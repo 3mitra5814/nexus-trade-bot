@@ -1,0 +1,2449 @@
+package main
+
+import (
+	"context"
+	"crypto/pbkdf2"
+	"crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"nexus-trade-bot/config"
+	"nexus-trade-bot/exchange"
+	"nexus-trade-bot/logger"
+	"nexus-trade-bot/tradestats"
+	"nexus-trade-bot/utils"
+)
+
+type consoleServer struct {
+	configPath    string
+	authPath      string
+	accountsPath  string
+	robotsPath    string
+	robotsDir     string
+	sessions      map[string]bool
+	loginFailures map[string]loginFailure
+	balanceCache  map[string]accountBalanceCache
+	auth          authState
+	accounts      map[string]*accountProfile
+	robots        map[string]*robotDefinition
+	processes     map[string]*robotProcess
+	baseConfig    *config.Config
+	baseRawYAML   []byte
+	mu            sync.RWMutex
+}
+
+type authState struct {
+	Username           string `json:"username"`
+	PasswordSalt       string `json:"password_salt"`
+	PasswordHash       string `json:"password_hash"`
+	RememberTokenHash  string `json:"remember_token_hash,omitempty"`
+	MustChangePassword bool   `json:"must_change_password"`
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type loginFailure struct {
+	Count       int
+	FirstAt     time.Time
+	LockedUntil time.Time
+}
+
+type passwordRequest struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+type consoleStatus struct {
+	Authenticated      bool `json:"authenticated"`
+	MustChangePassword bool `json:"must_change_password"`
+}
+
+type symbolsResponse struct {
+	Symbols []string `json:"symbols"`
+}
+
+type accountProfile struct {
+	ID        string                `json:"id"`
+	Name      string                `json:"name"`
+	Exchange  string                `json:"exchange"`
+	Config    config.ExchangeConfig `json:"config"`
+	CreatedAt time.Time             `json:"created_at"`
+	UpdatedAt time.Time             `json:"updated_at"`
+}
+
+type accountView struct {
+	ID        string                `json:"id"`
+	Name      string                `json:"name"`
+	Exchange  string                `json:"exchange"`
+	Config    config.ExchangeConfig `json:"config"`
+	CreatedAt time.Time             `json:"created_at"`
+	UpdatedAt time.Time             `json:"updated_at"`
+}
+
+type robotDefinition struct {
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	ConfigPath string         `json:"config_path"`
+	Config     *config.Config `json:"config"`
+	AccountID  string         `json:"account_id"`
+	CreatedAt  time.Time      `json:"created_at"`
+	UpdatedAt  time.Time      `json:"updated_at"`
+}
+
+type robotProcess struct {
+	Cmd           *exec.Cmd
+	Status        string    `json:"status"`
+	PID           int       `json:"pid"`
+	StartedAt     time.Time `json:"started_at"`
+	StoppedAt     time.Time `json:"stopped_at"`
+	LastError     string    `json:"last_error"`
+	ExitReason    string    `json:"exit_reason"`
+	DesiredStatus string
+	LogPath       string `json:"log_path,omitempty"`
+	logFile       *os.File
+	RestartCount  int
+}
+
+type robotPayload struct {
+	Name      string         `json:"name"`
+	Config    *config.Config `json:"config"`
+	AccountID string         `json:"account_id"`
+}
+
+type accountPayload struct {
+	Name     string                `json:"name"`
+	Exchange string                `json:"exchange"`
+	Config   config.ExchangeConfig `json:"config"`
+}
+
+type robotMetric struct {
+	Balance          float64 `json:"balance"`
+	AvailableBalance float64 `json:"available_balance"`
+	MarginBalance    float64 `json:"margin_balance"`
+	CurrentPrice     float64 `json:"current_price"`
+	UnrealizedPNL    float64 `json:"unrealized_pnl"`
+	TodayRealizedPNL float64 `json:"today_realized_pnl"`
+	TotalRealizedPNL float64 `json:"total_realized_pnl"`
+	TodayVolume      float64 `json:"today_volume"`
+	TotalVolume      float64 `json:"total_volume"`
+	PositionCount    int     `json:"position_count"`
+	OpenOrderCount   int     `json:"open_order_count"`
+	QuoteAsset       string  `json:"quote_asset"`
+	PriceError       string  `json:"price_error,omitempty"`
+	Error            string  `json:"error,omitempty"`
+}
+
+type accountBalanceView struct {
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	Exchange         string    `json:"exchange"`
+	Balance          float64   `json:"balance"`
+	AvailableBalance float64   `json:"available_balance"`
+	MarginBalance    float64   `json:"margin_balance"`
+	QuoteAsset       string    `json:"quote_asset"`
+	FetchedAt        time.Time `json:"fetched_at,omitempty"`
+	Error            string    `json:"error,omitempty"`
+}
+
+type accountBalanceCache struct {
+	Value            accountBalanceView
+	AccountUpdatedAt time.Time
+	ExpiresAt        time.Time
+}
+
+type robotView struct {
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Config     *config.Config `json:"config"`
+	AccountID  string         `json:"account_id"`
+	Account    *accountView   `json:"account,omitempty"`
+	Status     string         `json:"status"`
+	PID        int            `json:"pid"`
+	StartedAt  time.Time      `json:"started_at,omitempty"`
+	StoppedAt  time.Time      `json:"stopped_at,omitempty"`
+	LastError  string         `json:"last_error,omitempty"`
+	ExitReason string         `json:"exit_reason,omitempty"`
+	Metric     robotMetric    `json:"metric"`
+	UpdatedAt  time.Time      `json:"updated_at"`
+}
+
+type dashboardResponse struct {
+	Summary  dashboardSummary     `json:"summary"`
+	Robots   []robotView          `json:"robots"`
+	Accounts []accountBalanceView `json:"accounts"`
+}
+
+type recentTradesResponse struct {
+	Trades []tradestats.TradeRecord `json:"trades"`
+}
+
+type dashboardSummary struct {
+	RobotCount         int     `json:"robot_count"`
+	RunningCount       int     `json:"running_count"`
+	StoppedCount       int     `json:"stopped_count"`
+	TodayRealizedPNL   float64 `json:"today_realized_pnl"`
+	TotalRealizedPNL   float64 `json:"total_realized_pnl"`
+	TodayVolume        float64 `json:"today_volume"`
+	TotalVolume        float64 `json:"total_volume"`
+	TotalBalance       float64 `json:"total_balance"`
+	TotalAvailable     float64 `json:"total_available"`
+	TotalUnrealizedPNL float64 `json:"total_unrealized_pnl"`
+}
+
+const (
+	secretMask                     = "********"
+	maxJSONBodyBytes               = 1 << 20
+	loginFailureWindow             = 10 * time.Minute
+	loginLockDuration              = 5 * time.Minute
+	maxLoginFailures               = 5
+	robotStartProbeDelay           = 800 * time.Millisecond
+	maxRobotAutoRestarts           = 5
+	passwordPBKDF2Prefix           = "pbkdf2-sha512"
+	passwordPBKDF2Iterations       = 200000
+	passwordPBKDF2KeyLength        = 32
+	hardcodedRiskInterval          = "1m"
+	hardcodedRiskVolumeMultiplier  = 3.0
+	hardcodedRiskAverageWindow     = 20
+	hardcodedRiskRecoveryThreshold = 3
+	hardcodedSystemLogLevel        = "INFO"
+	hardcodedSystemCancelOnExit    = true
+	hardcodedWSReconnectDelay      = 5
+	hardcodedWSWriteWait           = 10
+	hardcodedWSPongWait            = 60
+	hardcodedWSPingInterval        = 20
+	hardcodedListenKeyKeepAlive    = 30
+	hardcodedPriceSendInterval     = 50
+	hardcodedRateLimitRetryDelay   = 1
+	hardcodedOrderRetryDelay       = 500
+	hardcodedPricePollInterval     = 500
+	hardcodedStatusPrintInterval   = 1
+	hardcodedOrderCleanupInterval  = 60
+	hardcodedBuyWindowSize         = 5
+	hardcodedSellWindowSize        = 5
+	hardcodedReconcileInterval     = 60
+	hardcodedOrderCleanupThreshold = 50
+	hardcodedCleanupBatchSize      = 20
+	hardcodedMarginLockSeconds     = 20
+	hardcodedPositionSafetyCheck   = 100
+)
+
+func ensureConfigFile(configPath string) error {
+	if _, err := os.Stat(configPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	examplePath := filepath.Join(filepath.Dir(configPath), "config.example.yaml")
+	data, err := os.ReadFile(examplePath)
+	if err != nil {
+		return fmt.Errorf("配置文件不存在，且读取示例配置失败: %w", err)
+	}
+	return os.WriteFile(configPath, data, 0600)
+}
+
+func runWebConsole(configPath string) error {
+	server, err := newConsoleServer(configPath)
+	if err != nil {
+		return err
+	}
+	return server.run()
+}
+
+func newConsoleServer(configPath string) (*consoleServer, error) {
+	baseRawYAML, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	baseCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+	rootDir := filepath.Dir(configPath)
+	server := &consoleServer{
+		configPath:    configPath,
+		authPath:      configPath + ".auth.json",
+		accountsPath:  filepath.Join(rootDir, "web_console_accounts.json"),
+		robotsPath:    filepath.Join(rootDir, "web_console_robots.json"),
+		robotsDir:     filepath.Join(rootDir, "web_console_robots"),
+		sessions:      make(map[string]bool),
+		loginFailures: make(map[string]loginFailure),
+		balanceCache:  make(map[string]accountBalanceCache),
+		accounts:      make(map[string]*accountProfile),
+		robots:        make(map[string]*robotDefinition),
+		processes:     make(map[string]*robotProcess),
+		baseConfig:    baseCfg,
+		baseRawYAML:   baseRawYAML,
+	}
+	if err := os.MkdirAll(server.robotsDir, 0700); err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(server.robotsDir, 0700)
+	if err := server.loadAuth(); err != nil {
+		return nil, err
+	}
+	if err := server.loadAccounts(); err != nil {
+		return nil, err
+	}
+	if err := server.loadRobots(); err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(server.authPath, 0600)
+	_ = os.Chmod(server.accountsPath, 0600)
+	_ = os.Chmod(server.robotsPath, 0600)
+	return server, nil
+}
+
+func (s *consoleServer) run() error {
+	mux := http.NewServeMux()
+	mux.Handle("/logo/", http.StripPrefix("/logo/", http.FileServer(http.Dir(filepath.Join(filepath.Dir(s.configPath), "logo")))))
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/change-password", s.handleChangePassword)
+	mux.HandleFunc("/api/dashboard", s.handleDashboard)
+	mux.HandleFunc("/api/base-config", s.handleBaseConfig)
+	mux.HandleFunc("/api/symbols", s.handleSymbols)
+	mux.HandleFunc("/api/accounts", s.handleAccounts)
+	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
+	mux.HandleFunc("/api/robots", s.handleRobots)
+	mux.HandleFunc("/api/robots/", s.handleRobotAction)
+	mux.HandleFunc("/api/logout", s.handleLogout)
+
+	addr := consoleListenAddr()
+	logger.Info("🌐 Web 控制台已启动: http://%s", addr)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	return server.ListenAndServe()
+}
+
+func consoleListenAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("NEXUS_TRADE_BOT_ADDR")); addr != "" {
+		return addr
+	}
+	if addr := strings.TrimSpace(os.Getenv("WEB_CONSOLE_ADDR")); addr != "" {
+		return addr
+	}
+	return "127.0.0.1:8080"
+}
+
+func (s *consoleServer) loadAuth() error {
+	data, err := os.ReadFile(s.authPath)
+	if errors.Is(err, os.ErrNotExist) {
+		auth, err := makeAuthState("admin", "admin", true)
+		if err != nil {
+			return err
+		}
+		s.auth = auth
+		return s.saveAuth()
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &s.auth)
+}
+
+func (s *consoleServer) saveAuth() error {
+	return s.saveAuthState(s.auth)
+}
+
+func (s *consoleServer) saveAuthState(auth authState) error {
+	data, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.authPath, data, 0600)
+}
+
+func makeAuthState(username, password string, mustChange bool) (authState, error) {
+	saltBytes := make([]byte, 24)
+	if _, err := rand.Read(saltBytes); err != nil {
+		return authState{}, err
+	}
+	salt := hex.EncodeToString(saltBytes)
+	hash, err := hashPassword(salt, password)
+	if err != nil {
+		return authState{}, err
+	}
+	return authState{
+		Username:           username,
+		PasswordSalt:       salt,
+		PasswordHash:       hash,
+		MustChangePassword: mustChange,
+	}, nil
+}
+
+func hashLegacyPassword(salt, password string) string {
+	sum := sha256.Sum256([]byte(salt + ":" + password))
+	return hex.EncodeToString(sum[:])
+}
+
+func hashPassword(salt, password string) (string, error) {
+	saltBytes, err := hex.DecodeString(salt)
+	if err != nil {
+		return "", err
+	}
+	key, err := pbkdf2.Key(sha512.New, password, saltBytes, passwordPBKDF2Iterations, passwordPBKDF2KeyLength)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s$%d$%s", passwordPBKDF2Prefix, passwordPBKDF2Iterations, hex.EncodeToString(key)), nil
+}
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func verifyPasswordState(auth authState, password string) bool {
+	expected := auth.PasswordHash
+	var actual string
+	if strings.HasPrefix(expected, passwordPBKDF2Prefix+"$") {
+		hash, err := hashPassword(auth.PasswordSalt, password)
+		if err != nil {
+			return false
+		}
+		actual = hash
+	} else {
+		actual = hashLegacyPassword(auth.PasswordSalt, password)
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
+}
+
+func (s *consoleServer) authSnapshot() authState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.auth
+}
+
+func (s *consoleServer) mustChangePassword() bool {
+	return s.authSnapshot().MustChangePassword
+}
+
+func (s *consoleServer) verifyPassword(password string) bool {
+	return verifyPasswordState(s.authSnapshot(), password)
+}
+
+func (s *consoleServer) authenticated(r *http.Request) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if cookie, err := r.Cookie("nexus_trade_bot_session"); err == nil && s.sessions[cookie.Value] {
+		return true
+	}
+	if cookie, err := r.Cookie("nexus_trade_bot_remember"); err == nil && s.auth.RememberTokenHash != "" {
+		return subtle.ConstantTimeCompare([]byte(s.auth.RememberTokenHash), []byte(hashToken(cookie.Value))) == 1
+	}
+	return false
+}
+
+func (s *consoleServer) requireAuth(w http.ResponseWriter, r *http.Request) bool {
+	if s.authenticated(r) {
+		return true
+	}
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return false
+}
+
+func (s *consoleServer) requireReady(w http.ResponseWriter, r *http.Request) bool {
+	if !s.requireAuth(w, r) {
+		return false
+	}
+	if s.mustChangePassword() {
+		http.Error(w, "must change password", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return false
+	}
+	var extra struct{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func (s *consoleServer) loginFailureKey(r *http.Request, username string) string {
+	host := r.RemoteAddr
+	if h, _, err := strings.Cut(host, ":"); err {
+		host = h
+	}
+	return strings.ToLower(strings.TrimSpace(username)) + "|" + host
+}
+
+func (s *consoleServer) loginLocked(key string) bool {
+	s.mu.RLock()
+	failure := s.loginFailures[key]
+	s.mu.RUnlock()
+	return time.Now().Before(failure.LockedUntil)
+}
+
+func (s *consoleServer) recordLoginFailure(key string) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	failure := s.loginFailures[key]
+	if now.Sub(failure.FirstAt) > loginFailureWindow {
+		failure = loginFailure{FirstAt: now}
+	}
+	failure.Count++
+	if failure.Count >= maxLoginFailures {
+		failure.LockedUntil = now.Add(loginLockDuration)
+	}
+	s.loginFailures[key] = failure
+}
+
+func (s *consoleServer) clearLoginFailure(key string) {
+	s.mu.Lock()
+	delete(s.loginFailures, key)
+	s.mu.Unlock()
+}
+
+func (s *consoleServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, consoleStatus{Authenticated: s.authenticated(r), MustChangePassword: s.mustChangePassword()})
+}
+
+func (s *consoleServer) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req loginRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	key := s.loginFailureKey(r, req.Username)
+	if s.loginLocked(key) {
+		http.Error(w, "登录失败次数过多，请稍后再试", http.StatusTooManyRequests)
+		return
+	}
+	auth := s.authSnapshot()
+	if req.Username != auth.Username || !verifyPasswordState(auth, req.Password) {
+		s.recordLoginFailure(key)
+		http.Error(w, "用户名或密码错误", http.StatusUnauthorized)
+		return
+	}
+	s.clearLoginFailure(key)
+	if !strings.HasPrefix(auth.PasswordHash, passwordPBKDF2Prefix+"$") {
+		if migrated, err := makeAuthState(auth.Username, req.Password, auth.MustChangePassword); err == nil {
+			s.mu.Lock()
+			if s.auth.PasswordHash == auth.PasswordHash {
+				s.auth = migrated
+				auth = migrated
+			}
+			s.mu.Unlock()
+			_ = s.saveAuthState(auth)
+		}
+	}
+	sessionBytes := make([]byte, 32)
+	if _, err := rand.Read(sessionBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	token := base64.RawURLEncoding.EncodeToString(sessionBytes)
+	s.mu.Lock()
+	s.sessions[token] = true
+	s.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "nexus_trade_bot_session", Value: token, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
+	rememberBytes := make([]byte, 32)
+	if _, err := rand.Read(rememberBytes); err == nil {
+		rememberToken := base64.RawURLEncoding.EncodeToString(rememberBytes)
+		s.mu.Lock()
+		s.auth.RememberTokenHash = hashToken(rememberToken)
+		auth = s.auth
+		s.mu.Unlock()
+		_ = s.saveAuthState(auth)
+		http.SetCookie(w, &http.Cookie{Name: "nexus_trade_bot_remember", Value: rememberToken, Path: "/", HttpOnly: true, Secure: r.TLS != nil, MaxAge: 86400 * 30, SameSite: http.SameSiteStrictMode})
+	}
+	writeJSON(w, consoleStatus{Authenticated: true, MustChangePassword: auth.MustChangePassword})
+}
+
+func (s *consoleServer) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cookie, err := r.Cookie("nexus_trade_bot_session")
+	s.mu.Lock()
+	if err == nil {
+		delete(s.sessions, cookie.Value)
+	}
+	s.auth.RememberTokenHash = ""
+	_ = s.saveAuth()
+	s.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "nexus_trade_bot_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: "nexus_trade_bot_remember", Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteStrictMode})
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *consoleServer) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAuth(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req passwordRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	authSnapshot := s.authSnapshot()
+	if !verifyPasswordState(authSnapshot, req.OldPassword) {
+		http.Error(w, "旧密码错误", http.StatusUnauthorized)
+		return
+	}
+	if !strongEnoughPassword(req.NewPassword) {
+		http.Error(w, "新密码至少 12 位，并且不能为 admin 或纯空白", http.StatusBadRequest)
+		return
+	}
+	auth, err := makeAuthState(authSnapshot.Username, req.NewPassword, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.mu.Lock()
+	s.auth = auth
+	s.mu.Unlock()
+	if err := s.saveAuthState(auth); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, consoleStatus{Authenticated: true, MustChangePassword: false})
+}
+
+func (s *consoleServer) handleBaseConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	writeJSON(w, publicConfig(s.baseConfig))
+}
+
+func (s *consoleServer) handleSymbols(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	marketType := normalizeMarketTypeParam(r.URL.Query().Get("market_type"))
+	symbols := collectPublicSymbols(marketType)
+	writeJSON(w, symbolsResponse{Symbols: symbols})
+}
+
+func (s *consoleServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	views := s.collectRobotViews()
+	activeConfigPaths := s.collectRobotConfigPaths()
+	accountBalances := s.collectAccountBalances()
+	var summary dashboardSummary
+	summary.RobotCount = len(views)
+	for _, robot := range views {
+		if robot.Status == "running" {
+			summary.RunningCount++
+		} else {
+			summary.StoppedCount++
+		}
+		summary.TodayRealizedPNL += robot.Metric.TodayRealizedPNL
+		summary.TotalRealizedPNL += robot.Metric.TotalRealizedPNL
+		summary.TodayVolume += robot.Metric.TodayVolume
+		summary.TotalVolume += robot.Metric.TotalVolume
+		summary.TotalUnrealizedPNL += robot.Metric.UnrealizedPNL
+	}
+	for _, metric := range s.collectArchivedRobotMetrics(activeConfigPaths) {
+		summary.TodayRealizedPNL += metric.TodayRealizedPNL
+		summary.TotalRealizedPNL += metric.TotalRealizedPNL
+		summary.TodayVolume += metric.TodayVolume
+		summary.TotalVolume += metric.TotalVolume
+	}
+	for _, account := range accountBalances {
+		if account.Error != "" {
+			continue
+		}
+		summary.TotalBalance += account.Balance
+		summary.TotalAvailable += account.AvailableBalance
+	}
+	writeJSON(w, dashboardResponse{Summary: summary, Robots: views, Accounts: accountBalances})
+}
+
+func (s *consoleServer) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, s.collectAccountViews())
+	case http.MethodPost:
+		var payload accountPayload
+		if !decodeJSONBody(w, r, &payload) {
+			return
+		}
+		account, err := s.createAccount(payload)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, publicAccountView(account))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *consoleServer) handleAccountAction(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/accounts/"), "/")
+	if id == "" {
+		http.Error(w, "account id required", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var payload accountPayload
+		if !decodeJSONBody(w, r, &payload) {
+			return
+		}
+		account, err := s.updateAccount(id, payload)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, publicAccountView(account))
+	case http.MethodDelete:
+		if err := s.deleteAccount(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"deleted": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *consoleServer) handleRobots(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, s.collectRobotViews())
+	case http.MethodPost:
+		var payload robotPayload
+		if !decodeJSONBody(w, r, &payload) {
+			return
+		}
+		robot, err := s.createRobot(payload)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, robot)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *consoleServer) handleRobotAction(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/robots/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "robot id required", http.StatusBadRequest)
+		return
+	}
+	id := parts[0]
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodPut:
+			var payload robotPayload
+			if !decodeJSONBody(w, r, &payload) {
+				return
+			}
+			robot, err := s.updateRobot(id, payload)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, robot)
+		case http.MethodDelete:
+			if err := s.deleteRobot(id); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, map[string]bool{"deleted": true})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	action := parts[1]
+	if action == "trades" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		trades, err := s.recentRobotTrades(id, 100)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, recentTradesResponse{Trades: trades})
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	switch action {
+	case "start":
+		if err := s.startRobot(id); err != nil {
+			http.Error(w, friendlyErrorMessage(err), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"started": true})
+	case "pause":
+		if err := s.pauseRobot(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"paused": true})
+	case "stop":
+		if err := s.stopRobot(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"stopped": true})
+	default:
+		http.Error(w, "unknown action", http.StatusBadRequest)
+	}
+}
+
+func (s *consoleServer) recentRobotTrades(id string, limit int) ([]tradestats.TradeRecord, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	s.mu.RLock()
+	robot, ok := s.robots[id]
+	if !ok || robot == nil {
+		s.mu.RUnlock()
+		return nil, fmt.Errorf("机器人不存在")
+	}
+	configPath := robot.ConfigPath
+	symbol := robot.Config.Trading.Symbol
+	s.mu.RUnlock()
+
+	snap, err := tradestats.LoadWithLogFallback(tradestats.PathForConfig(configPath), robotLogPath(configPath), 0)
+	if err != nil {
+		return nil, fmt.Errorf("读取近期成交失败: %w", err)
+	}
+	trades := tradestats.FilterTradesBySymbol(snap.RecentTrades, symbol)
+	if len(trades) > limit {
+		trades = trades[len(trades)-limit:]
+	}
+	out := make([]tradestats.TradeRecord, 0, len(trades))
+	for i := len(trades) - 1; i >= 0; i-- {
+		out = append(out, trades[i])
+	}
+	return out, nil
+}
+
+func (s *consoleServer) createRobot(payload robotPayload) (*robotView, error) {
+	cfg, err := s.normalizeRobotConfig(payload.Config)
+	if err != nil {
+		return nil, err
+	}
+	account, err := s.applyAccountToRobotConfig(payload.AccountID, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	id := makeRobotID(payload.Name)
+	cfg.Trading.OrderTag = robotOrderTag(id)
+	now := time.Now()
+	robot := &robotDefinition{
+		ID:         id,
+		Name:       strings.TrimSpace(payload.Name),
+		ConfigPath: filepath.Join(s.robotsDir, id+".yaml"),
+		Config:     cfg,
+		AccountID:  account.ID,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if robot.Name == "" {
+		robot.Name = "Robot " + strings.ToUpper(id[:6])
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.robots[id]; exists {
+		return nil, fmt.Errorf("机器人 ID 冲突，请重试")
+	}
+	if err := config.SaveConfig(robot.ConfigPath, robot.Config); err != nil {
+		return nil, err
+	}
+	s.robots[id] = robot
+	if err := s.saveRobotsLocked(); err != nil {
+		delete(s.robots, id)
+		return nil, err
+	}
+	view := s.buildRobotViewLocked(robot)
+	return &view, nil
+}
+
+func (s *consoleServer) updateRobot(id string, payload robotPayload) (*robotView, error) {
+	cfg, err := s.normalizeRobotConfig(payload.Config)
+	if err != nil {
+		return nil, err
+	}
+	account, err := s.applyAccountToRobotConfig(payload.AccountID, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	robot, ok := s.robots[id]
+	if !ok {
+		return nil, fmt.Errorf("机器人不存在")
+	}
+	if proc, exists := s.processes[id]; exists && proc.Status == "running" {
+		return nil, fmt.Errorf("编辑前必须先暂停机器人")
+	}
+	cfg.Trading.OrderTag = robotOrderTag(id)
+	oldConfigBytes, _ := json.Marshal(robot.Config)
+	newConfigBytes, _ := json.Marshal(cfg)
+	oldName := robot.Name
+	oldAccountID := robot.AccountID
+	newName := strings.TrimSpace(payload.Name)
+	shouldRestart := string(oldConfigBytes) != string(newConfigBytes) || oldName != newName || oldAccountID != account.ID
+	robot.Name = newName
+	if robot.Name == "" {
+		robot.Name = oldName
+	}
+	robot.Config = cfg
+	robot.AccountID = account.ID
+	robot.UpdatedAt = time.Now()
+	if err := config.SaveConfig(robot.ConfigPath, robot.Config); err != nil {
+		return nil, err
+	}
+	if err := s.saveRobotsLocked(); err != nil {
+		return nil, err
+	}
+	if proc, exists := s.processes[id]; exists && proc.Status == "paused" && shouldRestart {
+		proc.Status = "stopped"
+		proc.DesiredStatus = "stopped"
+	}
+	view := s.buildRobotViewLocked(robot)
+	return &view, nil
+}
+
+func (s *consoleServer) deleteRobot(id string) error {
+	if err := s.stopRobot(id); err != nil && !strings.Contains(err.Error(), "未运行") {
+		return err
+	}
+	if err := s.cancelRobotOpenOrders(id); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	robot, ok := s.robots[id]
+	if !ok {
+		return fmt.Errorf("机器人不存在")
+	}
+	delete(s.robots, id)
+	delete(s.processes, id)
+	_ = os.Remove(robot.ConfigPath)
+	return s.saveRobotsLocked()
+}
+
+func (s *consoleServer) startRobot(id string) error {
+	s.mu.Lock()
+	robot, ok := s.robots[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("机器人不存在")
+	}
+	if proc, exists := s.processes[id]; exists && proc.Status == "running" {
+		s.mu.Unlock()
+		return fmt.Errorf("机器人已在运行")
+	}
+	account, ok := s.accounts[robot.AccountID]
+	if !ok || account == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("机器人绑定的账户不存在")
+	}
+	if err := applyAccountConfigToRobot(robot, account); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	ensureRobotOrderTag(robot)
+	if err := config.SaveConfig(robot.ConfigPath, robot.Config); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("保存机器人最新账户配置失败: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	logPath := filepath.Join(s.robotsDir, id+".log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("无法创建机器人日志文件: %w", err)
+	}
+	cmd := exec.Command(executable, "worker", robot.ConfigPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		s.mu.Unlock()
+		return err
+	}
+	restartCount := 0
+	if existing := s.processes[id]; existing != nil {
+		if existing.Status == "auto-restarting" {
+			restartCount = existing.RestartCount
+		}
+	}
+	proc := &robotProcess{Cmd: cmd, Status: "running", PID: cmd.Process.Pid, StartedAt: time.Now(), DesiredStatus: "running", LogPath: logPath, logFile: logFile, RestartCount: restartCount}
+	s.processes[id] = proc
+	s.mu.Unlock()
+	go s.probeRobotStart(id, cmd)
+	go s.waitRobot(id, cmd)
+	return nil
+}
+
+func (s *consoleServer) probeRobotStart(id string, cmd *exec.Cmd) {
+	time.Sleep(robotStartProbeDelay)
+	s.mu.RLock()
+	proc, ok := s.processes[id]
+	stillSameProcess := ok && proc.Cmd == cmd && proc.Status == "running"
+	s.mu.RUnlock()
+	if stillSameProcess {
+		return
+	}
+	s.mu.RLock()
+	lastError := ""
+	if proc != nil {
+		lastError = proc.LastError
+	}
+	s.mu.RUnlock()
+	if lastError != "" {
+		logger.Warn("机器人启动失败: %s", lastError)
+	}
+}
+
+func (s *consoleServer) pauseRobot(id string) error {
+	s.mu.Lock()
+	if proc, ok := s.processes[id]; ok && proc != nil && proc.Status != "running" && proc.DesiredStatus == "running" {
+		proc.DesiredStatus = "paused"
+		proc.Status = "paused"
+		proc.ExitReason = "已暂停自动重启"
+		s.mu.Unlock()
+		return s.cancelRobotOpenOrders(id)
+	}
+	s.mu.Unlock()
+	if err := s.stopRobotWithStatus(id, "paused"); err != nil {
+		return err
+	}
+	return s.cancelRobotOpenOrders(id)
+}
+
+func (s *consoleServer) cancelRobotOpenOrders(id string) error {
+	robotCfg, symbol, orderTag, err := s.robotConfigForOrderCancel(id)
+	if err != nil {
+		return err
+	}
+	ex, err := exchange.NewExchange(robotCfg)
+	if err != nil {
+		return fmt.Errorf("创建撤单交易所实例失败: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	openOrders, err := ex.GetOpenOrders(ctx, symbol)
+	if err != nil {
+		return fmt.Errorf("查询机器人挂单失败: %w", err)
+	}
+	orderIDs := make([]int64, 0, len(openOrders))
+	for _, order := range openOrders {
+		if order == nil || order.OrderID == 0 {
+			continue
+		}
+		clientOrderID := utils.RemoveBrokerPrefix(ex.GetName(), order.ClientOrderID)
+		tag, ok := utils.OrderIDTag(clientOrderID)
+		if !ok || (tag != orderTag && tag != "") {
+			continue
+		}
+		orderIDs = append(orderIDs, order.OrderID)
+	}
+	if len(orderIDs) == 0 {
+		logger.Info("✅ [机器人撤单] %s 未发现归属标签 %s 的 %s 挂单", id, orderTag, symbol)
+		return nil
+	}
+	if err := ex.BatchCancelOrders(ctx, symbol, orderIDs); err != nil {
+		return fmt.Errorf("撤销机器人挂单失败: %w", err)
+	}
+	logger.Info("✅ [机器人撤单] %s 已撤销 %s 的 %d 个归属挂单", id, symbol, len(orderIDs))
+	return nil
+}
+
+func (s *consoleServer) robotConfigForOrderCancel(id string) (*config.Config, string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	robot, ok := s.robots[id]
+	if !ok || robot == nil || robot.Config == nil {
+		return nil, "", "", fmt.Errorf("机器人不存在")
+	}
+	account, ok := s.accounts[robot.AccountID]
+	if !ok || account == nil {
+		return nil, "", "", fmt.Errorf("机器人绑定的账户不存在")
+	}
+	ensureRobotOrderTag(robot)
+	if err := applyAccountConfigToRobot(robot, account); err != nil {
+		return nil, "", "", err
+	}
+	cfgCopy := cloneConfig(robot.Config)
+	return cfgCopy, robot.Config.Trading.Symbol, robot.Config.Trading.OrderTag, nil
+}
+
+func (s *consoleServer) waitRobot(id string, cmd *exec.Cmd) {
+	err := cmd.Wait()
+	var restartAfter time.Duration
+	shouldRestart := false
+	s.mu.Lock()
+	proc, ok := s.processes[id]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	if proc.DesiredStatus == "paused" {
+		proc.Status = "paused"
+	} else {
+		proc.Status = "stopped"
+	}
+	proc.StoppedAt = time.Now()
+	if proc.logFile != nil {
+		_ = proc.logFile.Close()
+		proc.logFile = nil
+	}
+	if err != nil {
+		if proc.DesiredStatus == "running" {
+			proc.LastError = friendlyRobotExitError(err, proc.LogPath)
+			proc.ExitReason = "进程异常退出"
+		} else {
+			proc.LastError = ""
+			if proc.DesiredStatus == "paused" {
+				proc.ExitReason = "已暂停"
+			} else {
+				proc.ExitReason = "已停止"
+			}
+		}
+		if proc.DesiredStatus == "running" && proc.RestartCount < maxRobotAutoRestarts {
+			proc.RestartCount++
+			restartAfter = robotRestartBackoff(proc.RestartCount)
+			proc.ExitReason = fmt.Sprintf("进程异常退出，%s 后自动重启 (%d/%d)", restartAfter, proc.RestartCount, maxRobotAutoRestarts)
+			shouldRestart = true
+		}
+	} else {
+		proc.ExitReason = "进程正常退出"
+		proc.RestartCount = 0
+	}
+	s.mu.Unlock()
+	if shouldRestart {
+		go s.restartRobotAfter(id, cmd, restartAfter)
+	}
+}
+
+func robotRestartBackoff(restartCount int) time.Duration {
+	if restartCount < 1 {
+		restartCount = 1
+	}
+	exp := restartCount - 1
+	if exp > 5 {
+		exp = 5
+	}
+	delay := time.Duration(1<<uint(exp)) * 5 * time.Second
+	if delay > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return delay
+}
+
+func (s *consoleServer) restartRobotAfter(id string, cmd *exec.Cmd, delay time.Duration) {
+	time.Sleep(delay)
+	s.mu.RLock()
+	proc, ok := s.processes[id]
+	shouldRestart := ok && proc.Cmd == cmd && proc.DesiredStatus == "running" && proc.Status == "stopped"
+	s.mu.RUnlock()
+	if !shouldRestart {
+		return
+	}
+	s.mu.Lock()
+	if proc, ok := s.processes[id]; ok && proc.Cmd == cmd && proc.DesiredStatus == "running" && proc.Status == "stopped" {
+		proc.Status = "auto-restarting"
+	}
+	s.mu.Unlock()
+	if err := s.startRobot(id); err != nil {
+		logger.Error("机器人自动重启失败: %s: %v", id, err)
+	}
+}
+
+func (s *consoleServer) stopRobot(id string) error {
+	return s.stopRobotWithStatus(id, "stopped")
+}
+
+func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
+	s.mu.Lock()
+	proc, ok := s.processes[id]
+	if !ok || proc == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("机器人未运行")
+	}
+	proc.DesiredStatus = finalStatus
+	if proc.Status != "running" || proc.Cmd == nil || proc.Cmd.Process == nil {
+		proc.Status = finalStatus
+		proc.ExitReason = "已停止自动重启"
+		proc.StoppedAt = time.Now()
+		s.mu.Unlock()
+		return nil
+	}
+	pid := proc.Cmd.Process.Pid
+	s.mu.Unlock()
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		status := proc.Status
+		s.mu.RUnlock()
+		if status != "running" {
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	return nil
+}
+
+func (s *consoleServer) loadRobots() error {
+	data, err := os.ReadFile(s.robotsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var robots []*robotDefinition
+	if err := json.Unmarshal(data, &robots); err != nil {
+		return err
+	}
+	for _, robot := range robots {
+		if robot.Config != nil && robot.AccountID != "" {
+			_, _ = s.applyAccountToRobotConfig(robot.AccountID, robot.Config)
+		}
+		ensureRobotOrderTag(robot)
+		s.robots[robot.ID] = robot
+	}
+	return nil
+}
+
+func (s *consoleServer) saveRobotsLocked() error {
+	items := make([]*robotDefinition, 0, len(s.robots))
+	for _, robot := range s.robots {
+		clone := *robot
+		clone.Config = publicConfig(robot.Config)
+		items = append(items, &clone)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt.Before(items[j].CreatedAt)
+	})
+	data, err := json.MarshalIndent(items, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.robotsPath, data, 0600)
+}
+
+func (s *consoleServer) normalizeRobotConfig(cfg *config.Config) (*config.Config, error) {
+	if cfg == nil {
+		cfg = cloneConfig(s.baseConfig)
+	}
+	if cfg.Trading.Symbol != "" {
+		cfg.Trading.Symbol = normalizeTradingSymbol(cfg.Trading.Symbol)
+	}
+	cfg.App.MarketType = normalizeMarketTypeParam(cfg.App.MarketType)
+	if cfg.App.MarketType == "spot" {
+		cfg.Trading.Direction = "long"
+	}
+	applyHardcodedRobotDefaults(cfg)
+	return cfg, nil
+}
+
+func (s *consoleServer) applyAccountToRobotConfig(accountID string, cfg *config.Config) (*accountProfile, error) {
+	s.mu.RLock()
+	account, ok := s.accounts[accountID]
+	s.mu.RUnlock()
+	if !ok || account == nil {
+		return nil, fmt.Errorf("必须先选择一个已保存账户")
+	}
+	cfg.App.CurrentExchange = account.Exchange
+	if cfg.Exchanges == nil {
+		cfg.Exchanges = make(map[string]config.ExchangeConfig)
+	}
+	cfg.Exchanges[account.Exchange] = account.Config
+	return account, nil
+}
+
+func applyHardcodedRobotDefaults(cfg *config.Config) {
+	cfg.App.MarketType = normalizeMarketTypeParam(cfg.App.MarketType)
+	if cfg.App.MarketType == "spot" {
+		cfg.Trading.Direction = "long"
+	}
+	if len(cfg.RiskControl.MonitorSymbols) == 0 {
+		cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"}
+	}
+	cfg.RiskControl.Interval = hardcodedRiskInterval
+	cfg.RiskControl.VolumeMultiplier = hardcodedRiskVolumeMultiplier
+	cfg.RiskControl.AverageWindow = hardcodedRiskAverageWindow
+	cfg.RiskControl.RecoveryThreshold = hardcodedRiskRecoveryThreshold
+
+	cfg.System.LogLevel = hardcodedSystemLogLevel
+	cfg.System.CancelOnExit = hardcodedSystemCancelOnExit
+
+	cfg.Timing.WebSocketReconnectDelay = hardcodedWSReconnectDelay
+	cfg.Timing.WebSocketWriteWait = hardcodedWSWriteWait
+	cfg.Timing.WebSocketPongWait = hardcodedWSPongWait
+	cfg.Timing.WebSocketPingInterval = hardcodedWSPingInterval
+	cfg.Timing.ListenKeyKeepAliveInterval = hardcodedListenKeyKeepAlive
+	cfg.Timing.PriceSendInterval = hardcodedPriceSendInterval
+	cfg.Timing.RateLimitRetryDelay = hardcodedRateLimitRetryDelay
+	cfg.Timing.OrderRetryDelay = hardcodedOrderRetryDelay
+	cfg.Timing.PricePollInterval = hardcodedPricePollInterval
+	cfg.Timing.StatusPrintInterval = hardcodedStatusPrintInterval
+	cfg.Timing.OrderCleanupInterval = hardcodedOrderCleanupInterval
+
+	cfg.Trading.BuyWindowSize = hardcodedBuyWindowSize
+	cfg.Trading.SellWindowSize = hardcodedSellWindowSize
+	cfg.Trading.ReconcileInterval = hardcodedReconcileInterval
+	cfg.Trading.OrderCleanupThreshold = hardcodedOrderCleanupThreshold
+	cfg.Trading.CleanupBatchSize = hardcodedCleanupBatchSize
+	cfg.Trading.MarginLockDurationSec = hardcodedMarginLockSeconds
+	cfg.Trading.PositionSafetyCheck = hardcodedPositionSafetyCheck
+	// 默认不接管已有交易所持仓，避免 Web 新建机器人误把手动底仓当作网格仓位平掉。
+	cfg.Trading.AdoptExistingPosition = false
+}
+
+func (s *consoleServer) loadAccounts() error {
+	data, err := os.ReadFile(s.accountsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var accounts []*accountProfile
+	if err := json.Unmarshal(data, &accounts); err != nil {
+		return err
+	}
+	for _, account := range accounts {
+		s.accounts[account.ID] = account
+	}
+	return nil
+}
+
+func (s *consoleServer) saveAccountsLocked() error {
+	items := make([]*accountProfile, 0, len(s.accounts))
+	for _, account := range s.accounts {
+		items = append(items, cloneAccountProfile(account))
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.Before(items[j].CreatedAt) })
+	data, err := json.MarshalIndent(items, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.accountsPath, data, 0600)
+}
+
+func (s *consoleServer) collectAccounts() []*accountProfile {
+	s.mu.RLock()
+	items := make([]*accountProfile, 0, len(s.accounts))
+	for _, account := range s.accounts {
+		items = append(items, account)
+	}
+	s.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.Before(items[j].CreatedAt) })
+	return items
+}
+
+func (s *consoleServer) collectAccountViews() []accountView {
+	accounts := s.collectAccounts()
+	items := make([]accountView, 0, len(accounts))
+	for _, account := range accounts {
+		items = append(items, publicAccountView(account))
+	}
+	return items
+}
+
+func publicAccountView(account *accountProfile) accountView {
+	if account == nil {
+		return accountView{}
+	}
+	return accountView{
+		ID:        account.ID,
+		Name:      account.Name,
+		Exchange:  account.Exchange,
+		Config:    publicExchangeConfig(account.Config),
+		CreatedAt: account.CreatedAt,
+		UpdatedAt: account.UpdatedAt,
+	}
+}
+
+func publicExchangeConfig(cfg config.ExchangeConfig) config.ExchangeConfig {
+	if strings.TrimSpace(cfg.APIKey) != "" {
+		cfg.APIKey = secretMask
+	}
+	if strings.TrimSpace(cfg.SecretKey) != "" {
+		cfg.SecretKey = secretMask
+	}
+	if strings.TrimSpace(cfg.Passphrase) != "" {
+		cfg.Passphrase = secretMask
+	}
+	return cfg
+}
+
+func publicConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := cloneConfig(cfg)
+	if clone.Exchanges != nil {
+		for name, exchangeCfg := range clone.Exchanges {
+			clone.Exchanges[name] = publicExchangeConfig(exchangeCfg)
+		}
+	}
+	return clone
+}
+
+func (s *consoleServer) collectAccountBalances() []accountBalanceView {
+	accounts := s.collectAccounts()
+	items := make([]accountBalanceView, 0, len(accounts))
+	now := time.Now()
+	for _, account := range accounts {
+		s.mu.RLock()
+		cached, ok := s.balanceCache[account.ID]
+		s.mu.RUnlock()
+		if ok && cached.AccountUpdatedAt.Equal(account.UpdatedAt) && now.Before(cached.ExpiresAt) {
+			items = append(items, cached.Value)
+			continue
+		}
+
+		value := s.fetchAccountBalance(account)
+		s.mu.Lock()
+		s.balanceCache[account.ID] = accountBalanceCache{
+			Value:            value,
+			AccountUpdatedAt: account.UpdatedAt,
+			ExpiresAt:        time.Now().Add(10 * time.Second),
+		}
+		s.mu.Unlock()
+		items = append(items, value)
+	}
+	return items
+}
+
+func (s *consoleServer) fetchAccountBalance(account *accountProfile) accountBalanceView {
+	view := accountBalanceView{
+		ID:        account.ID,
+		Name:      account.Name,
+		Exchange:  account.Exchange,
+		FetchedAt: time.Now(),
+	}
+	symbol := "BTCUSDT"
+	if s.baseConfig != nil && s.baseConfig.Trading.Symbol != "" {
+		symbol = normalizeTradingSymbol(s.baseConfig.Trading.Symbol)
+	}
+	cfg := accountConfig(account.Exchange, account.Config, symbol, "futures")
+	ex, err := exchange.NewExchange(cfg)
+	if err != nil {
+		cfg = accountConfig(account.Exchange, account.Config, symbol, "spot")
+		ex, err = exchange.NewExchange(cfg)
+		if err != nil {
+			view.Error = friendlyErrorMessage(err)
+			return view
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	balance, err := ex.GetAccount(ctx)
+	if err != nil {
+		if cfg.App.MarketType == "spot" {
+			view.Error = friendlyErrorMessage(err)
+			return view
+		}
+		cfg = accountConfig(account.Exchange, account.Config, symbol, "spot")
+		ex, err = exchange.NewExchange(cfg)
+		if err != nil {
+			view.Error = friendlyErrorMessage(err)
+			return view
+		}
+		balance, err = ex.GetAccount(ctx)
+		if err != nil {
+			view.Error = friendlyErrorMessage(err)
+			return view
+		}
+	}
+	view.Balance = balance.TotalWalletBalance
+	view.AvailableBalance = balance.AvailableBalance
+	view.MarginBalance = balance.TotalMarginBalance
+	view.QuoteAsset = ex.GetQuoteAsset()
+	return view
+}
+
+func (s *consoleServer) createAccount(payload accountPayload) (*accountProfile, error) {
+	if strings.TrimSpace(payload.Name) == "" {
+		return nil, fmt.Errorf("账户名称不能为空")
+	}
+	if strings.TrimSpace(payload.Exchange) == "" {
+		return nil, fmt.Errorf("交易所不能为空")
+	}
+	payload.Config = trimExchangeConfig(payload.Config)
+	if strings.TrimSpace(payload.Config.APIKey) == "" || strings.TrimSpace(payload.Config.SecretKey) == "" {
+		return nil, fmt.Errorf("API Key 和 Secret Key 不能为空")
+	}
+	if requiresPassphrase(payload.Exchange) && strings.TrimSpace(payload.Config.Passphrase) == "" {
+		return nil, fmt.Errorf("%s 需要填写 Passphrase", strings.ToUpper(payload.Exchange))
+	}
+	if err := validateAccountPayload(payload); err != nil {
+		return nil, err
+	}
+	id := makeRobotID(payload.Name)
+	now := time.Now()
+	account := &accountProfile{ID: id, Name: strings.TrimSpace(payload.Name), Exchange: payload.Exchange, Config: payload.Config, CreatedAt: now, UpdatedAt: now}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accounts[id] = account
+	if err := s.saveAccountsLocked(); err != nil {
+		delete(s.accounts, id)
+		return nil, err
+	}
+	return account, nil
+}
+
+func (s *consoleServer) updateAccount(id string, payload accountPayload) (*accountProfile, error) {
+	if strings.TrimSpace(payload.Name) == "" {
+		return nil, fmt.Errorf("账户名称不能为空")
+	}
+	if strings.TrimSpace(payload.Exchange) == "" {
+		return nil, fmt.Errorf("交易所不能为空")
+	}
+	s.mu.RLock()
+	existing, exists := s.accounts[id]
+	s.mu.RUnlock()
+	if !exists {
+		return nil, fmt.Errorf("账户不存在")
+	}
+	payload.Config = mergeExistingSecrets(payload.Config, existing.Config, payload.Exchange == existing.Exchange)
+	if strings.TrimSpace(payload.Config.APIKey) == "" || strings.TrimSpace(payload.Config.SecretKey) == "" {
+		return nil, fmt.Errorf("API Key 和 Secret Key 不能为空")
+	}
+	if requiresPassphrase(payload.Exchange) && strings.TrimSpace(payload.Config.Passphrase) == "" {
+		return nil, fmt.Errorf("%s 需要填写 Passphrase", strings.ToUpper(payload.Exchange))
+	}
+	if err := validateAccountPayload(payload); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account, ok := s.accounts[id]
+	if !ok {
+		return nil, fmt.Errorf("账户不存在")
+	}
+	account.Name = strings.TrimSpace(payload.Name)
+	account.Exchange = payload.Exchange
+	account.Config = payload.Config
+	account.UpdatedAt = time.Now()
+	for _, robot := range s.robots {
+		if robot.AccountID != id {
+			continue
+		}
+		if err := applyAccountConfigToRobot(robot, account); err != nil {
+			return nil, err
+		}
+		robot.UpdatedAt = time.Now()
+		if err := config.SaveConfig(robot.ConfigPath, robot.Config); err != nil {
+			return nil, fmt.Errorf("同步机器人 %s 的账户配置失败: %w", robot.Name, err)
+		}
+	}
+	if err := s.saveAccountsLocked(); err != nil {
+		return nil, err
+	}
+	if err := s.saveRobotsLocked(); err != nil {
+		return nil, err
+	}
+	return account, nil
+}
+
+func applyAccountConfigToRobot(robot *robotDefinition, account *accountProfile) error {
+	if robot == nil || robot.Config == nil {
+		return fmt.Errorf("机器人配置不存在")
+	}
+	if account == nil {
+		return fmt.Errorf("账户不存在")
+	}
+	robot.Config.App.CurrentExchange = account.Exchange
+	if robot.Config.Exchanges == nil {
+		robot.Config.Exchanges = make(map[string]config.ExchangeConfig)
+	}
+	robot.Config.Exchanges[account.Exchange] = account.Config
+	return nil
+}
+
+func trimExchangeConfig(cfg config.ExchangeConfig) config.ExchangeConfig {
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	cfg.SecretKey = strings.TrimSpace(cfg.SecretKey)
+	cfg.Passphrase = strings.TrimSpace(cfg.Passphrase)
+	return cfg
+}
+
+func mergeExistingSecrets(next, existing config.ExchangeConfig, sameExchange bool) config.ExchangeConfig {
+	next = trimExchangeConfig(next)
+	if !sameExchange {
+		return next
+	}
+	if isMaskedSecret(next.APIKey) {
+		next.APIKey = existing.APIKey
+	}
+	if isMaskedSecret(next.SecretKey) {
+		next.SecretKey = existing.SecretKey
+	}
+	if isMaskedSecret(next.Passphrase) {
+		next.Passphrase = existing.Passphrase
+	}
+	return next
+}
+
+func isMaskedSecret(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || value == secretMask
+}
+
+func strongEnoughPassword(password string) bool {
+	trimmed := strings.TrimSpace(password)
+	if len(trimmed) < 12 || strings.EqualFold(trimmed, "admin") {
+		return false
+	}
+	return true
+}
+
+func requiresPassphrase(exchangeName string) bool {
+	switch strings.ToLower(exchangeName) {
+	case "bitget", "okx":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateAccountPayload(payload accountPayload) error {
+	cfg := accountConfig(payload.Exchange, payload.Config, "BTCUSDT", "futures")
+	ex, err := exchange.NewExchange(cfg)
+	if err != nil {
+		spotCfg := accountConfig(payload.Exchange, payload.Config, "BTCUSDT", "spot")
+		spotEx, spotErr := exchange.NewExchange(spotCfg)
+		if spotErr != nil {
+			return fmt.Errorf("账户校验失败: %s", friendlyErrorMessage(err))
+		}
+		ex = spotEx
+		cfg = spotCfg
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := ex.GetAccount(ctx); err != nil {
+		if cfg.App.MarketType != "spot" {
+			spotCfg := accountConfig(payload.Exchange, payload.Config, "BTCUSDT", "spot")
+			spotEx, spotErr := exchange.NewExchange(spotCfg)
+			if spotErr == nil {
+				spotCtx, spotCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer spotCancel()
+				if _, spotAccountErr := spotEx.GetAccount(spotCtx); spotAccountErr == nil {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("API Key 校验失败: %s", friendlyErrorMessage(err))
+	}
+	return nil
+}
+
+func collectPublicSymbols(marketType string) []string {
+	symbolSet := make(map[string]bool)
+	for _, symbol := range fallbackSymbols() {
+		symbolSet[symbol] = true
+	}
+	if marketType == "spot" {
+		for _, symbol := range fetchBinanceSpotSymbols() {
+			symbolSet[symbol] = true
+		}
+		for _, symbol := range fetchBitgetSpotSymbols() {
+			symbolSet[symbol] = true
+		}
+		for _, symbol := range fetchBybitSpotSymbols() {
+			symbolSet[symbol] = true
+		}
+		for _, symbol := range fetchOKXSpotSymbols() {
+			symbolSet[symbol] = true
+		}
+		for _, symbol := range fetchGateSpotSymbols() {
+			symbolSet[symbol] = true
+		}
+		for _, symbol := range fetchHyperliquidSpotSymbols() {
+			symbolSet[symbol] = true
+		}
+	} else {
+		for _, symbol := range fetchBinanceFuturesSymbols() {
+			symbolSet[symbol] = true
+		}
+		for _, symbol := range fetchBitgetFuturesSymbols() {
+			symbolSet[symbol] = true
+		}
+	}
+	symbols := make([]string, 0, len(symbolSet))
+	for symbol := range symbolSet {
+		symbols = append(symbols, symbol)
+	}
+	sort.Strings(symbols)
+	return symbols
+}
+
+func fetchBinanceSpotSymbols() []string {
+	var payload struct {
+		Symbols []struct {
+			Symbol               string `json:"symbol"`
+			Status               string `json:"status"`
+			QuoteAsset           string `json:"quoteAsset"`
+			IsSpotTradingAllowed bool   `json:"isSpotTradingAllowed"`
+		} `json:"symbols"`
+	}
+	if err := fetchPublicJSON("https://api.binance.com/api/v3/exchangeInfo", &payload); err != nil {
+		logger.Warn("⚠️ 获取 Binance 现货交易对失败: %s", publicFetchErrorMessage(err))
+		return nil
+	}
+	var symbols []string
+	for _, item := range payload.Symbols {
+		if item.Status == "TRADING" && item.IsSpotTradingAllowed && (item.QuoteAsset == "USDT" || item.QuoteAsset == "USDC") {
+			symbols = append(symbols, strings.ToUpper(item.Symbol))
+		}
+	}
+	return symbols
+}
+
+func fetchBinanceFuturesSymbols() []string {
+	var payload struct {
+		Symbols []struct {
+			Symbol       string `json:"symbol"`
+			Status       string `json:"status"`
+			ContractType string `json:"contractType"`
+			QuoteAsset   string `json:"quoteAsset"`
+		} `json:"symbols"`
+	}
+	if err := fetchPublicJSON("https://fapi.binance.com/fapi/v1/exchangeInfo", &payload); err != nil {
+		logger.Warn("⚠️ 获取 Binance 合约交易对失败: %s", publicFetchErrorMessage(err))
+		return nil
+	}
+	var symbols []string
+	for _, item := range payload.Symbols {
+		if item.Status == "TRADING" && item.ContractType == "PERPETUAL" && (item.QuoteAsset == "USDT" || item.QuoteAsset == "USDC") {
+			symbols = append(symbols, strings.ToUpper(item.Symbol))
+		}
+	}
+	return symbols
+}
+
+func fetchBitgetSpotSymbols() []string {
+	var payload struct {
+		Code string `json:"code"`
+		Data []struct {
+			Symbol    string `json:"symbol"`
+			QuoteCoin string `json:"quoteCoin"`
+			Status    string `json:"status"`
+		} `json:"data"`
+	}
+	if err := fetchPublicJSON("https://api.bitget.com/api/v2/spot/public/symbols", &payload); err != nil {
+		logger.Warn("⚠️ 获取 Bitget 现货交易对失败: %v", err)
+		return nil
+	}
+	if payload.Code != "" && payload.Code != "00000" {
+		logger.Warn("⚠️ 获取 Bitget 现货交易对失败: code=%s", payload.Code)
+		return nil
+	}
+	var symbols []string
+	for _, item := range payload.Data {
+		if item.Status == "online" && (item.QuoteCoin == "USDT" || item.QuoteCoin == "USDC") {
+			if symbol := normalizeTradingSymbol(item.Symbol); symbol != "" {
+				symbols = append(symbols, symbol)
+			}
+		}
+	}
+	return symbols
+}
+
+func fetchBybitSpotSymbols() []string {
+	var payload struct {
+		RetCode int `json:"retCode"`
+		Result  struct {
+			List []struct {
+				Symbol    string `json:"symbol"`
+				QuoteCoin string `json:"quoteCoin"`
+				Status    string `json:"status"`
+			} `json:"list"`
+		} `json:"result"`
+	}
+	if err := fetchPublicJSON("https://api.bybit.com/v5/market/instruments-info?category=spot", &payload); err != nil {
+		logger.Warn("⚠️ 获取 Bybit 现货交易对失败: %v", err)
+		return nil
+	}
+	if payload.RetCode != 0 {
+		logger.Warn("⚠️ 获取 Bybit 现货交易对失败: code=%d", payload.RetCode)
+		return nil
+	}
+	var symbols []string
+	for _, item := range payload.Result.List {
+		if item.Status == "Trading" && (item.QuoteCoin == "USDT" || item.QuoteCoin == "USDC") {
+			symbols = append(symbols, strings.ToUpper(item.Symbol))
+		}
+	}
+	return symbols
+}
+
+func fetchOKXSpotSymbols() []string {
+	var payload struct {
+		Code string `json:"code"`
+		Data []struct {
+			InstID   string `json:"instId"`
+			QuoteCcy string `json:"quoteCcy"`
+			State    string `json:"state"`
+		} `json:"data"`
+	}
+	if err := fetchPublicJSON("https://www.okx.com/api/v5/public/instruments?instType=SPOT", &payload); err != nil {
+		logger.Warn("⚠️ 获取 OKX 现货交易对失败: %v", err)
+		return nil
+	}
+	if payload.Code != "" && payload.Code != "0" {
+		logger.Warn("⚠️ 获取 OKX 现货交易对失败: code=%s", payload.Code)
+		return nil
+	}
+	var symbols []string
+	for _, item := range payload.Data {
+		if item.State == "live" && (item.QuoteCcy == "USDT" || item.QuoteCcy == "USDC") {
+			if symbol := normalizeTradingSymbol(item.InstID); symbol != "" {
+				symbols = append(symbols, symbol)
+			}
+		}
+	}
+	return symbols
+}
+
+func fetchGateSpotSymbols() []string {
+	var items []struct {
+		ID          string `json:"id"`
+		Quote       string `json:"quote"`
+		TradeStatus string `json:"trade_status"`
+	}
+	if err := fetchPublicJSON("https://api.gateio.ws/api/v4/spot/currency_pairs", &items); err != nil {
+		logger.Warn("⚠️ 获取 Gate 现货交易对失败: %v", err)
+		return nil
+	}
+	var symbols []string
+	for _, item := range items {
+		if item.TradeStatus == "tradable" && (item.Quote == "USDT" || item.Quote == "USDC") {
+			if symbol := normalizeTradingSymbol(item.ID); symbol != "" {
+				symbols = append(symbols, symbol)
+			}
+		}
+	}
+	return symbols
+}
+
+func fetchHyperliquidSpotSymbols() []string {
+	var payload struct {
+		Universe []struct {
+			Name string `json:"name"`
+		} `json:"universe"`
+	}
+	if err := postPublicJSON("https://api.hyperliquid.xyz/info", map[string]string{"type": "spotMeta"}, &payload); err != nil {
+		logger.Warn("⚠️ 获取 Hyperliquid 现货交易对失败: %v", err)
+		return nil
+	}
+	var symbols []string
+	for _, item := range payload.Universe {
+		name := strings.ToUpper(item.Name)
+		if strings.HasSuffix(name, "/USDC") {
+			if symbol := normalizeTradingSymbol(name); symbol != "" {
+				symbols = append(symbols, symbol)
+			}
+		}
+	}
+	return symbols
+}
+
+func fetchBitgetFuturesSymbols() []string {
+	var symbols []string
+	for _, productType := range []string{"USDT-FUTURES", "USDC-FUTURES"} {
+		var payload struct {
+			Code string `json:"code"`
+			Data []struct {
+				Symbol       string `json:"symbol"`
+				SymbolStatus string `json:"symbolStatus"`
+				SymbolType   string `json:"symbolType"`
+			} `json:"data"`
+		}
+		url := "https://api.bitget.com/api/v2/mix/market/contracts?productType=" + productType
+		if err := fetchPublicJSON(url, &payload); err != nil {
+			logger.Warn("⚠️ 获取 Bitget %s 合约交易对失败: %v", productType, err)
+			continue
+		}
+		if payload.Code != "" && payload.Code != "00000" {
+			logger.Warn("⚠️ 获取 Bitget %s 合约交易对失败: code=%s", productType, payload.Code)
+			continue
+		}
+		for _, item := range payload.Data {
+			if item.SymbolStatus != "normal" || item.SymbolType != "perpetual" {
+				continue
+			}
+			if symbol := normalizeTradingSymbol(item.Symbol); symbol != "" {
+				symbols = append(symbols, symbol)
+			}
+		}
+	}
+	return symbols
+}
+
+func fetchPublicJSON(url string, dst interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(dst)
+}
+
+func postPublicJSON(url string, payload interface{}, dst interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(dst)
+}
+
+func publicFetchErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "status=451") || strings.Contains(lower, "restricted location") {
+		return "服务器所在地区被交易所限制访问，已使用内置交易对列表兜底。"
+	}
+	return msg
+}
+
+func fallbackSymbols() []string {
+	return []string{
+		"1000PEPEUSDT", "AAVEUSDT", "ADAUSDT", "APTUSDT", "ARBUSDT", "ATOMUSDT", "AVAXUSDT",
+		"BCHUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT", "DOTUSDT", "ENAUSDT", "EOSUSDT",
+		"ETCUSDT", "ETHUSDC", "ETHUSDT", "FILUSDT", "INJUSDT", "JUPUSDT", "LINKUSDT",
+		"LTCUSDT", "MATICUSDT", "NEARUSDT", "OPUSDT", "ORDIUSDT", "PEPEUSDT", "POLUSDT",
+		"PYTHUSDT", "SEIUSDT", "SHIBUSDT", "SOLUSDT", "SUIUSDT", "TIAUSDT", "TONUSDT",
+		"TRXUSDT", "UNIUSDT", "WIFUSDT", "WLDUSDT", "XRPUSDT",
+	}
+}
+
+func accountConfig(exchangeName string, exchangeConfig config.ExchangeConfig, symbol string, marketType string) *config.Config {
+	cfg := &config.Config{}
+	cfg.App.CurrentExchange = exchangeName
+	cfg.App.MarketType = normalizeMarketTypeParam(marketType)
+	cfg.Exchanges = map[string]config.ExchangeConfig{
+		exchangeName: exchangeConfig,
+	}
+	cfg.Trading.Symbol = normalizeTradingSymbol(symbol)
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 20
+	cfg.Trading.BuyWindowSize = hardcodedBuyWindowSize
+	cfg.Trading.SellWindowSize = hardcodedSellWindowSize
+	cfg.Trading.ReconcileInterval = hardcodedReconcileInterval
+	cfg.Trading.OrderCleanupThreshold = hardcodedOrderCleanupThreshold
+	cfg.Trading.CleanupBatchSize = hardcodedCleanupBatchSize
+	cfg.Trading.MarginLockDurationSec = hardcodedMarginLockSeconds
+	cfg.Trading.PositionSafetyCheck = hardcodedPositionSafetyCheck
+	cfg.Trading.AdoptExistingPosition = false
+	applyHardcodedRobotDefaults(cfg)
+	return cfg
+}
+
+func normalizeMarketTypeParam(marketType string) string {
+	switch strings.ToLower(strings.TrimSpace(marketType)) {
+	case "spot":
+		return "spot"
+	default:
+		return "futures"
+	}
+}
+
+func normalizeTradingSymbol(symbol string) string {
+	return strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(symbol), "/", ""))
+}
+
+func (s *consoleServer) deleteAccount(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, robot := range s.robots {
+		if robot.AccountID == id {
+			return fmt.Errorf("该账户正在被机器人 %s 使用，无法删除", robot.Name)
+		}
+	}
+	if _, ok := s.accounts[id]; !ok {
+		return fmt.Errorf("账户不存在")
+	}
+	delete(s.accounts, id)
+	delete(s.balanceCache, id)
+	return s.saveAccountsLocked()
+}
+
+func makeRobotID(name string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(name))
+	trimmed = strings.ReplaceAll(trimmed, " ", "-")
+	trimmed = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return -1
+	}, trimmed)
+	if trimmed == "" {
+		trimmed = "robot"
+	}
+	buf := make([]byte, 4)
+	_, _ = rand.Read(buf)
+	return fmt.Sprintf("%s-%s", trimmed, hex.EncodeToString(buf))
+}
+
+func robotOrderTag(id string) string {
+	sum := sha1.Sum([]byte(strings.TrimSpace(id)))
+	return utils.NormalizeOrderTag(hex.EncodeToString(sum[:])[:6])
+}
+
+func ensureRobotOrderTag(robot *robotDefinition) {
+	if robot == nil || robot.Config == nil {
+		return
+	}
+	if tag := utils.NormalizeOrderTag(robot.Config.Trading.OrderTag); tag != "" {
+		robot.Config.Trading.OrderTag = tag
+		return
+	}
+	robot.Config.Trading.OrderTag = robotOrderTag(robot.ID)
+}
+
+func cloneConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	if cfg.Exchanges != nil {
+		clone.Exchanges = make(map[string]config.ExchangeConfig, len(cfg.Exchanges))
+		for name, exchangeCfg := range cfg.Exchanges {
+			clone.Exchanges[name] = exchangeCfg
+		}
+	}
+	if cfg.RiskControl.MonitorSymbols != nil {
+		clone.RiskControl.MonitorSymbols = append([]string(nil), cfg.RiskControl.MonitorSymbols...)
+	}
+	return &clone
+}
+
+func cloneAccountProfile(account *accountProfile) *accountProfile {
+	if account == nil {
+		return nil
+	}
+	clone := *account
+	return &clone
+}
+
+func cloneRobotDefinition(robot *robotDefinition) *robotDefinition {
+	if robot == nil {
+		return nil
+	}
+	clone := *robot
+	clone.Config = cloneConfig(robot.Config)
+	return &clone
+}
+
+func (s *consoleServer) collectRobotViews() []robotView {
+	s.mu.RLock()
+	items := make([]*robotDefinition, 0, len(s.robots))
+	for _, robot := range s.robots {
+		items = append(items, cloneRobotDefinition(robot))
+	}
+	s.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt.Before(items[j].CreatedAt)
+	})
+	views := make([]robotView, len(items))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for i, robot := range items {
+		i, robot := i, robot
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			views[i] = s.buildRobotView(robot)
+		}()
+	}
+	wg.Wait()
+	return views
+}
+
+func (s *consoleServer) collectRobotConfigPaths() map[string]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	paths := make(map[string]bool, len(s.robots))
+	for _, robot := range s.robots {
+		if robot.ConfigPath != "" {
+			paths[filepath.Clean(robot.ConfigPath)] = true
+		}
+	}
+	return paths
+}
+
+func (s *consoleServer) collectArchivedRobotMetrics(activeConfigPaths map[string]bool) []robotMetric {
+	matches, err := filepath.Glob(filepath.Join(s.robotsDir, "*.stats.json"))
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	sort.Strings(matches)
+	metrics := make([]robotMetric, 0)
+	for _, statsPath := range matches {
+		configPath := strings.TrimSuffix(statsPath, ".stats.json")
+		if activeConfigPaths[filepath.Clean(configPath)] {
+			continue
+		}
+		statsSnapshot, err := tradestats.LoadWithLogFallback(statsPath, robotLogPath(configPath), 0)
+		if err != nil {
+			continue
+		}
+		todayStats := tradestats.Today(statsSnapshot)
+		metrics = append(metrics, robotMetric{
+			TodayRealizedPNL: todayStats.RealizedPNL,
+			TotalRealizedPNL: statsSnapshot.TotalRealizedPNL,
+			TodayVolume:      todayStats.Volume,
+			TotalVolume:      statsSnapshot.TotalVolume,
+		})
+	}
+	return metrics
+}
+
+func (s *consoleServer) buildRobotView(robot *robotDefinition) robotView {
+	s.mu.RLock()
+	view := s.buildRobotViewLocked(robot)
+	s.mu.RUnlock()
+	view.Metric = s.fetchRobotMetric(robot)
+	return view
+}
+
+func (s *consoleServer) buildRobotViewLocked(robot *robotDefinition) robotView {
+	view := robotView{
+		ID:        robot.ID,
+		Name:      robot.Name,
+		Config:    publicConfig(robot.Config),
+		AccountID: robot.AccountID,
+		Status:    "stopped",
+		UpdatedAt: robot.UpdatedAt,
+	}
+	if account, ok := s.accounts[robot.AccountID]; ok {
+		accountView := publicAccountView(account)
+		view.Account = &accountView
+	}
+	if proc, ok := s.processes[robot.ID]; ok {
+		view.Status = proc.Status
+		view.PID = proc.PID
+		view.StartedAt = proc.StartedAt
+		view.StoppedAt = proc.StoppedAt
+		view.LastError = proc.LastError
+		view.ExitReason = proc.ExitReason
+	}
+	return view
+}
+
+func (s *consoleServer) fetchRobotMetric(robot *robotDefinition) robotMetric {
+	statsMetric := robotStatsMetric(robot.ConfigPath, 0)
+	ex, err := exchange.NewExchange(robot.Config)
+	if err != nil {
+		statsMetric.Error = friendlyErrorMessage(err)
+		return statsMetric
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	account, err := ex.GetAccount(ctx)
+	if err != nil {
+		statsMetric.Error = friendlyErrorMessage(err)
+	} else {
+		statsMetric.Balance = account.TotalWalletBalance
+		statsMetric.AvailableBalance = account.AvailableBalance
+		statsMetric.MarginBalance = account.TotalMarginBalance
+	}
+	currentPrice, priceErr := ex.GetLatestPrice(ctx, robot.Config.Trading.Symbol)
+	if currentPrice > 0 {
+		statsMetric = mergeStatsMetric(statsMetric, robotStatsMetric(robot.ConfigPath, currentPrice))
+	}
+	openOrders, err := ex.GetOpenOrders(ctx, robot.Config.Trading.Symbol)
+	if err != nil && statsMetric.Error == "" {
+		statsMetric.Error = friendlyErrorMessage(err)
+	} else if err == nil {
+		statsMetric.OpenOrderCount = len(openOrders)
+	}
+	positions, err := ex.GetPositions(ctx, robot.Config.Trading.Symbol)
+	if err != nil && statsMetric.Error == "" {
+		statsMetric.Error = friendlyErrorMessage(err)
+	} else if err == nil {
+		var exchangePNL float64
+		for _, pos := range positions {
+			exchangePNL += pos.UnrealizedPNL
+		}
+		if exchangePNL != 0 {
+			statsMetric.UnrealizedPNL = exchangePNL
+		}
+		statsMetric.PositionCount = len(positions)
+	}
+	if currentPrice > 0 {
+		statsMetric.CurrentPrice = currentPrice
+	}
+	statsMetric.QuoteAsset = ex.GetQuoteAsset()
+	statsMetric.PriceError = friendlyErrorString(priceErr)
+	return statsMetric
+}
+
+func robotStatsMetric(configPath string, markPrice float64) robotMetric {
+	statsSnapshot, statsErr := tradestats.LoadWithLogFallback(tradestats.PathForConfig(configPath), robotLogPath(configPath), markPrice)
+	todayStats := tradestats.Today(statsSnapshot)
+	statsError := ""
+	if statsErr != nil {
+		statsError = friendlyErrorMessage(fmt.Errorf("读取交易统计失败: %w", statsErr))
+	}
+	return robotMetric{
+		CurrentPrice:     statsSnapshot.LastMarkPrice,
+		UnrealizedPNL:    statsSnapshot.UnrealizedPNL,
+		TodayRealizedPNL: todayStats.RealizedPNL,
+		TotalRealizedPNL: statsSnapshot.TotalRealizedPNL,
+		TodayVolume:      todayStats.Volume,
+		TotalVolume:      statsSnapshot.TotalVolume,
+		Error:            statsError,
+	}
+}
+
+func robotLogPath(configPath string) string {
+	ext := filepath.Ext(configPath)
+	if ext == "" {
+		return configPath + ".log"
+	}
+	return strings.TrimSuffix(configPath, ext) + ".log"
+}
+
+func mergeStatsMetric(base, next robotMetric) robotMetric {
+	if next.CurrentPrice > 0 {
+		base.CurrentPrice = next.CurrentPrice
+	}
+	base.UnrealizedPNL = next.UnrealizedPNL
+	base.TodayRealizedPNL = next.TodayRealizedPNL
+	base.TotalRealizedPNL = next.TotalRealizedPNL
+	base.TodayVolume = next.TodayVolume
+	base.TotalVolume = next.TotalVolume
+	if next.Error != "" {
+		base.Error = next.Error
+	}
+	return base
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func friendlyErrorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return friendlyErrorMessage(err)
+}
+
+func friendlyRobotExitError(err error, logPath string) string {
+	logTail := tailTextFile(logPath, 4096)
+	if logTail != "" {
+		return friendlyErrorMessage(errors.New(logTail))
+	}
+	return friendlyErrorMessage(err)
+}
+
+func tailTextFile(path string, maxBytes int) string {
+	if strings.TrimSpace(path) == "" || maxBytes <= 0 {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	if len(data) > maxBytes {
+		data = data[len(data)-maxBytes:]
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		return line
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func friendlyErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	msg = strings.TrimPrefix(msg, "Error:")
+	msg = strings.TrimSpace(msg)
+	if strings.Contains(msg, "❌") {
+		parts := strings.Split(msg, "❌")
+		msg = parts[len(parts)-1]
+	}
+	msg = strings.TrimPrefix(strings.TrimSpace(msg), "[FATAL]")
+	msg = strings.TrimPrefix(strings.TrimSpace(msg), "[ERROR]")
+	msg = strings.TrimPrefix(strings.TrimSpace(msg), "ERROR")
+	msg = strings.TrimPrefix(strings.TrimSpace(msg), "FATAL")
+	msg = strings.TrimSpace(msg)
+	lower := strings.ToLower(msg)
+
+	switch {
+	case strings.Contains(lower, "status=451") || strings.Contains(lower, "restricted location") || strings.Contains(lower, "限制服务区域"):
+		return "服务器所在地区被交易所限制访问。请更换服务器地区、配置代理，或改用当前地区可访问的交易所。"
+	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout") || strings.Contains(lower, "timeout") || strings.Contains(lower, "i/o timeout"):
+		return "连接交易所超时。请检查服务器网络、交易所是否可访问，以及 API 是否限制了服务器 IP。"
+	case strings.Contains(lower, "no such host") || strings.Contains(lower, "temporary failure in name resolution") || strings.Contains(lower, "connection refused") || strings.Contains(lower, "network is unreachable"):
+		return "服务器无法连接交易所。请检查服务器网络、DNS、防火墙或地区访问限制。"
+	case strings.Contains(lower, "invalid api") || strings.Contains(lower, "api key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "invalid key") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "401"):
+		return "API Key 无效或权限不足。请检查 API Key、Secret Key、交易权限，并确认没有开启提现权限。"
+	case strings.Contains(lower, "signature") || strings.Contains(lower, "sign") || strings.Contains(lower, "签名"):
+		return "API Secret 或 Passphrase 不正确，导致签名校验失败。请重新复制 API 信息。"
+	case strings.Contains(lower, "passphrase"):
+		return "Passphrase 不正确或未填写。Bitget 和 OKX 必须填写创建 API 时设置的 Passphrase。"
+	case strings.Contains(lower, "ip") && (strings.Contains(lower, "restrict") || strings.Contains(lower, "whitelist") || strings.Contains(lower, "not permitted") || strings.Contains(lower, "not allowed")):
+		return "API 限制了 IP 白名单。请把当前服务器公网 IP 加到交易所 API 白名单。"
+	case strings.Contains(lower, "insufficient") || strings.Contains(lower, "余额不足") || strings.Contains(lower, "balance") && strings.Contains(lower, "not enough"):
+		return "账户可用余额不足。请充值、降低每单金额，或检查合约保证金账户是否有资金。"
+	case strings.Contains(lower, "symbol") || strings.Contains(lower, "instrument") || strings.Contains(lower, "contract") || strings.Contains(lower, "instid"):
+		return "交易币种不被当前交易所或当前市场支持。请检查现货/合约选择和交易对名称。"
+	case strings.Contains(lower, "price") && (strings.Contains(lower, "precision") || strings.Contains(lower, "tick") || strings.Contains(lower, "invalid")):
+		return "价格精度不符合交易所要求。请调整价格间隔，或换一个支持的交易对。"
+	case strings.Contains(lower, "quantity") || strings.Contains(lower, "size") || strings.Contains(lower, "lot") || strings.Contains(lower, "min order"):
+		return "下单数量或最小订单金额不符合交易所要求。请提高每单金额或最小订单价值。"
+	case strings.Contains(lower, "websocket") || strings.Contains(lower, "web socket") || strings.Contains(lower, "价格流"):
+		return "实时价格连接失败。请检查服务器能否访问交易所 WebSocket，或稍后重试。"
+	case strings.Contains(lower, "无法从") && strings.Contains(lower, "获取价格"):
+		return "无法读取实时价格。请检查交易对是否正确，以及服务器能否访问交易所行情接口。"
+	case strings.Contains(lower, "exit status"):
+		return "机器人启动后立即退出。请检查 API、交易对、余额和服务器网络。"
+	}
+
+	if msg == "" {
+		return "操作失败。请检查 API、交易对、余额和服务器网络。"
+	}
+	if len([]rune(msg)) > 180 {
+		return "操作失败。请检查 API、交易对、余额和服务器网络；详细原因可查看机器人日志。"
+	}
+	return msg
+}
+
+func writeJSON(w http.ResponseWriter, value interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func (s *consoleServer) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(consoleHTML))
+}

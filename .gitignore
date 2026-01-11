@@ -1,0 +1,74 @@
+################################
+# Go 构建产物 / 二进制文件
+################################
+# go build 输出（当前目录）
+./opensqt_free
+./opensqt
+/nexus-trade-bot
+/nexus-trade-bot.pid
+nexus-trade-bot.local.pid
+nexus-trade-bot.local.pid.port
+# 一般二进制可执行文件（无扩展名）
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 其它常见构建/缓存目录
+bin/
+dist/
+build/
+test/
+################################
+# 日志文件
+################################
+log/
+logs/
+*.log
+
+################################
+# 配置文件
+################################
+# 真实配置（包含密钥等）
+config.yaml
+config.local.*
+*.local.yaml
+*.local.yml
+*.local.json
+*.auth.json
+.env
+*.env
+.env.*
+web_console_accounts.json
+web_console_robots.json
+web_console_robots/
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+
+# 如果以后有本地覆盖配置，也可以加：
+# config.local.yaml
+
+################################
+# Go 相关忽略
+################################
+# go module 缓存
+vendor/
+
+# IDE / 编辑器文件
+.vscode/
+.idea/
+*.iml
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+
+opensqt

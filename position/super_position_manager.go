@@ -1,0 +1,2486 @@
+package position
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"nexus-trade-bot/config"
+	"nexus-trade-bot/logger"
+	"nexus-trade-bot/utils"
+)
+
+// OrderUpdate 订单更新事件（避免依赖 websocket 包）
+type OrderUpdate struct {
+	OrderID       int64
+	ClientOrderID string
+	Symbol        string
+	Status        string
+	ExecutedQty   float64
+	Price         float64
+	AvgPrice      float64
+	Side          string
+	Type          string
+	UpdateTime    int64
+}
+
+type orderFillProgress struct {
+	ExecutedQty float64
+	Terminal    bool
+	UpdatedAt   time.Time
+}
+
+// OrderExecutorInterface 订单执行器接口（避免循环导入）
+type OrderExecutorInterface interface {
+	PlaceOrder(req *OrderRequest) (*Order, error)
+	BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool)
+	BatchCancelOrders(orderIDs []int64) error
+}
+
+// OrderRequest 订单请求（避免循环导入）
+type OrderRequest struct {
+	Symbol        string
+	Side          string
+	Price         float64
+	Quantity      float64
+	PriceDecimals int    // 价格小数位数（用于格式化价格字符串）
+	ReduceOnly    bool   // 是否只减仓（平仓单）
+	PostOnly      bool   // 是否只做 Maker（Post Only）
+	ClientOrderID string // 自定义订单ID
+}
+
+// Order 订单信息（避免循环导入）
+type Order struct {
+	OrderID       int64
+	ClientOrderID string
+	Symbol        string
+	Side          string
+	Price         float64
+	Quantity      float64
+	Status        string
+	CreatedAt     time.Time
+}
+
+// 订单状态常量
+const (
+	OrderStatusNotPlaced       = "NOT_PLACED"       // 未下单
+	OrderStatusPlaced          = "PLACED"           // 已下单
+	OrderStatusConfirmed       = "CONFIRMED"        // 已确认（WebSocket确认）
+	OrderStatusPartiallyFilled = "PARTIALLY_FILLED" // 部分成交
+	OrderStatusFilled          = "FILLED"           // 全部成交
+	OrderStatusCancelRequested = "CANCEL_REQUESTED" // 已申请撤单
+	OrderStatusCanceled        = "CANCELED"         // 已撤单
+)
+
+// 持仓状态常量
+const (
+	PositionStatusEmpty  = "EMPTY"  // 空仓
+	PositionStatusFilled = "FILLED" // 有仓
+)
+
+const (
+	BookSideLong  = "LONG"
+	BookSideShort = "SHORT"
+)
+
+// 槽位锁定状态
+const (
+	SlotStatusFree    = "FREE"    // 空闲，可操作
+	SlotStatusPending = "PENDING" // 等待下单确认
+	SlotStatusLocked  = "LOCKED"  // 已锁定，有活跃订单
+)
+
+// InventorySlot 库存槽位（每个价格点一个）
+type InventorySlot struct {
+	Price float64 // 价格（作为key，支持高精度）
+
+	// 持仓信息
+	PositionStatus string  // 持仓状态：空仓/有仓
+	PositionQty    float64 // 持仓数量（支持小数点后3位）
+	BookSide       string  // 槽位归属方向：LONG/SHORT
+
+	// 订单信息 (买卖互斥)
+	OrderID        int64     // 订单ID
+	ClientOID      string    // 自定义订单ID
+	OrderSide      string    // 订单方向 (BUY/SELL)
+	OrderStatus    string    // 订单状态
+	OrderPrice     float64   // 订单价格
+	OrderFilledQty float64   // 成交数量
+	OrderCreatedAt time.Time // 创建时间
+
+	// 🔥 新增：槽位锁定状态，防止并发重复操作
+	SlotStatus string // FREE/PENDING/LOCKED
+
+	// PostOnly失败计数（连续失败3次后降级为普通单）
+	PostOnlyFailCount int
+
+	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
+}
+
+// PositionInfo 持仓信息（简化版，避免循环导入）
+type PositionInfo struct {
+	Symbol        string
+	Size          float64
+	EntryPrice    float64
+	MarkPrice     float64
+	UnrealizedPNL float64
+}
+
+// IExchange 交易所接口（避免循环导入）
+// 注意：这里不能直接使用 exchange.IExchange，否则会循环导入
+// 所以定义一个子集接口，只包含对账需要的方法
+type IExchange interface {
+	GetName() string // 获取交易所名称
+	GetPositions(ctx context.Context, symbol string) (interface{}, error)
+	GetOpenOrders(ctx context.Context, symbol string) (interface{}, error)
+	GetOrder(ctx context.Context, symbol string, orderID int64) (interface{}, error)
+	GetBaseAsset() string                                     // 获取基础资产（交易币种）
+	CancelAllOrders(ctx context.Context, symbol string) error // 取消所有订单
+}
+
+// SuperPositionManager 超级仓位管理器
+type SuperPositionManager struct {
+	config   *config.Config
+	executor OrderExecutorInterface
+	exchange IExchange
+
+	// 价格锚点（初始化时的市场价格）
+	anchorPrice float64
+	// 最后市场价格（用于打印状态）
+	lastMarketPrice atomic.Value // float64
+	// 价格精度（根据锚点价格检测得出的小数位数）
+	priceDecimals int
+	// 数量精度（从交易所获取）
+	quantityDecimals int
+
+	// 库存槽位：方向+价格 -> 槽位。neutral 模式下同一价格会同时有 LONG/SHORT 两套状态。
+	slots sync.Map // map[string]*InventorySlot
+
+	// 订单成交进度：ClientOrderID -> 已处理累计成交量。
+	// 交易所（尤其是 Bitget 私有流）可能重复推送同一张订单的终态事件；槽位释放后仍需要这层记忆保证幂等。
+	orderFills sync.Map // map[string]orderFillProgress
+
+	// 保证金管理
+	insufficientMargin bool
+	marginLockTime     time.Time
+	marginLockDuration time.Duration
+
+	// 统计（注意：以下字段被 safety.Reconciler 和 PrintPositions 使用，不可删除）
+	totalBuyQty       atomic.Value // float64 - 累计买入数量
+	totalSellQty      atomic.Value // float64 - 累计卖出数量
+	totalRealizedPNL  atomic.Value // float64 - 已实现净盈亏（按平仓成交价差累计）
+	statsMu           sync.Mutex
+	reconcileCount    atomic.Int64 // 对账次数
+	lastReconcileTime atomic.Value // time.Time - 最后对账时间
+
+	// 初始化标志
+	isInitialized atomic.Bool
+
+	mu sync.RWMutex // 全局锁（用于关键操作）
+}
+
+// NewSuperPositionManager 创建超级仓位管理器
+func NewSuperPositionManager(cfg *config.Config, executor OrderExecutorInterface, exchange IExchange, priceDecimals, quantityDecimals int) *SuperPositionManager {
+	marginLockSec := cfg.Trading.MarginLockDurationSec
+	if marginLockSec <= 0 {
+		marginLockSec = 10 // 默认10秒
+	}
+
+	spm := &SuperPositionManager{
+		config:             cfg,
+		executor:           executor,
+		exchange:           exchange,
+		insufficientMargin: false,
+		marginLockDuration: time.Duration(marginLockSec) * time.Second,
+		priceDecimals:      priceDecimals,
+		quantityDecimals:   quantityDecimals,
+	}
+	spm.totalBuyQty.Store(0.0)
+	spm.totalSellQty.Store(0.0)
+	spm.totalRealizedPNL.Store(0.0)
+	spm.lastReconcileTime.Store(time.Now())
+	spm.lastMarketPrice.Store(0.0)
+	return spm
+}
+
+func (spm *SuperPositionManager) tradingDirection() string {
+	direction := strings.ToLower(spm.config.Trading.Direction)
+	if direction == "" {
+		return "long"
+	}
+	return direction
+}
+
+func (spm *SuperPositionManager) enabledBookSides() []string {
+	switch spm.tradingDirection() {
+	case "short":
+		return []string{BookSideShort}
+	case "neutral":
+		return []string{BookSideLong, BookSideShort}
+	default:
+		return []string{BookSideLong}
+	}
+}
+
+func (spm *SuperPositionManager) entryOrderSide(bookSide string) string {
+	if bookSide == BookSideShort {
+		return "SELL"
+	}
+	return "BUY"
+}
+
+func (spm *SuperPositionManager) exitOrderSide(bookSide string) string {
+	if bookSide == BookSideShort {
+		return "BUY"
+	}
+	return "SELL"
+}
+
+func (spm *SuperPositionManager) entrySlotDirection(bookSide string) string {
+	if bookSide == BookSideShort {
+		return "up"
+	}
+	return "down"
+}
+
+func (spm *SuperPositionManager) exitPrice(slotPrice float64, bookSide string) float64 {
+	price := slotPrice + spm.config.Trading.PriceInterval
+	if bookSide == BookSideShort {
+		price = slotPrice - spm.config.Trading.PriceInterval
+	}
+	return roundPrice(price, spm.priceDecimals)
+}
+
+func (spm *SuperPositionManager) slotBelongsToBook(slot *InventorySlot, bookSide string) bool {
+	if slot.BookSide == "" {
+		return bookSide == BookSideLong
+	}
+	return slot.BookSide == bookSide
+}
+
+func (spm *SuperPositionManager) isEntryOrder(side, bookSide string) bool {
+	return side == spm.entryOrderSide(bookSide)
+}
+
+func (spm *SuperPositionManager) addTradedQty(side string, deltaQty float64) {
+	if deltaQty <= 0 {
+		return
+	}
+	spm.statsMu.Lock()
+	defer spm.statsMu.Unlock()
+	if side == "BUY" {
+		oldTotal := spm.totalBuyQty.Load().(float64)
+		spm.totalBuyQty.Store(oldTotal + deltaQty)
+		return
+	}
+	oldTotal := spm.totalSellQty.Load().(float64)
+	spm.totalSellQty.Store(oldTotal + deltaQty)
+}
+
+func (spm *SuperPositionManager) addRealizedPNL(entryPrice, tradePrice, qty float64, bookSide string) {
+	realized := gridRealizedPNL(entryPrice, tradePrice, qty, bookSide, spm.currentFeeRate())
+	if realized == 0 {
+		return
+	}
+	spm.statsMu.Lock()
+	defer spm.statsMu.Unlock()
+	oldTotal := spm.totalRealizedPNL.Load().(float64)
+	spm.totalRealizedPNL.Store(oldTotal + realized)
+}
+
+func (spm *SuperPositionManager) currentFeeRate() float64 {
+	exchangeCfg := spm.config.Exchanges[spm.config.App.CurrentExchange]
+	if exchangeCfg.FeeRate < 0 {
+		return 0
+	}
+	return exchangeCfg.FeeRate
+}
+
+// Initialize 初始化管理器（设置价格锚点并创建初始槽位）
+func (spm *SuperPositionManager) Initialize(initialPrice float64, initialPriceStr string) error {
+	spm.mu.Lock()
+	defer spm.mu.Unlock()
+
+	if initialPrice <= 0 {
+		return fmt.Errorf("初始价格无效: %.2f", initialPrice)
+	}
+
+	// 1. 设置价格锚点（精度信息已经在构造函数中设置，从交易所获取）
+	spm.anchorPrice = initialPrice
+	spm.lastMarketPrice.Store(initialPrice) // 初始化最后市场价格
+	logger.Info("✅ 价格锚点已设置: %s, 价格精度:%d, 数量精度:%d",
+		formatPrice(initialPrice, spm.priceDecimals), spm.priceDecimals, spm.quantityDecimals)
+
+	// 2. 直接使用锚点价格作为网格价格（不再对齐到整数）
+	initialGridPrice := spm.anchorPrice
+	logger.Info("✅ 初始网格价格: %s (使用锚点价格)", formatPrice(initialGridPrice, spm.priceDecimals))
+
+	for _, bookSide := range spm.enabledBookSides() {
+		slotPrices := spm.calculateSlotPrices(initialGridPrice, spm.config.Trading.BuyWindowSize, spm.entrySlotDirection(bookSide))
+		for _, price := range slotPrices {
+			slot := spm.getOrCreateSlot(price, bookSide)
+			slot.mu.Lock()
+			slot.BookSide = bookSide
+			slot.mu.Unlock()
+		}
+		slotPricesStr := make([]string, len(slotPrices))
+		for i, p := range slotPrices {
+			slotPricesStr[i] = formatPrice(p, spm.priceDecimals)
+		}
+		logger.Info("✅ [初始化-%s] 计算出的槽位价格: %v", bookSide, slotPricesStr)
+	}
+
+	// 5. 为初始槽位下买单
+	err := spm.placeInitialBuyOrders()
+	if err == nil {
+		// 标记为已初始化
+		spm.isInitialized.Store(true)
+		logger.Info("✅ 初始化完成，网格价格: %s", formatPrice(initialGridPrice, spm.priceDecimals))
+	}
+	return err
+}
+
+// generateClientOrderID 生成自定义订单ID
+// 使用新的紧凑格式，最大长度不超过18字符
+// 格式: {price_int}_{side}_{timestamp}{seq}
+// price_int: price * 10^decimals (转为整数)
+// side: B=Buy, S=Sell
+func (spm *SuperPositionManager) generateClientOrderID(price float64, side, bookSide string) string {
+	// 使用统一的 utils 包生成紧凑ID
+	return utils.GenerateOrderIDWithTag(price, side, bookSide, spm.priceDecimals, spm.config.Trading.OrderTag)
+}
+
+// parseClientOrderID 解析 ClientOrderID
+// 返回: price, side, bookSide, valid
+func (spm *SuperPositionManager) parseClientOrderID(clientOrderID string) (float64, string, string, bool) {
+	// 1. 先移除交易所前缀
+	exchangeName := strings.ToLower(spm.exchange.GetName())
+	cleanID := utils.RemoveBrokerPrefix(exchangeName, clientOrderID)
+
+	// 2. 使用统一的 utils 包解析
+	price, side, bookSide, _, orderTag, valid := utils.ParseOrderIDWithTag(cleanID, spm.priceDecimals)
+	if !valid {
+		return 0, "", "", false
+	}
+	currentTag := utils.NormalizeOrderTag(spm.config.Trading.OrderTag)
+	parsedTag := utils.NormalizeOrderTag(orderTag)
+	if currentTag != "" && parsedTag != "" && parsedTag != currentTag {
+		return 0, "", "", false
+	}
+
+	// 🔥 关键修复：不要对从ClientOrderID解析出的价格进行四舍五入！
+	// 因为价格本身就是从整数还原的，已经是精确的值
+	// 如果再次四舍五入，可能因为浮点数精度问题导致多个不同价格被映射到同一个槽位
+	// 例如: 3116.85 和 3114.85 可能都被四舍五入成同一个值
+
+	return price, side, bookSide, true
+}
+
+// placeInitialBuyOrders 设定初始槽位（并恢复持仓槽位）
+func (spm *SuperPositionManager) placeInitialBuyOrders() error {
+	// 🔥 修改：只恢复持仓槽位，不再主动下单
+	// 所有下单操作由 AdjustOrders 统一处理，避免时序问题
+	existing := spm.getExistingPositions()
+	if !spm.config.Trading.AdoptExistingPosition {
+		if existing.LongQty > 0 || existing.ShortQty > 0 {
+			logger.Warn("🛡️ [持仓恢复] 检测到交易所已有持仓 Long=%.8f Short=%.8f，但 adopt_existing_position=false，已视为手动底仓，不创建平仓槽位",
+				existing.LongQty, existing.ShortQty)
+		}
+		logger.Info("✅ [初始化] 槽位已创建，订单下达将由 AdjustOrders 统一处理")
+		return nil
+	}
+	if existing.LongQty > 0 {
+		logger.Info("🔄 [持仓恢复] 检测到现有多仓: %.4f，参考价: %s，开始初始化多头平仓槽位", existing.LongQty, formatPrice(existing.LongEntry, spm.priceDecimals))
+		spm.initializeSlotsFromPosition(existing.LongQty, BookSideLong, existing.LongEntry)
+	}
+	if existing.ShortQty > 0 {
+		logger.Info("🔄 [持仓恢复] 检测到现有空仓: %.4f，参考价: %s，开始初始化空头平仓槽位", existing.ShortQty, formatPrice(existing.ShortEntry, spm.priceDecimals))
+		spm.initializeSlotsFromPosition(existing.ShortQty, BookSideShort, existing.ShortEntry)
+	}
+
+	logger.Info("✅ [初始化] 槽位已创建，订单下达将由 AdjustOrders 统一处理")
+	return nil
+}
+
+// AdjustOrders 调整订单（交易入口）
+func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
+	return spm.adjustOrders(currentPrice, true)
+}
+
+func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowRebalance bool) error {
+	// 🔥 移除初始化检查：现在完全由 AdjustOrders 控制所有下单
+	// 初始化只负责恢复持仓状态，不再下单
+
+	spm.mu.Lock()
+
+	// 验证价格有效性
+	if currentPrice <= 0 {
+		logger.Warn("⚠️ 收到无效价格: %.2f，跳过订单调整", currentPrice)
+		spm.mu.Unlock()
+		return nil
+	}
+
+	// 对当前价格进行精度处理
+	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
+
+	// 更新最后市场价格（用于打印状态）
+	spm.lastMarketPrice.Store(currentPrice)
+
+	// 检查保证金不足状态
+	if spm.insufficientMargin {
+		if time.Since(spm.marginLockTime) >= spm.marginLockDuration {
+			logger.Info("✅ [保证金恢复] 锁定时间已过，恢复下单功能")
+			spm.insufficientMargin = false
+		} else {
+			remainingTime := spm.marginLockDuration - time.Since(spm.marginLockTime)
+			logger.Warn("⏸️ [暂停下单] 保证金不足，暂停下单中... (剩余时间: %.0f秒)", remainingTime.Seconds())
+			spm.mu.Unlock()
+			return nil
+		}
+	}
+
+	buyWindowSize := spm.config.Trading.BuyWindowSize
+	sellWindowSize := spm.config.Trading.SellWindowSize
+	currentGridPrice := spm.findNearestGridPrice(currentPrice)
+	spm.pruneEmptyFarSlots(currentGridPrice, maxInt(buyWindowSize, sellWindowSize)*4+10)
+
+	// 计算允许创建的订单数量上限
+	threshold := spm.config.Trading.OrderCleanupThreshold
+	if threshold <= 0 {
+		threshold = 100
+	}
+
+	enabledBookSides := spm.enabledBookSides()
+	desiredEntryPrices := make(map[string]map[float64]bool, len(enabledBookSides))
+	desiredEntrySlots := make(map[string][]float64, len(enabledBookSides))
+
+	for _, bookSide := range enabledBookSides {
+		desiredEntryPrices[bookSide] = make(map[float64]bool)
+		slotPrices := spm.calculateEntrySlotPrices(currentGridPrice, currentPrice, buyWindowSize, bookSide)
+		for _, price := range slotPrices {
+			desiredEntryPrices[bookSide][price] = true
+			desiredEntrySlots[bookSide] = append(desiredEntrySlots[bookSide], price)
+		}
+	}
+
+	if allowWindowRebalance {
+		if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
+			return err
+		} else if rebalanced {
+			spm.mu.Unlock()
+			return spm.adjustOrders(currentPrice, false)
+		}
+	}
+
+	var ordersToPlace []*OrderRequest
+
+	// 统计当前所有订单数量（分别统计买单和卖单）
+	var currentOrderCount int
+	var currentBuyOrderCount int
+	var currentSellOrderCount int
+	currentEntryOrdersByBook := make(map[string]int, len(enabledBookSides))
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		if slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed ||
+			slot.OrderStatus == OrderStatusPartiallyFilled {
+			currentOrderCount++
+			if slot.OrderSide == "BUY" {
+				currentBuyOrderCount++
+			} else if slot.OrderSide == "SELL" {
+				currentSellOrderCount++
+			}
+			if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
+				currentEntryOrdersByBook[slot.BookSide]++
+			}
+		}
+		slot.mu.RUnlock()
+		return true
+	})
+
+	// 🔥 核心改进：不预留空间，允许订单数达到threshold上限
+	// 剩余可用订单数 = 阈值 - 当前订单数
+	remainingOrders := threshold - currentOrderCount
+	if remainingOrders < 0 {
+		remainingOrders = 0
+	}
+
+	type exitCandidate struct {
+		SlotPrice     float64
+		ExitPrice     float64
+		Quantity      float64
+		DistanceToMid float64
+		BookSide      string
+	}
+	var exitCandidates []exitCandidate
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slotPrice := slot.Price
+		slot.mu.Lock()
+		defer slot.mu.Unlock()
+		if slot.PositionStatus != PositionStatusFilled || slot.SlotStatus != SlotStatusFree || slot.OrderID != 0 || slot.ClientOID != "" || slot.PositionQty <= 0 {
+			return true
+		}
+		exitPrice := spm.exitPrice(slotPrice, slot.BookSide)
+		if slot.BookSide == BookSideLong {
+			sellWindowMaxPrice := roundPrice(currentPrice+float64(sellWindowSize)*spm.config.Trading.PriceInterval, spm.priceDecimals)
+			if slotPrice > sellWindowMaxPrice {
+				return true
+			}
+		} else {
+			buyWindowMinPrice := roundPrice(currentPrice-float64(sellWindowSize)*spm.config.Trading.PriceInterval, spm.priceDecimals)
+			if slotPrice < buyWindowMinPrice {
+				return true
+			}
+		}
+		exitPrice = spm.makerSafeExitPrice(exitPrice, currentPrice, slot.BookSide)
+		exitQty, ok := spm.exitOrderQuantity(slot.PositionQty, exitPrice)
+		if !ok {
+			return true
+		}
+		orderValue := exitPrice * exitQty
+		minValue := spm.minOrderValue()
+		if orderValue >= minValue {
+			exitCandidates = append(exitCandidates, exitCandidate{SlotPrice: slotPrice, ExitPrice: exitPrice, Quantity: exitQty, DistanceToMid: math.Abs(slotPrice - currentPrice), BookSide: slot.BookSide})
+		}
+		return true
+	})
+	sort.Slice(exitCandidates, func(i, j int) bool { return exitCandidates[i].DistanceToMid < exitCandidates[j].DistanceToMid })
+
+	allowedNewExitOrders := sellWindowSize
+	projectedExitOrdersToCreate := len(exitCandidates)
+	if projectedExitOrdersToCreate > allowedNewExitOrders {
+		projectedExitOrdersToCreate = allowedNewExitOrders
+	}
+	remainingOrdersForEntry := threshold - currentOrderCount - projectedExitOrdersToCreate
+	if remainingOrdersForEntry < 0 {
+		remainingOrdersForEntry = 0
+	}
+
+	exitOrdersToCreate := 0
+	for i := 0; i < len(exitCandidates) && exitOrdersToCreate < allowedNewExitOrders; i++ {
+		candidate := exitCandidates[i]
+		slot := spm.getOrCreateSlot(candidate.SlotPrice, candidate.BookSide)
+		slot.mu.Lock()
+		if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
+			slot.mu.Unlock()
+			continue
+		}
+		slot.SlotStatus = SlotStatusPending
+		usePostOnly := true
+		slot.mu.Unlock()
+		exitSide := spm.exitOrderSide(candidate.BookSide)
+		clientOID := spm.generateClientOrderID(candidate.SlotPrice, exitSide, candidate.BookSide)
+		ordersToPlace = append(ordersToPlace, &OrderRequest{Symbol: spm.config.Trading.Symbol, Side: exitSide, Price: candidate.ExitPrice, Quantity: candidate.Quantity, PriceDecimals: spm.priceDecimals, ReduceOnly: true, PostOnly: usePostOnly, ClientOrderID: clientOID})
+		exitOrdersToCreate++
+	}
+
+	remainingOrdersForEntry = threshold - currentOrderCount - exitOrdersToCreate
+	if remainingOrdersForEntry < 0 {
+		remainingOrdersForEntry = 0
+	}
+
+	allowedNewEntryOrders := buyWindowSize
+	if allowedNewEntryOrders > remainingOrdersForEntry {
+		allowedNewEntryOrders = remainingOrdersForEntry
+	}
+	entryOrderQuotaByBook := make(map[string]int, len(enabledBookSides))
+	for _, bookSide := range enabledBookSides {
+		quota := allowedNewEntryOrders
+		if quota > buyWindowSize-currentEntryOrdersByBook[bookSide] {
+			quota = buyWindowSize - currentEntryOrdersByBook[bookSide]
+		}
+		if quota < 0 {
+			quota = 0
+		}
+		entryOrderQuotaByBook[bookSide] = quota
+	}
+	if len(enabledBookSides) > 1 && remainingOrdersForEntry < buyWindowSize*len(enabledBookSides) {
+		baseQuota := remainingOrdersForEntry / len(enabledBookSides)
+		extraQuota := remainingOrdersForEntry % len(enabledBookSides)
+		for i, bookSide := range enabledBookSides {
+			quota := baseQuota
+			if i < extraQuota {
+				quota++
+			}
+			if quota > buyWindowSize-currentEntryOrdersByBook[bookSide] {
+				quota = buyWindowSize - currentEntryOrdersByBook[bookSide]
+			}
+			if quota < 0 {
+				quota = 0
+			}
+			entryOrderQuotaByBook[bookSide] = quota
+		}
+	}
+	entryOrdersToCreate := 0
+	entryOrdersByBook := make(map[string]int, len(enabledBookSides))
+
+	for _, bookSide := range enabledBookSides {
+		entrySide := spm.entryOrderSide(bookSide)
+		for _, price := range desiredEntrySlots[bookSide] {
+			slot := spm.getOrCreateSlot(price, bookSide)
+			slot.mu.Lock()
+			slot.BookSide = bookSide
+			if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusEmpty {
+				slot.mu.Unlock()
+				continue
+			}
+			hasActiveOrder := slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed || slot.OrderStatus == OrderStatusPartiallyFilled
+			if hasActiveOrder || slot.OrderID != 0 || slot.ClientOID != "" || entryOrdersByBook[bookSide] >= entryOrderQuotaByBook[bookSide] {
+				slot.mu.Unlock()
+				continue
+			}
+
+			quantity, ok := spm.entryOrderQuantity(price)
+			if !ok {
+				slot.mu.Unlock()
+				continue
+			}
+			clientOID := spm.generateClientOrderID(price, entrySide, bookSide)
+			slot.SlotStatus = SlotStatusPending
+			usePostOnly := true
+			slot.mu.Unlock()
+
+			ordersToPlace = append(ordersToPlace, &OrderRequest{
+				Symbol:        spm.config.Trading.Symbol,
+				Side:          entrySide,
+				Price:         price,
+				Quantity:      quantity,
+				PriceDecimals: spm.priceDecimals,
+				PostOnly:      usePostOnly,
+				ClientOrderID: clientOID,
+			})
+			entryOrdersToCreate++
+			entryOrdersByBook[bookSide]++
+		}
+	}
+
+	logger.Info("📊 [订单配额] 阈值:%d, 当前订单:%d(买:%d/卖:%d), 开仓剩余:%d, 平仓候选:%d, 新增平仓:%d, 新增开仓:%d",
+		threshold, currentOrderCount, currentBuyOrderCount, currentSellOrderCount, remainingOrders, len(exitCandidates), exitOrdersToCreate, entryOrdersToCreate)
+
+	// 下单是网络 I/O，不能持有全局锁。槽位已经标记为 PENDING，结果回写依赖槽位锁。
+	spm.mu.Unlock()
+
+	// 执行下单
+	if len(ordersToPlace) > 0 {
+		logger.Info("🔄 [实时调整] 需要新增: %d 个订单", len(ordersToPlace))
+		placedOrders, marginError := spm.executor.BatchPlaceOrders(ordersToPlace)
+
+		if marginError {
+			logger.Warn("⚠️ [保证金不足] 检测到保证金不足错误，暂停下单 %d 秒", int(spm.marginLockDuration.Seconds()))
+			spm.mu.Lock()
+			spm.insufficientMargin = true
+			spm.marginLockTime = time.Now()
+			spm.mu.Unlock()
+			spm.CancelEntryOrders()
+		}
+
+		// 🔥 构建成功订单的ClientOrderID集合
+		placedClientOIDs := make(map[string]bool)
+		for _, ord := range placedOrders {
+			if strings.TrimSpace(ord.ClientOrderID) != "" {
+				placedClientOIDs[ord.ClientOrderID] = true
+			}
+		}
+
+		// 🔥 释放未成功提交订单的槽位锁
+		for _, req := range ordersToPlace {
+			if !placedClientOIDs[req.ClientOrderID] {
+				// 这个订单没有成功提交，需要释放槽位锁
+				price, _, bookSide, valid := spm.parseClientOrderID(req.ClientOrderID)
+				if valid {
+					slot := spm.getOrCreateSlot(price, bookSide)
+					slot.mu.Lock()
+					slot.BookSide = bookSide
+					if slot.SlotStatus == SlotStatusPending {
+						slot.SlotStatus = SlotStatusFree
+						logger.Debug("🔓 [释放槽位] 订单提交失败，释放槽位 %s 的锁 (ClientOID: %s)",
+							formatPrice(price, spm.priceDecimals), req.ClientOrderID)
+					}
+					slot.mu.Unlock()
+				}
+			}
+		}
+
+		for _, ord := range placedOrders {
+			// 解析 ClientOrderID
+			price, side, bookSide, valid := spm.parseClientOrderID(ord.ClientOrderID)
+
+			if !valid {
+				logger.Warn("⚠️ [实时调整] 无法解析 ClientOID: %s", ord.ClientOrderID)
+				continue
+			}
+
+			// 获取槽位 (注意：无论是买单还是卖单，ID中编码的都是 SlotPrice)
+			slot := spm.getOrCreateSlot(price, bookSide)
+			slot.mu.Lock()
+			slot.BookSide = bookSide
+
+			// 🔥 关键修复：检查是否是秒成交场景（买单或卖单都可能）
+			// 秒成交的特征:
+			// 1. 买单秒成交: PositionStatus=FILLED (刚成交) 且 OrderID=0 (已被WebSocket清空) 且 OrderSide=""
+			// 2. 卖单秒成交: PositionStatus=EMPTY (已清空) 且 OrderID=0 (已被WebSocket清空) 且 OrderSide=""
+			isInstantFill := false
+			if spm.isEntryOrder(side, bookSide) {
+				isInstantFill = (slot.PositionStatus == PositionStatusFilled && slot.OrderID == 0 && slot.OrderSide == "")
+			} else {
+				isInstantFill = (slot.PositionStatus == PositionStatusEmpty && slot.OrderID == 0 && slot.OrderSide == "" && slot.SlotStatus == SlotStatusFree)
+			}
+
+			if !isInstantFill {
+				// 正常情况: 更新订单状态
+				// 🔥 检查OrderID冲突：只有当ClientOID已设置且不匹配时才是真正的冲突
+				// 如果ClientOID为空或匹配，说明是正常的WebSocket先到或批量处理顺序问题
+				if slot.OrderID != 0 && slot.OrderID != ord.OrderID {
+					if slot.ClientOID != "" && slot.ClientOID != ord.ClientOrderID {
+						// 真正的冲突：槽位已被其他订单占用
+						logger.Warn("⚠️ [OrderID冲突] 槽位 %.2f: 下单返回OrderID=%d (ClientOID=%s)，但槽位已被OrderID=%d (ClientOID=%s)占用",
+							price, ord.OrderID, ord.ClientOrderID, slot.OrderID, slot.ClientOID)
+					} else {
+						// WebSocket推送先到达，这是正常现象
+						logger.Debug("📝 [覆盖OrderID] 槽位 %.2f: WebSocket已设置OrderID=%d，现用下单返回的OrderID=%d (ClientOID: %s)",
+							price, slot.OrderID, ord.OrderID, ord.ClientOrderID)
+					}
+				}
+
+				slot.OrderID = ord.OrderID
+				slot.ClientOID = ord.ClientOrderID
+				slot.OrderSide = side // "BUY" or "SELL"
+				slot.OrderStatus = OrderStatusPlaced
+				slot.OrderPrice = ord.Price
+				slot.OrderCreatedAt = time.Now()
+				// 🔥 订单提交成功，设置为LOCKED状态
+				slot.SlotStatus = SlotStatusLocked
+				// 注意：不在这里重置PostOnlyFailCount，因为订单可能立即被撤销
+				// PostOnly计数只在订单真正成交时重置
+
+				logger.Info("✅ [实时新增] 槽位价格: %s, %s订单, 订单价格: %s, 订单ID: %d, ClientOID: %s",
+					formatPrice(price, spm.priceDecimals), side, formatPrice(ord.Price, spm.priceDecimals), ord.OrderID, ord.ClientOrderID)
+			} else {
+				// 🔍 秒成交场景：WebSocket已经处理了FILLED,跳过状态更新
+				logger.Debug("🔍 [%s单秒成交] 槽位 %s 的订单已被WebSocket处理，跳过状态更新 (持仓: %.4f, SlotStatus: %s)",
+					side, formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.SlotStatus)
+			}
+
+			slot.mu.Unlock()
+		}
+	}
+
+	return nil
+}
+
+func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desiredEntryPrices map[string]map[float64]bool, desiredEntrySlots map[string][]float64) (bool, error) {
+	staleByBook := make(map[string][]staleEntryCandidate, len(desiredEntryPrices))
+	activeEntryCountByBook := make(map[string]int, len(desiredEntryPrices))
+	missingByBook := make(map[string]int, len(desiredEntryPrices))
+
+	for bookSide, prices := range desiredEntrySlots {
+		for _, price := range prices {
+			slot := spm.getOrCreateSlot(price, bookSide)
+			slot.mu.Lock()
+			slot.BookSide = bookSide
+			hasActiveOrder := slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed || slot.OrderStatus == OrderStatusPartiallyFilled
+			if slot.SlotStatus == SlotStatusFree && slot.PositionStatus == PositionStatusEmpty && !hasActiveOrder && slot.OrderID == 0 && slot.ClientOID == "" {
+				missingByBook[bookSide]++
+			}
+			slot.mu.Unlock()
+		}
+	}
+
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if !spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
+			return true
+		}
+		if slot.OrderStatus != OrderStatusPlaced && slot.OrderStatus != OrderStatusConfirmed {
+			return true
+		}
+		if slot.OrderID == 0 || slot.PositionStatus != PositionStatusEmpty {
+			return true
+		}
+		activeEntryCountByBook[slot.BookSide]++
+		if desiredEntryPrices[slot.BookSide][slot.Price] {
+			return true
+		}
+		staleByBook[slot.BookSide] = append(staleByBook[slot.BookSide], staleEntryCandidate{
+			SlotPrice: slot.Price,
+			BookSide:  slot.BookSide,
+			OrderID:   slot.OrderID,
+			ClientOID: slot.ClientOID,
+			Distance:  math.Abs(slot.Price - currentPrice),
+		})
+		return true
+	})
+
+	var candidates []staleEntryCandidate
+	for bookSide, stale := range staleByBook {
+		needed := missingByBook[bookSide]
+		overflow := activeEntryCountByBook[bookSide] - spm.config.Trading.BuyWindowSize
+		if overflow > needed {
+			needed = overflow
+		}
+		if needed <= 0 {
+			continue
+		}
+		sort.Slice(stale, func(i, j int) bool {
+			return stale[i].Distance > stale[j].Distance
+		})
+		if needed > len(stale) {
+			needed = len(stale)
+		}
+		candidates = append(candidates, stale[:needed]...)
+	}
+	if len(candidates) == 0 {
+		return false, nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Distance > candidates[j].Distance
+	})
+	batchSize := spm.config.Trading.CleanupBatchSize
+	if batchSize <= 0 {
+		batchSize = 10
+	}
+	if len(candidates) > batchSize {
+		candidates = candidates[:batchSize]
+	}
+
+	orderIDs := make([]int64, 0, len(candidates))
+	for _, candidate := range candidates {
+		orderIDs = append(orderIDs, candidate.OrderID)
+	}
+	logger.Info("🧭 [网格自检] 发现开仓挂单偏离最新价格窗口，撤销 %d 个远端开仓单后补回现价周边", len(orderIDs))
+
+	spm.mu.Unlock()
+	err := spm.executor.BatchCancelOrders(orderIDs)
+	spm.mu.Lock()
+	if err != nil {
+		logger.Warn("⚠️ [网格自检] 撤销远端开仓单失败: %v", err)
+		return false, nil
+	}
+	for _, candidate := range candidates {
+		spm.UpdateSlotOrderStatus(candidate.SlotPrice, candidate.BookSide, OrderStatusCanceled)
+	}
+	return true, nil
+}
+
+// OnOrderUpdate 订单更新回调（异步订单同步流）
+func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
+	// 🔥 重构：完全依赖 ClientOrderID 解析
+	price, side, bookSide, valid := spm.parseClientOrderID(update.ClientOrderID)
+
+	if !valid {
+		logger.Debug("⏳ [忽略] 无法识别的订单更新: ID=%d, ClientOID=%s", update.OrderID, update.ClientOrderID)
+		return false
+	}
+
+	slot := spm.getOrCreateSlot(price, bookSide)
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	slot.BookSide = bookSide
+	status := normalizeOrderUpdateStatus(update.Status)
+	isTerminalStatus := status == "FILLED" || status == "CANCELED" || status == "EXPIRED" || status == "REJECTED"
+	if spm.isStaleAfterTerminalOrderUpdate(update.ClientOrderID, update.ExecutedQty, status) {
+		logger.Debug("⏳ [订单更新被忽略] 已处理终态后的延迟推送: slot=%s, clientOID=%s, status=%s, executed=%.8f",
+			formatPrice(price, spm.priceDecimals), update.ClientOrderID, status, update.ExecutedQty)
+		return false
+	}
+
+	// 校验：确保这个更新属于当前的订单 (防止旧订单的延迟推送干扰新订单)
+	// 优先使用 ClientOrderID 匹配 (某些交易所如 Gate.io 的 OrderID 可能略有差异)
+	if slot.ClientOID != "" && slot.ClientOID != update.ClientOrderID {
+		// ClientOrderID 不匹配，忽略此更新
+		logger.Info("⚠️ [订单更新被忽略] 槽位 %.2f: ClientOID不匹配 (槽位: %s, 推送: %s, OrderID: %d)",
+			price, slot.ClientOID, update.ClientOrderID, update.OrderID)
+		return false
+	}
+	if slot.ClientOID == "" && slot.OrderStatus == OrderStatusCanceled && slot.SlotStatus != SlotStatusPending && status == "NEW" {
+		logger.Debug("⏳ [订单更新被忽略] 已取消槽位收到延迟NEW: slot=%s, clientOID=%s, orderID=%d",
+			formatPrice(price, spm.priceDecimals), update.ClientOrderID, update.OrderID)
+		return false
+	}
+
+	// 更新订单ID (如果是首个推送)
+	if slot.OrderID == 0 {
+		logger.Debug("📝 [首次设置OrderID] 槽位 %.2f: OrderID=%d, ClientOID=%s", price, update.OrderID, update.ClientOrderID)
+		slot.OrderID = update.OrderID
+		slot.ClientOID = update.ClientOrderID
+		slot.OrderSide = side
+	} else if slot.OrderID != update.OrderID {
+		// OrderID 不一致但 ClientOrderID 匹配，更新 OrderID (Gate.io 批量下单可能出现此情况)
+		logger.Debug("📝 [更新OrderID] 槽位 %.2f: %d -> %d (ClientOID: %s)", price, slot.OrderID, update.OrderID, update.ClientOrderID)
+		slot.OrderID = update.OrderID
+	}
+
+	deltaQty := 0.0
+	if isFillBearingOrderUpdateStatus(status) {
+		deltaQty = spm.orderUpdateDeltaQty(update.ClientOrderID, update.ExecutedQty, slot.OrderFilledQty, isTerminalStatus)
+		if update.ExecutedQty > slot.OrderFilledQty {
+			slot.OrderFilledQty = update.ExecutedQty
+		}
+	}
+
+	// 处理状态转换
+	switch status {
+	case "NEW":
+		slot.OrderStatus = OrderStatusConfirmed
+		slot.SlotStatus = SlotStatusLocked
+		if update.Price > 0 {
+			slot.OrderPrice = update.Price
+		}
+		if slot.OrderCreatedAt.IsZero() {
+			slot.OrderCreatedAt = time.Now()
+		}
+
+	case "PARTIALLY_FILLED", "FILLED":
+		isEntry := spm.isEntryOrder(side, bookSide)
+		if isEntry {
+			if deltaQty > 0 {
+				slot.PositionQty += deltaQty
+				spm.addTradedQty(side, deltaQty)
+			}
+
+			if status == "FILLED" {
+				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
+				slot.OrderID = 0
+				slot.ClientOID = ""
+				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
+				slot.OrderFilledQty = 0
+
+				slot.PositionStatus = PositionStatusFilled
+				slot.SlotStatus = SlotStatusFree
+				slot.PostOnlyFailCount = 0
+				logger.Info("✅ [开仓成交-%s] 价格: %s, 持仓: %.4f, 订单方向: %s", bookSide, formatPrice(price, spm.priceDecimals), slot.PositionQty, side)
+				return true
+			} else {
+				slot.OrderStatus = OrderStatusPartiallyFilled
+			}
+
+		} else {
+			if deltaQty > 0 {
+				slot.PositionQty -= deltaQty
+				if slot.PositionQty < 0 {
+					slot.PositionQty = 0
+				}
+				spm.addTradedQty(side, deltaQty)
+				tradePrice := firstPositiveFloat(update.AvgPrice, update.Price, spm.exitPrice(price, bookSide))
+				spm.addRealizedPNL(price, tradePrice, deltaQty, bookSide)
+			}
+
+			if status == "FILLED" {
+				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
+				slot.OrderID = 0
+				slot.ClientOID = ""
+				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
+				slot.OrderFilledQty = 0
+
+				if slot.PositionQty < 0.000001 {
+					slot.PositionStatus = PositionStatusEmpty
+				}
+				slot.SlotStatus = SlotStatusFree
+				slot.PostOnlyFailCount = 0
+				logger.Info("✅ [平仓成交-%s] 价格: %s, 剩余持仓: %.4f, 订单方向: %s", bookSide, formatPrice(price, spm.priceDecimals), slot.PositionQty, side)
+				return true
+			} else {
+				slot.OrderStatus = OrderStatusPartiallyFilled
+			}
+		}
+
+	case "CANCELED", "EXPIRED", "REJECTED":
+		isEntry := spm.isEntryOrder(side, bookSide)
+		if deltaQty > 0 {
+			if isEntry {
+				slot.PositionQty += deltaQty
+			} else {
+				slot.PositionQty -= deltaQty
+				if slot.PositionQty < 0 {
+					slot.PositionQty = 0
+				}
+				tradePrice := firstPositiveFloat(update.AvgPrice, update.Price, spm.exitPrice(price, bookSide))
+				spm.addRealizedPNL(price, tradePrice, deltaQty, bookSide)
+			}
+			spm.addTradedQty(side, deltaQty)
+		}
+
+		logger.Info("⚠️ [订单%s] 价格: %s, 方向: %s, 原因: %s, 已成交: %.4f",
+			status, formatPrice(price, spm.priceDecimals), side, status, slot.OrderFilledQty)
+
+		// 🔥 核心修复：根据订单方向和成交情况处理槽位状态
+		if isEntry {
+			// 买单被取消/拒绝
+			if slot.PositionQty > 0 || slot.OrderFilledQty > 0 {
+				logger.Info("💡 [开仓单部分成交后取消-%s] 价格: %s, 持仓: %.4f",
+					bookSide,
+					formatPrice(price, spm.priceDecimals), slot.PositionQty)
+				slot.PositionStatus = PositionStatusFilled
+				slot.SlotStatus = SlotStatusFree
+			} else {
+				logger.Info("🔄 [开仓单未成交取消-%s] 价格: %s, 重置槽位为空闲",
+					bookSide,
+					formatPrice(price, spm.priceDecimals))
+				slot.PositionStatus = PositionStatusEmpty
+				slot.SlotStatus = SlotStatusFree
+			}
+		} else {
+			if slot.PositionQty > 0 {
+				slot.PostOnlyFailCount++
+				logger.Info("🔄 [平仓单取消-%s] 价格: %s, 保持持仓状态: %.4f, PostOnly失败计数: %d",
+					bookSide, formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PostOnlyFailCount)
+				slot.PositionStatus = PositionStatusFilled
+				slot.SlotStatus = SlotStatusFree
+			} else {
+				logger.Warn("⚠️ [异常] 平仓单取消但无持仓，价格: %s, 重置为空", formatPrice(price, spm.priceDecimals))
+				slot.PositionStatus = PositionStatusEmpty
+				slot.SlotStatus = SlotStatusFree
+			}
+		}
+
+		// 清空订单信息
+		slot.OrderStatus = OrderStatusCanceled
+		slot.OrderID = 0
+		slot.ClientOID = ""
+		slot.OrderFilledQty = 0
+		// 保留 OrderSide 用于日志调试
+		return true
+	}
+	return false
+}
+
+func normalizeOrderUpdateStatus(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "NEW", "OPEN", "LIVE", "CREATED":
+		return "NEW"
+	case "PARTIALLY_FILLED_CANCELED", "PARTIAL_FILLED_CANCELED", "PARTIALLY_FILLED_CANCELLED", "PARTIAL_FILLED_CANCELLED":
+		return "CANCELED"
+	case "PARTIALLY_FILLED", "PARTIALLYFILLED", "PARTIAL_FILL", "PARTIAL_FILLED":
+		return "PARTIALLY_FILLED"
+	case "FILLED", "FULLY_FILLED":
+		return "FILLED"
+	case "CANCELED", "CANCELLED":
+		return "CANCELED"
+	case "EXPIRED":
+		return "EXPIRED"
+	case "REJECTED":
+		return "REJECTED"
+	default:
+		return strings.ToUpper(strings.TrimSpace(status))
+	}
+}
+
+func isFillBearingOrderUpdateStatus(status string) bool {
+	switch status {
+	case "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED":
+		return true
+	default:
+		return false
+	}
+}
+
+func (spm *SuperPositionManager) isStaleAfterTerminalOrderUpdate(clientOrderID string, executedQty float64, status string) bool {
+	value, ok := spm.orderFills.Load(strings.TrimSpace(clientOrderID))
+	if !ok {
+		return false
+	}
+	progress := value.(orderFillProgress)
+	if !progress.Terminal {
+		return false
+	}
+	if status == "FILLED" || status == "CANCELED" || status == "EXPIRED" || status == "REJECTED" {
+		return false
+	}
+	return executedQty <= progress.ExecutedQty
+}
+
+func (spm *SuperPositionManager) orderUpdateDeltaQty(clientOrderID string, executedQty, slotFilledQty float64, terminal bool) float64 {
+	if executedQty <= 0 {
+		if terminal {
+			spm.rememberOrderFillProgress(clientOrderID, 0, true)
+		}
+		return 0
+	}
+	processedQty := slotFilledQty
+	if value, ok := spm.orderFills.Load(clientOrderID); ok {
+		progress := value.(orderFillProgress)
+		if progress.ExecutedQty > processedQty {
+			processedQty = progress.ExecutedQty
+		}
+	}
+	deltaQty := executedQty - processedQty
+	if deltaQty <= 0 {
+		if terminal {
+			spm.rememberOrderFillProgress(clientOrderID, executedQty, true)
+		}
+		return 0
+	}
+	spm.rememberOrderFillProgress(clientOrderID, executedQty, terminal)
+	return deltaQty
+}
+
+func (spm *SuperPositionManager) rememberOrderFillProgress(clientOrderID string, executedQty float64, terminal bool) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return
+	}
+	next := orderFillProgress{ExecutedQty: executedQty, Terminal: terminal, UpdatedAt: time.Now()}
+	if value, ok := spm.orderFills.Load(clientOrderID); ok {
+		prev := value.(orderFillProgress)
+		if prev.ExecutedQty > next.ExecutedQty {
+			next.ExecutedQty = prev.ExecutedQty
+		}
+		next.Terminal = prev.Terminal || terminal
+	}
+	spm.orderFills.Store(clientOrderID, next)
+	spm.pruneOrderFillProgress(next.UpdatedAt)
+}
+
+func (spm *SuperPositionManager) pruneOrderFillProgress(now time.Time) {
+	const maxRememberedOrderFills = 4096
+	const orderFillProgressTTL = 24 * time.Hour
+
+	count := 0
+	var oldestKey string
+	var oldestTime time.Time
+	spm.orderFills.Range(func(key, value interface{}) bool {
+		progress := value.(orderFillProgress)
+		count++
+		if now.Sub(progress.UpdatedAt) > orderFillProgressTTL {
+			spm.orderFills.Delete(key)
+			return true
+		}
+		if oldestTime.IsZero() || progress.UpdatedAt.Before(oldestTime) {
+			oldestTime = progress.UpdatedAt
+			oldestKey = key.(string)
+		}
+		return true
+	})
+	if count > maxRememberedOrderFills && oldestKey != "" {
+		spm.orderFills.Delete(oldestKey)
+	}
+}
+
+// getOrCreateSlot 获取或创建槽位
+func (spm *SuperPositionManager) slotKey(price float64, bookSide string) string {
+	if bookSide == "" {
+		bookSide = BookSideLong
+	}
+	return fmt.Sprintf("%s:%s", bookSide, formatPrice(price, spm.priceDecimals))
+}
+
+func (spm *SuperPositionManager) getOrCreateSlot(price float64, bookSide string) *InventorySlot {
+	if bookSide == "" {
+		bookSide = BookSideLong
+	}
+	key := spm.slotKey(price, bookSide)
+	if slot, exists := spm.slots.Load(key); exists {
+		return slot.(*InventorySlot)
+	}
+
+	// 创建新槽位
+	slot := &InventorySlot{
+		Price:          price,
+		PositionStatus: PositionStatusEmpty,
+		PositionQty:    0,
+		BookSide:       bookSide,
+		OrderStatus:    OrderStatusNotPlaced,
+		SlotStatus:     SlotStatusFree, // 🔥 初始化为FREE状态
+	}
+	actual, _ := spm.slots.LoadOrStore(key, slot)
+	return actual.(*InventorySlot)
+}
+
+func (spm *SuperPositionManager) pruneEmptyFarSlots(currentGridPrice float64, retainIntervals int) {
+	if retainIntervals <= 0 || spm.config.Trading.PriceInterval <= 0 {
+		return
+	}
+	maxDistance := spm.config.Trading.PriceInterval * float64(retainIntervals)
+	pruned := 0
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		if math.Abs(slot.Price-currentGridPrice) <= maxDistance {
+			return true
+		}
+		slot.mu.RLock()
+		canDelete := slot.PositionStatus == PositionStatusEmpty &&
+			slot.PositionQty <= 0 &&
+			slot.OrderID == 0 &&
+			slot.ClientOID == "" &&
+			slot.OrderFilledQty == 0 &&
+			slot.SlotStatus == SlotStatusFree &&
+			!isActiveOrderStatus(slot.OrderStatus)
+		slot.mu.RUnlock()
+		if canDelete {
+			spm.slots.Delete(key)
+			pruned++
+		}
+		return true
+	})
+	if pruned > 0 {
+		logger.Debug("🧹 [槽位剪枝] 清理远端空槽位: %d", pruned)
+	}
+}
+
+// findNearestGridPrice 找到最近的网格价格
+// 根据当前价格动态计算最近的网格对齐价格
+func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) float64 {
+	// 计算当前价格相对于锚点的偏移量
+	offset := currentPrice - spm.anchorPrice
+	// 计算离当前价格最近的网格间隔数（四舍五入）
+	intervals := math.Round(offset / spm.config.Trading.PriceInterval)
+	// 计算最近的网格价格
+	gridPrice := spm.anchorPrice + intervals*spm.config.Trading.PriceInterval
+	// 使用检测到的价格精度进行舍入
+	return roundPrice(gridPrice, spm.priceDecimals)
+}
+
+// calculateSlotPrices 计算槽位价格列表（统一的网格计算方法）
+// 这个方法确保初始化和实时调整计算出完全相同的槽位价格
+// 参数：
+//   - gridPrice: 网格价格（使用锚点价格）
+//   - count: 需要计算的槽位数量
+//   - direction: 方向，"down"表示向下（买单），"up"表示向上（卖单）
+//
+// 返回：槽位价格列表，从网格价格开始，按价格间隔递减或递增，使用检测到的价格精度
+func (spm *SuperPositionManager) calculateSlotPrices(gridPrice float64, count int, direction string) []float64 {
+	var prices []float64
+	priceInterval := spm.config.Trading.PriceInterval
+
+	for i := 0; i < count; i++ {
+		var price float64
+		if direction == "down" {
+			// 向下：网格价格 - i * 间隔
+			price = gridPrice - float64(i)*priceInterval
+		} else {
+			// 向上：网格价格 + i * 间隔
+			price = gridPrice + float64(i)*priceInterval
+		}
+		// 使用检测到的价格精度进行舍入
+		price = roundPrice(price, spm.priceDecimals)
+		prices = append(prices, price)
+	}
+
+	return prices
+}
+
+func (spm *SuperPositionManager) calculateEntrySlotPrices(gridPrice, currentPrice float64, count int, bookSide string) []float64 {
+	if count <= 0 {
+		return nil
+	}
+	prices := make([]float64, 0, count)
+	seen := make(map[float64]struct{}, count)
+	priceInterval := spm.config.Trading.PriceInterval
+	if priceInterval <= 0 {
+		return prices
+	}
+	direction := spm.entrySlotDirection(bookSide)
+	maxAttempts := count*4 + 20
+	for i := 0; len(prices) < count && i < maxAttempts; i++ {
+		price := gridPrice
+		if direction == "down" {
+			price = gridPrice - float64(i)*priceInterval
+		} else {
+			price = gridPrice + float64(i)*priceInterval
+		}
+		price = roundPrice(price, spm.priceDecimals)
+		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			if direction == "down" {
+				break
+			}
+			continue
+		}
+		if _, exists := seen[price]; exists {
+			continue
+		}
+		if !spm.isMakerSafeEntryPrice(price, currentPrice, bookSide) {
+			continue
+		}
+		seen[price] = struct{}{}
+		prices = append(prices, price)
+	}
+	return prices
+}
+
+func (spm *SuperPositionManager) entryOrderQuantity(price float64) (float64, bool) {
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return 0, false
+	}
+	quantity := spm.maxConfiguredOrderQuantity(price)
+	if quantity <= 0 || math.IsNaN(quantity) || math.IsInf(quantity, 0) {
+		logger.Warn("⚠️ [跳过开仓] 价格 %s 的数量按精度取整后为 0，请提高单笔金额或调整交易对",
+			formatPrice(price, spm.priceDecimals))
+		return 0, false
+	}
+	orderValue := price * quantity
+	minValue := spm.minOrderValue()
+	if orderValue+1e-9 < minValue {
+		logger.Warn("⚠️ [跳过开仓] 价格 %s 数量 %.8f 订单价值 %.4f 小于最小订单额 %.4f",
+			formatPrice(price, spm.priceDecimals), quantity, orderValue, minValue)
+		return 0, false
+	}
+	return quantity, true
+}
+
+func (spm *SuperPositionManager) exitOrderQuantity(positionQty, price float64) (float64, bool) {
+	if positionQty <= 0 || price <= 0 || math.IsNaN(positionQty) || math.IsInf(positionQty, 0) || math.IsNaN(price) || math.IsInf(price, 0) {
+		return 0, false
+	}
+	maxQty := spm.maxConfiguredOrderQuantity(price)
+	if maxQty <= 0 {
+		logger.Warn("⚠️ [跳过平仓] 价格 %s 的单笔平仓数量按配置金额取整后为 0，避免放大底仓平仓单",
+			formatPrice(price, spm.priceDecimals))
+		return 0, false
+	}
+	quantity := positionQty
+	if quantity > maxQty {
+		quantity = maxQty
+	}
+	quantity = roundQuantity(quantity, spm.quantityDecimals)
+	if quantity <= 0 {
+		return 0, false
+	}
+	return quantity, true
+}
+
+func (spm *SuperPositionManager) maxConfiguredOrderQuantity(price float64) float64 {
+	if price <= 0 {
+		return 0
+	}
+	return floorQuantity(spm.config.Trading.OrderQuantity/price, spm.quantityDecimals)
+}
+
+func (spm *SuperPositionManager) minOrderValue() float64 {
+	minValue := spm.config.Trading.MinOrderValue
+	if minValue <= 0 {
+		minValue = 6.0
+	}
+	return minValue
+}
+
+func (spm *SuperPositionManager) isMakerSafeEntryPrice(price, currentPrice float64, bookSide string) bool {
+	safetyBuffer := spm.config.Trading.PriceInterval * 0.1
+	if bookSide == BookSideShort {
+		return price > currentPrice+safetyBuffer
+	}
+	return price < currentPrice-safetyBuffer
+}
+
+func (spm *SuperPositionManager) makerSafeExitPrice(targetPrice, currentPrice float64, bookSide string) float64 {
+	priceInterval := spm.config.Trading.PriceInterval
+	if priceInterval <= 0 || currentPrice <= 0 {
+		return roundPrice(targetPrice, spm.priceDecimals)
+	}
+	safetyBuffer := priceInterval * 0.1
+	if bookSide == BookSideShort {
+		if targetPrice < currentPrice-safetyBuffer {
+			return roundPrice(targetPrice, spm.priceDecimals)
+		}
+		return spm.firstGridBelow(currentPrice, safetyBuffer)
+	}
+	if targetPrice > currentPrice+safetyBuffer {
+		return roundPrice(targetPrice, spm.priceDecimals)
+	}
+	return spm.firstGridAbove(currentPrice, safetyBuffer)
+}
+
+func (spm *SuperPositionManager) firstGridAbove(currentPrice, safetyBuffer float64) float64 {
+	priceInterval := spm.config.Trading.PriceInterval
+	intervals := math.Floor((currentPrice-spm.anchorPrice)/priceInterval) + 1
+	price := roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+	for price <= currentPrice+safetyBuffer {
+		intervals++
+		price = roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+	}
+	return price
+}
+
+func (spm *SuperPositionManager) firstGridBelow(currentPrice, safetyBuffer float64) float64 {
+	priceInterval := spm.config.Trading.PriceInterval
+	intervals := math.Ceil((currentPrice-spm.anchorPrice)/priceInterval) - 1
+	price := roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+	for price >= currentPrice-safetyBuffer {
+		intervals--
+		price = roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+	}
+	return price
+}
+
+// ===== IPositionManager 接口实现（供 safety.Reconciler 使用）=====
+// 注意：以下方法是 safety/reconciler.go 中 IPositionManager 接口的实现，
+// 被 Reconciler 对账器调用，不可删除或修改签名
+
+// SlotData 槽位数据结构（用于传递给外部）
+type SlotData struct {
+	Price          float64
+	PositionStatus string
+	PositionQty    float64
+	BookSide       string
+	OrderID        int64
+	OrderSide      string
+	OrderStatus    string
+	OrderCreatedAt time.Time
+}
+
+type exchangeOrderSnapshot struct {
+	OrderID       int64
+	ClientOrderID string
+	Side          string
+	Status        string
+	Price         float64
+	Quantity      float64
+	ExecutedQty   float64
+	AvgPrice      float64
+	UpdateTime    int64
+}
+
+type exchangePositionSnapshot struct {
+	Symbol     string
+	Size       float64
+	EntryPrice float64
+	MarkPrice  float64
+}
+
+type staleOrderRef struct {
+	OrderID       int64
+	ClientOrderID string
+}
+
+type staleEntryCandidate struct {
+	SlotPrice float64
+	BookSide  string
+	OrderID   int64
+	ClientOID string
+	Distance  float64
+}
+
+// IterateSlots 遍历所有槽位（封装 sync.Map.Range）
+// 注意：为了避免类型冲突，这里使用 interface{} 返回槽位数据
+// 调用者需要将其转换为具体的槽位信息
+func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot interface{}) bool) {
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		price := slot.Price
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+
+		// 构造槽位数据
+		data := SlotData{
+			Price:          price,
+			PositionStatus: slot.PositionStatus,
+			PositionQty:    slot.PositionQty,
+			OrderID:        slot.OrderID,
+			OrderSide:      slot.OrderSide,
+			OrderStatus:    slot.OrderStatus,
+			OrderCreatedAt: slot.OrderCreatedAt,
+			BookSide:       slot.BookSide,
+		}
+
+		// 返回槽位数据
+		return fn(price, data)
+	})
+}
+
+// ApplyExchangeSnapshot 用交易所 REST 快照修正本地槽位，补上 WS 漏推或重启后丢失的活跃订单。
+func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{}, openOrdersRaw interface{}) {
+	orders := spm.extractExchangeOrders(openOrdersRaw)
+	openOrderIDs := make(map[int64]struct{}, len(orders))
+	openClientOIDs := make(map[string]struct{}, len(orders))
+
+	for _, order := range orders {
+		if order.OrderID != 0 {
+			openOrderIDs[order.OrderID] = struct{}{}
+		}
+		if order.ClientOrderID != "" {
+			openClientOIDs[order.ClientOrderID] = struct{}{}
+		}
+		price, side, bookSide, valid := spm.parseClientOrderID(order.ClientOrderID)
+		if !valid {
+			continue
+		}
+		slot := spm.getOrCreateSlot(price, bookSide)
+		slot.mu.Lock()
+		slot.BookSide = bookSide
+		slot.OrderID = order.OrderID
+		slot.ClientOID = order.ClientOrderID
+		slot.OrderSide = side
+		remoteStatus := normalizeRemoteOrderStatus(order.Status)
+		slot.OrderStatus = remoteStatus
+		slot.OrderPrice = order.Price
+		if slot.OrderCreatedAt.IsZero() {
+			slot.OrderCreatedAt = time.Now()
+		}
+		spm.applySnapshotFillDelta(slot, side, bookSide, order.ExecutedQty, firstPositiveFloat(order.AvgPrice, order.Price, spm.exitPrice(price, bookSide)))
+		if isActiveOrderStatus(remoteStatus) {
+			slot.SlotStatus = SlotStatusLocked
+		}
+		slot.mu.Unlock()
+	}
+
+	positions := spm.extractExchangePositions(positionsRaw)
+	spm.reconcilePositionSnapshot(positions)
+
+	staleActive := 0
+	var staleOrders []staleOrderRef
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.Lock()
+		defer slot.mu.Unlock()
+		if !isActiveOrderStatus(slot.OrderStatus) || slot.OrderID == 0 {
+			return true
+		}
+		_, hasID := openOrderIDs[slot.OrderID]
+		_, hasClientOID := openClientOIDs[slot.ClientOID]
+		if !hasID && !hasClientOID {
+			staleActive++
+			staleOrders = append(staleOrders, staleOrderRef{OrderID: slot.OrderID, ClientOrderID: slot.ClientOID})
+			logger.Warn("⚠️ [对账] 本地订单不在交易所挂单中，等待订单详情/WS确认: slot=%s, orderID=%d, clientOID=%s, status=%s",
+				formatPrice(slot.Price, spm.priceDecimals), slot.OrderID, slot.ClientOID, slot.OrderStatus)
+		}
+		return true
+	})
+	if staleActive > 0 {
+		logger.Warn("⚠️ [对账] 发现 %d 个本地活跃订单不在交易所挂单列表中", staleActive)
+		spm.refreshStaleOrders(staleOrders)
+	}
+}
+
+func (spm *SuperPositionManager) applySnapshotFillDelta(slot *InventorySlot, side, bookSide string, executedQty, tradePrice float64) {
+	deltaQty := executedQty - slot.OrderFilledQty
+	if deltaQty <= 0 {
+		return
+	}
+
+	if spm.isEntryOrder(side, bookSide) {
+		slot.PositionQty += deltaQty
+		slot.PositionStatus = PositionStatusFilled
+	} else {
+		slot.PositionQty -= deltaQty
+		if slot.PositionQty <= 0.000001 {
+			slot.PositionQty = 0
+			slot.PositionStatus = PositionStatusEmpty
+		}
+		spm.addRealizedPNL(slot.Price, tradePrice, deltaQty, bookSide)
+	}
+	spm.addTradedQty(side, deltaQty)
+	slot.OrderFilledQty = executedQty
+}
+
+func (spm *SuperPositionManager) refreshStaleOrders(ordersToRefresh []staleOrderRef) {
+	for _, ref := range ordersToRefresh {
+		if ref.OrderID == 0 {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		orderRaw, err := spm.exchange.GetOrder(ctx, spm.config.Trading.Symbol, ref.OrderID)
+		cancel()
+		if err != nil {
+			if isRemoteOrderGoneError(err) && ref.ClientOrderID != "" {
+				logger.Warn("🧹 [对账] 交易所确认订单不存在，清理本地槽位: orderID=%d, clientOID=%s", ref.OrderID, ref.ClientOrderID)
+				spm.OnOrderUpdate(OrderUpdate{
+					OrderID:       ref.OrderID,
+					ClientOrderID: ref.ClientOrderID,
+					Status:        "CANCELED",
+				})
+				continue
+			}
+			logger.Warn("⚠️ [对账] 查询疑似丢失订单失败: orderID=%d, err=%v", ref.OrderID, err)
+			continue
+		}
+		orders := spm.extractExchangeOrders([]interface{}{orderRaw})
+		if len(orders) == 0 {
+			continue
+		}
+		order := orders[0]
+		status := normalizeRemoteOrderStatus(order.Status)
+		if status == OrderStatusConfirmed {
+			status = "NEW"
+		}
+		spm.OnOrderUpdate(OrderUpdate{
+			OrderID:       order.OrderID,
+			ClientOrderID: order.ClientOrderID,
+			Status:        status,
+			ExecutedQty:   order.ExecutedQty,
+			Price:         order.Price,
+			AvgPrice:      order.AvgPrice,
+			Side:          strings.ToUpper(order.Side),
+			UpdateTime:    order.UpdateTime,
+		})
+	}
+}
+
+func isRemoteOrderGoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "unknown order") ||
+		strings.Contains(errStr, "does not exist") ||
+		strings.Contains(errStr, "not exist") ||
+		strings.Contains(errStr, "not found") ||
+		strings.Contains(errStr, "order not found") ||
+		strings.Contains(errStr, "-2011") ||
+		strings.Contains(errStr, "40004")
+}
+
+func (spm *SuperPositionManager) reconcilePositionSnapshot(positions []exchangePositionSnapshot) {
+	remoteLong := 0.0
+	remoteShort := 0.0
+	longEntry := 0.0
+	shortEntry := 0.0
+	for _, pos := range positions {
+		if pos.Symbol != "" && !strings.EqualFold(pos.Symbol, spm.config.Trading.Symbol) {
+			continue
+		}
+		if pos.Size > 0 {
+			remoteLong += pos.Size
+			if pos.EntryPrice > 0 {
+				longEntry = pos.EntryPrice
+			}
+		} else if pos.Size < 0 {
+			remoteShort += math.Abs(pos.Size)
+			if pos.EntryPrice > 0 {
+				shortEntry = pos.EntryPrice
+			}
+		}
+	}
+	localLong, localShort := spm.localPositionTotals()
+	tolerance := math.Pow(10, -float64(maxInt(spm.quantityDecimals, 0)))
+	if tolerance <= 0 {
+		tolerance = 0.000001
+	}
+	if math.Abs(localLong-remoteLong) > tolerance {
+		spm.reconcileBookPositionSnapshot(BookSideLong, localLong, remoteLong, longEntry, tolerance)
+	}
+	if math.Abs(localShort-remoteShort) > tolerance {
+		spm.reconcileBookPositionSnapshot(BookSideShort, localShort, remoteShort, shortEntry, tolerance)
+	}
+}
+
+func (spm *SuperPositionManager) reconcileBookPositionSnapshot(bookSide string, localQty, remoteQty, entryPrice, tolerance float64) {
+	if spm.config.Trading.AdoptExistingPosition {
+		logger.Warn("⚠️ [对账修正-%s] 本地持仓 %.8f 与交易所 %.8f 不一致，按交易所快照修正", bookSide, localQty, remoteQty)
+		spm.resetFilledSlots(bookSide)
+		if remoteQty > 0 {
+			spm.initializeSlotsFromPosition(remoteQty, bookSide, entryPrice)
+		}
+		return
+	}
+
+	if localQty <= tolerance {
+		logger.Warn("🛡️ [对账-%s] 交易所持仓 %.8f 不是本机器人仓位，adopt_existing_position=false，已忽略以保护手动底仓", bookSide, remoteQty)
+		return
+	}
+	if remoteQty+tolerance < localQty {
+		logger.Warn("⚠️ [对账修正-%s] 交易所持仓 %.8f 小于本地机器人持仓 %.8f，按较小值修正，避免平仓单超过真实仓位", bookSide, remoteQty, localQty)
+		spm.resetFilledSlots(bookSide)
+		if remoteQty > 0 {
+			spm.initializeSlotsFromPosition(remoteQty, bookSide, entryPrice)
+		}
+		return
+	}
+	logger.Warn("🛡️ [对账-%s] 交易所持仓 %.8f 大于本地机器人持仓 %.8f，超出部分视为手动底仓，不创建额外平仓槽位", bookSide, remoteQty, localQty)
+}
+
+func (spm *SuperPositionManager) localPositionTotals() (float64, float64) {
+	longTotal := 0.0
+	shortTotal := 0.0
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
+			return true
+		}
+		if slot.BookSide == BookSideShort {
+			shortTotal += slot.PositionQty
+		} else {
+			longTotal += slot.PositionQty
+		}
+		return true
+	})
+	return longTotal, shortTotal
+}
+
+func (spm *SuperPositionManager) resetFilledSlots(bookSide string) {
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.Lock()
+		defer slot.mu.Unlock()
+		if slot.BookSide != bookSide || slot.PositionStatus != PositionStatusFilled {
+			return true
+		}
+		if isActiveOrderStatus(slot.OrderStatus) && slot.OrderID != 0 {
+			return true
+		}
+		slot.PositionStatus = PositionStatusEmpty
+		slot.PositionQty = 0
+		slot.SlotStatus = SlotStatusFree
+		slot.OrderFilledQty = 0
+		return true
+	})
+}
+
+// GetTotalBuyQty 获取累计买入数量（IPositionManager 接口方法，供 Reconciler 使用）
+func (spm *SuperPositionManager) GetTotalBuyQty() float64 {
+	return spm.totalBuyQty.Load().(float64)
+}
+
+// GetTotalSellQty 获取累计卖出数量（IPositionManager 接口方法，供 Reconciler 使用）
+func (spm *SuperPositionManager) GetTotalSellQty() float64 {
+	return spm.totalSellQty.Load().(float64)
+}
+
+func (spm *SuperPositionManager) GetRealizedPNL() float64 {
+	return spm.totalRealizedPNL.Load().(float64)
+}
+
+func (spm *SuperPositionManager) EstimateUnrealizedPNL(markPrice float64) float64 {
+	if markPrice <= 0 {
+		return 0
+	}
+	total := 0.0
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
+			return true
+		}
+		if slot.BookSide == BookSideShort {
+			total += (slot.Price - markPrice) * slot.PositionQty
+			return true
+		}
+		total += (markPrice - slot.Price) * slot.PositionQty
+		return true
+	})
+	return total
+}
+
+// GetReconcileCount 获取对账次数（IPositionManager 接口方法，供 Reconciler 使用）
+func (spm *SuperPositionManager) GetReconcileCount() int64 {
+	return spm.reconcileCount.Load()
+}
+
+// IncrementReconcileCount 增加对账次数（IPositionManager 接口方法，供 Reconciler 使用）
+func (spm *SuperPositionManager) IncrementReconcileCount() {
+	spm.reconcileCount.Add(1)
+}
+
+// UpdateLastReconcileTime 更新最后对账时间（IPositionManager 接口方法，供 Reconciler 使用）
+func (spm *SuperPositionManager) UpdateLastReconcileTime(t time.Time) {
+	spm.lastReconcileTime.Store(t)
+}
+
+// GetSymbol 获取交易符号
+func (spm *SuperPositionManager) GetSymbol() string {
+	return spm.config.Trading.Symbol
+}
+
+// GetPriceInterval 获取价格间隔
+func (spm *SuperPositionManager) GetPriceInterval() float64 {
+	return spm.config.Trading.PriceInterval
+}
+
+// ===== 订单清理功能已迁移到 safety.OrderCleaner =====
+// StartOrderCleanup 和 cleanupOrders 方法已移至 safety/order_cleaner.go
+
+// UpdateSlotOrderStatus 更新槽位订单状态（供 OrderCleaner 使用）
+func (spm *SuperPositionManager) UpdateSlotOrderStatus(price float64, bookSide, status string) {
+	slot := spm.getOrCreateSlot(price, bookSide)
+	slot.mu.Lock()
+	slot.OrderStatus = status
+	if status == OrderStatusCancelRequested {
+		slot.SlotStatus = SlotStatusLocked
+	} else if status == OrderStatusCanceled || status == OrderStatusNotPlaced {
+		slot.SlotStatus = SlotStatusFree
+		slot.OrderID = 0
+		slot.ClientOID = ""
+		slot.OrderSide = ""
+		slot.OrderFilledQty = 0
+	}
+	slot.mu.Unlock()
+}
+
+// CancelEntryOrders 撤销所有开仓单（风控触发时使用）
+func (spm *SuperPositionManager) CancelEntryOrders() {
+	var orderIDs []int64
+	var targets []struct {
+		price    float64
+		bookSide string
+	}
+
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		price := slot.Price
+
+		slot.mu.RLock()
+		if slot.OrderID > 0 && spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
+			orderIDs = append(orderIDs, slot.OrderID)
+			targets = append(targets, struct {
+				price    float64
+				bookSide string
+			}{price: price, bookSide: slot.BookSide})
+		}
+		slot.mu.RUnlock()
+		return true
+	})
+
+	if len(orderIDs) == 0 {
+		return
+	}
+
+	logger.Info("🔄 [撤销开仓单] 准备撤销 %d 个开仓单以释放保证金", len(orderIDs))
+
+	// 🔥 重复尝试3次，确保撤单干净
+	for attempt := 1; attempt <= 3; attempt++ {
+		if len(orderIDs) == 0 {
+			break
+		}
+
+		logger.Info("🔄 [撤销开仓单] 第 %d 次尝试，剩余 %d 个订单", attempt, len(orderIDs))
+
+		if err := spm.executor.BatchCancelOrders(orderIDs); err != nil {
+			logger.Error("❌ [撤销开仓单] 批量撤单失败: %v", err)
+			if attempt == 3 {
+				break
+			}
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// 更新槽位状态
+		for _, target := range targets {
+			slot := spm.getOrCreateSlot(target.price, target.bookSide)
+			slot.mu.Lock()
+			slot.OrderStatus = OrderStatusCancelRequested
+			slot.mu.Unlock()
+		}
+
+		// 等待2秒让撤单生效（WebSocket推送通知）
+		time.Sleep(2 * time.Second)
+
+		// 🔥 二次检查：重新扫描本地槽位状态
+		if attempt < 3 {
+			orderIDs = nil
+			targets = nil
+
+			spm.slots.Range(func(key, value interface{}) bool {
+				slot := value.(*InventorySlot)
+				price := slot.Price
+
+				slot.mu.RLock()
+				if slot.OrderID > 0 && spm.isEntryOrder(slot.OrderSide, slot.BookSide) &&
+					slot.OrderStatus != OrderStatusCanceled {
+					orderIDs = append(orderIDs, slot.OrderID)
+					targets = append(targets, struct {
+						price    float64
+						bookSide string
+					}{price: price, bookSide: slot.BookSide})
+				}
+				slot.mu.RUnlock()
+				return true
+			})
+
+			if len(orderIDs) > 0 {
+				logger.Warn("⚠️ [撤销开仓单] 检测到 %d 个残留订单，继续清理", len(orderIDs))
+			} else {
+				logger.Info("✅ [撤销开仓单] 所有开仓单已清理完成")
+				break
+			}
+		}
+	}
+
+	logger.Info("✅ [撤销开仓单] 清理完成")
+}
+
+// ===== 对账功能已迁移到 safety.Reconciler =====
+// StartReconciliation 和 Reconcile 方法已移至 safety/reconciler.go
+// SetPauseChecker 也已移至 Reconciler
+
+// CancelAllOrders 撤销所有订单（退出时使用）
+// 委托给交易所适配器实现具体逻辑
+func (spm *SuperPositionManager) CancelAllOrders() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := spm.exchange.CancelAllOrders(ctx, spm.config.Trading.Symbol); err != nil {
+		logger.Error("❌ [%s] 撤销所有订单失败: %v", spm.exchange.GetName(), err)
+	} else {
+		logger.Info("✅ [%s] 撤销所有订单完成", spm.exchange.GetName())
+	}
+}
+
+type existingPositions struct {
+	LongQty    float64
+	ShortQty   float64
+	LongEntry  float64
+	ShortEntry float64
+}
+
+func (p *existingPositions) add(size, entryPrice, fallbackPrice float64) {
+	if size == 0 {
+		return
+	}
+	if entryPrice <= 0 {
+		entryPrice = fallbackPrice
+	}
+	if entryPrice <= 0 {
+		entryPrice = 0
+	}
+	qty := math.Abs(size)
+	if size > 0 {
+		p.LongEntry = weightedAveragePrice(p.LongEntry, p.LongQty, entryPrice, qty)
+		p.LongQty += qty
+		return
+	}
+	p.ShortEntry = weightedAveragePrice(p.ShortEntry, p.ShortQty, entryPrice, qty)
+	p.ShortQty += qty
+}
+
+func weightedAveragePrice(currentPrice, currentQty, nextPrice, nextQty float64) float64 {
+	if nextPrice <= 0 {
+		return currentPrice
+	}
+	if currentPrice <= 0 || currentQty <= 0 {
+		return nextPrice
+	}
+	totalQty := currentQty + nextQty
+	if totalQty <= 0 {
+		return currentPrice
+	}
+	return (currentPrice*currentQty + nextPrice*nextQty) / totalQty
+}
+
+// getExistingPositions 获取当前多空持仓与交易所参考价（容错处理）
+func (spm *SuperPositionManager) getExistingPositions() existingPositions {
+	result := existingPositions{}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	positionsInterface, err := spm.exchange.GetPositions(ctx, spm.config.Trading.Symbol)
+	if err != nil || positionsInterface == nil {
+		logger.Debug("🔍 [持仓恢复] 无法获取持仓信息: %v", err)
+		return result
+	}
+
+	positions := spm.extractExchangePositions(positionsInterface)
+	for _, pos := range positions {
+		if pos.Size == 0 {
+			continue
+		}
+		if pos.Symbol != "" && !sameTradingSymbol(pos.Symbol, spm.config.Trading.Symbol) {
+			continue
+		}
+		entryPrice := pos.EntryPrice
+		if entryPrice <= 0 {
+			entryPrice = pos.MarkPrice
+		}
+		if entryPrice <= 0 {
+			entryPrice = spm.anchorPrice
+		}
+		logger.Debug("🔍 [持仓恢复] 找到持仓: symbol=%s, size=%.8f, entry=%.8f, mark=%.8f",
+			pos.Symbol, pos.Size, pos.EntryPrice, pos.MarkPrice)
+		result.add(pos.Size, entryPrice, spm.anchorPrice)
+	}
+
+	if result.LongQty == 0 && result.ShortQty == 0 {
+		logger.Debug("🔍 [持仓恢复] 未找到匹配的持仓")
+	}
+	return result
+}
+
+// initializeSlotsFromPosition 从现有持仓初始化平仓槽位（用于程序重启后恢复状态）
+func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float64, bookSide string, entryPrice float64) {
+	if totalPosition <= 0 {
+		return
+	}
+	referencePrice := roundPrice(firstPositiveFloat(entryPrice, spm.anchorPrice), spm.priceDecimals)
+	if referencePrice <= 0 {
+		return
+	}
+	direction := "down"
+	if bookSide == BookSideShort {
+		direction = "up"
+	}
+
+	remaining := roundQuantity(totalPosition, spm.quantityDecimals)
+	allocatedQty := 0.0
+	created := 0
+	maxSlots := 100000
+	for i := 0; remaining > 0 && i < maxSlots; i++ {
+		price := referencePrice
+		if direction == "down" {
+			price = referencePrice - float64(i)*spm.config.Trading.PriceInterval
+		} else {
+			price = referencePrice + float64(i)*spm.config.Trading.PriceInterval
+		}
+		price = roundPrice(price, spm.priceDecimals)
+		if price <= 0 {
+			break
+		}
+		slotQty := spm.maxConfiguredOrderQuantity(price)
+		if slotQty <= 0 {
+			logger.Warn("⚠️ [持仓恢复-%s] 价格 %s 的单格数量为 0，停止拆分底仓以避免放大订单",
+				bookSide, formatPrice(price, spm.priceDecimals))
+			break
+		}
+		if slotQty > remaining {
+			slotQty = remaining
+		}
+		slotQty = roundQuantity(slotQty, spm.quantityDecimals)
+
+		slot := spm.getOrCreateSlot(price, bookSide)
+		slot.mu.Lock()
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = slotQty
+		slot.BookSide = bookSide
+		slot.OrderID = 0
+		slot.OrderStatus = OrderStatusNotPlaced
+		slot.OrderSide = spm.exitOrderSide(bookSide)
+		slot.ClientOID = ""
+		slot.OrderFilledQty = 0
+		slot.SlotStatus = SlotStatusFree
+		slot.mu.Unlock()
+
+		allocatedQty += slotQty
+		remaining = roundQuantity(remaining-slotQty, spm.quantityDecimals)
+		created++
+		if i < 10 {
+			logger.Info("✅ [持仓恢复] 槽位 %s: 分配持仓 %.4f", formatPrice(price, spm.priceDecimals), slotQty)
+		} else if i == 10 {
+			logger.Info("... （省略后续底仓拆分槽位日志）")
+		}
+	}
+
+	if remaining > 0 {
+		logger.Warn("⚠️ [持仓恢复-%s] 仍有 %.8f 仓位未能按单笔金额拆分，将不会自动放大成大单",
+			bookSide, remaining)
+	}
+	logger.Info("✅ [持仓恢复-%s] 按单笔金额拆分底仓: 参考价 %s, 创建 %d 个槽位, 总持仓 %.4f, 已分配 %.4f",
+		bookSide, formatPrice(referencePrice, spm.priceDecimals), created, totalPosition, allocatedQty)
+}
+
+// ===== 状态打印功能 =====
+
+// PrintPositions 打印持仓状态（由 main.go 定期调用和退出时调用）
+// 注意：该方法内部使用 totalBuyQty 和 totalSellQty 统计数据
+func (spm *SuperPositionManager) PrintPositions() {
+	logger.Debug("📊 ===== 当前持仓 =====")
+	debugEnabled := logger.GetLevel() <= logger.DEBUG
+	total := 0.0
+	count := 0
+
+	// 收集所有持仓数据
+	type positionInfo struct {
+		Price       float64
+		Qty         float64
+		BookSide    string
+		OrderStatus string
+		OrderSide   string
+		OrderID     int64
+		SlotStatus  string
+	}
+	var positions []positionInfo
+
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		price := slot.Price
+		slot.mu.RLock()
+		if slot.PositionStatus == PositionStatusFilled && slot.PositionQty > 0.001 {
+			if debugEnabled {
+				positions = append(positions, positionInfo{
+					Price:       price,
+					Qty:         slot.PositionQty,
+					BookSide:    slot.BookSide,
+					OrderStatus: slot.OrderStatus,
+					OrderSide:   slot.OrderSide,
+					OrderID:     slot.OrderID,
+					SlotStatus:  slot.SlotStatus,
+				})
+			}
+			total += slot.PositionQty
+			count++
+		}
+		slot.mu.RUnlock()
+		return true
+	})
+
+	// 从交易所接口获取基础币种（支持U本位和币本位合约）
+	baseCurrency := spm.exchange.GetBaseAsset()
+	lastPrice, ok := spm.lastMarketPrice.Load().(float64)
+	if !ok || lastPrice <= 0 {
+		lastPrice = spm.anchorPrice
+	}
+
+	if debugEnabled {
+		sort.Slice(positions, func(i, j int) bool {
+			return positions[i].Price > positions[j].Price
+		})
+		for _, pos := range positions {
+			statusIcon := "🟢" // 有持仓
+			priceStr := formatPrice(pos.Price, spm.priceDecimals)
+			positionDesc := fmt.Sprintf("%s持仓: %.4f %s", pos.BookSide, pos.Qty, baseCurrency)
+
+			orderInfo := ""
+			if pos.OrderStatus != OrderStatusNotPlaced && pos.OrderStatus != "" {
+				orderInfo = fmt.Sprintf(", 订单: %s/%s (ID:%d)", pos.OrderSide, pos.OrderStatus, pos.OrderID)
+			}
+
+			slotStatusInfo := ""
+			if pos.SlotStatus != "" {
+				slotStatusInfo = fmt.Sprintf(" [槽位:%s]", pos.SlotStatus)
+			} else {
+				slotStatusInfo = " [槽位:空]"
+			}
+
+			logger.Debug("  %s %s: %s%s%s",
+				statusIcon, priceStr, positionDesc, orderInfo, slotStatusInfo)
+		}
+	}
+
+	totalBuyQty := spm.totalBuyQty.Load().(float64)
+	totalSellQty := spm.totalSellQty.Load().(float64)
+	realizedPNL := spm.totalRealizedPNL.Load().(float64)
+	unrealizedPNL := spm.EstimateUnrealizedPNL(lastPrice)
+	logger.Info("📊 [统计] 持仓: %.4f %s (%d 个槽位), 当前价格: %s, 累计买入: %.4f, 累计卖出: %.4f, 已实现盈亏: %.4f USD, 未实现盈亏: %.4f USD",
+		total, baseCurrency, count, formatPrice(lastPrice, spm.priceDecimals), totalBuyQty, totalSellQty, realizedPNL, unrealizedPNL)
+	// === 打印当前窗口槽位，便于 CLI 观察机器人是否按预期补单 ===
+	logger.Info("🔍 ===== 当前窗口槽位 =====")
+	logger.Info("当前市场价格: %s", formatPrice(lastPrice, spm.priceDecimals))
+
+	// 收集所有槽位信息（包括买单和空槽位）
+	type slotInfo struct {
+		Price          float64
+		PositionStatus string
+		PositionQty    float64
+		BookSide       string
+		OrderSide      string
+		OrderStatus    string
+		OrderID        int64
+		ClientOID      string
+		SlotStatus     string
+	}
+	var allSlots []slotInfo
+
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		price := slot.Price
+		slot.mu.RLock()
+		allSlots = append(allSlots, slotInfo{
+			Price:          price,
+			PositionStatus: slot.PositionStatus,
+			PositionQty:    slot.PositionQty,
+			BookSide:       slot.BookSide,
+			OrderSide:      slot.OrderSide,
+			OrderStatus:    slot.OrderStatus,
+			OrderID:        slot.OrderID,
+			ClientOID:      slot.ClientOID,
+			SlotStatus:     slot.SlotStatus,
+		})
+		slot.mu.RUnlock()
+		return true
+	})
+
+	// 按价格从高到低排序
+	sort.Slice(allSlots, func(i, j int) bool {
+		return allSlots[i].Price > allSlots[j].Price
+	})
+
+	// 找到最接近当前价格的网格价格
+	currentGridPrice := spm.findNearestGridPrice(lastPrice)
+	logger.Info("当前网格价格: %s", formatPrice(currentGridPrice, spm.priceDecimals))
+
+	// 计算开仓窗口范围；多头在当前价下方，空头在当前价上方。
+	buyWindowSize := spm.config.Trading.BuyWindowSize
+	windowSlotMap := make(map[string]bool)
+	for _, bookSide := range spm.enabledBookSides() {
+		for _, p := range spm.calculateEntrySlotPrices(currentGridPrice, lastPrice, buyWindowSize, bookSide) {
+			windowSlotMap[spm.slotKey(p, bookSide)] = true
+		}
+	}
+
+	// 打印开仓窗口内的所有槽位
+	logger.Info("开仓窗口大小: %d 个槽位", buyWindowSize)
+	entryOrderCount := 0
+	emptySlotCount := 0
+	filledSlotCount := 0
+
+	for _, slot := range allSlots {
+		priceStr := formatPrice(slot.Price, spm.priceDecimals)
+		// 只打印当前交易方向启用的开仓窗口槽位
+		if windowSlotMap[spm.slotKey(slot.Price, slot.BookSide)] {
+			statusIcon := "⚪" // 空槽位
+			statusDesc := ""
+
+			if slot.PositionStatus == PositionStatusFilled {
+				statusIcon = "🟢" // 有持仓
+				statusDesc = fmt.Sprintf("%s持仓: %.4f %s", slot.BookSide, slot.PositionQty, baseCurrency)
+				filledSlotCount++
+			} else {
+				statusDesc = "无持仓"
+				emptySlotCount++
+			}
+
+			orderInfo := ""
+			if slot.OrderStatus != OrderStatusNotPlaced && slot.OrderStatus != "" {
+				orderInfo = fmt.Sprintf(", 订单: %s/%s (ID:%d)", slot.OrderSide, slot.OrderStatus, slot.OrderID)
+				if spm.isEntryOrder(slot.OrderSide, slot.BookSide) && (slot.OrderStatus == OrderStatusPlaced ||
+					slot.OrderStatus == OrderStatusConfirmed ||
+					slot.OrderStatus == OrderStatusPartiallyFilled) {
+					entryOrderCount++
+				}
+			}
+
+			// 🔥 总是显示槽位状态,便于调试
+			slotStatusInfo := ""
+			if slot.SlotStatus != "" {
+				slotStatusInfo = fmt.Sprintf(" [槽位:%s]", slot.SlotStatus)
+			} else {
+				slotStatusInfo = " [槽位:空]"
+			}
+
+			logger.Info("  %s %s: %s%s%s",
+				statusIcon, priceStr, statusDesc, orderInfo, slotStatusInfo)
+		}
+	}
+
+	logger.Info("窗口统计: %d 个开仓单活跃, %d 个已持仓, %d 个空槽位",
+		entryOrderCount, filledSlotCount, emptySlotCount)
+	logger.Info("==========================")
+}
+
+// 辅助函数
+// roundPrice 价格四舍五入
+func roundPrice(price float64, decimals int) float64 {
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Round(price*multiplier) / multiplier
+}
+
+func roundQuantity(quantity float64, decimals int) float64 {
+	if decimals < 0 {
+		decimals = 0
+	}
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Round(quantity*multiplier) / multiplier
+}
+
+func floorQuantity(quantity float64, decimals int) float64 {
+	if decimals < 0 {
+		decimals = 0
+	}
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Floor(quantity*multiplier) / multiplier
+}
+
+func firstPositiveFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+			return value
+		}
+	}
+	return 0
+}
+
+func gridRealizedPNL(entryPrice, tradePrice, qty float64, bookSide string, feeRate float64) float64 {
+	if entryPrice <= 0 || tradePrice <= 0 || qty <= 0 {
+		return 0
+	}
+	gross := (tradePrice - entryPrice) * qty
+	if strings.ToUpper(bookSide) == BookSideShort {
+		gross = (entryPrice - tradePrice) * qty
+	}
+	if feeRate < 0 {
+		feeRate = 0
+	}
+	fees := (entryPrice + tradePrice) * qty * feeRate
+	return gross - fees
+}
+
+func isActiveOrderStatus(status string) bool {
+	switch status {
+	case OrderStatusPlaced, OrderStatusConfirmed, OrderStatusPartiallyFilled, OrderStatusCancelRequested:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeRemoteOrderStatus(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "NEW", "OPEN", "LIVE":
+		return OrderStatusConfirmed
+	case "PARTIALLY_FILLED", "PARTIALLYFILLED":
+		return OrderStatusPartiallyFilled
+	case "PARTIALLY_FILLED_CANCELED", "PARTIAL_FILLED_CANCELED", "PARTIALLY_FILLED_CANCELLED", "PARTIAL_FILLED_CANCELLED":
+		return OrderStatusCanceled
+	case "FILLED":
+		return OrderStatusFilled
+	case "CANCELED", "CANCELLED", "EXPIRED", "REJECTED":
+		return OrderStatusCanceled
+	case OrderStatusPlaced, OrderStatusConfirmed, OrderStatusCancelRequested:
+		return status
+	default:
+		return OrderStatusConfirmed
+	}
+}
+
+func sameTradingSymbol(a, b string) bool {
+	return normalizeComparableSymbol(a) == normalizeComparableSymbol(b)
+}
+
+func normalizeComparableSymbol(symbol string) string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	replacer := strings.NewReplacer("/", "", "_", "", "-", "", " ", "")
+	return replacer.Replace(symbol)
+}
+
+func (spm *SuperPositionManager) extractExchangeOrders(raw interface{}) []exchangeOrderSnapshot {
+	values := reflectSlice(raw)
+	orders := make([]exchangeOrderSnapshot, 0, len(values))
+	for _, value := range values {
+		order := exchangeOrderSnapshot{
+			OrderID:       reflectInt64Field(value, "OrderID", "ID"),
+			ClientOrderID: reflectStringField(value, "ClientOrderID", "ClientOID", "Text", "OrderLinkID", "ClOrdID"),
+			Side:          reflectStringField(value, "Side", "OrderSide"),
+			Status:        reflectStringField(value, "Status", "OrderStatus"),
+			Price:         reflectFloatField(value, "Price", "OrderPrice"),
+			Quantity:      reflectFloatField(value, "Quantity", "Qty", "Size"),
+			ExecutedQty:   reflectFloatField(value, "ExecutedQty", "CumExecQty", "FillSize"),
+			AvgPrice:      reflectFloatField(value, "AvgPrice", "FillPrice"),
+			UpdateTime:    reflectInt64Field(value, "UpdateTime", "UpdatedTime"),
+		}
+		if order.ClientOrderID == "" && order.OrderID == 0 {
+			continue
+		}
+		orders = append(orders, order)
+	}
+	return orders
+}
+
+func (spm *SuperPositionManager) extractExchangePositions(raw interface{}) []exchangePositionSnapshot {
+	values := reflectSlice(raw)
+	positions := make([]exchangePositionSnapshot, 0, len(values))
+	for _, value := range values {
+		pos := exchangePositionSnapshot{
+			Symbol:     reflectStringField(value, "Symbol"),
+			Size:       reflectFloatField(value, "Size", "PositionAmt"),
+			EntryPrice: reflectFloatField(value, "EntryPrice", "AvgPrice"),
+			MarkPrice:  reflectFloatField(value, "MarkPrice"),
+		}
+		if pos.Symbol == "" && pos.Size == 0 {
+			continue
+		}
+		positions = append(positions, pos)
+	}
+	return positions
+}
+
+func reflectSlice(raw interface{}) []reflect.Value {
+	if raw == nil {
+		return nil
+	}
+	v := reflect.ValueOf(raw)
+	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+		return nil
+	}
+	values := make([]reflect.Value, 0, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		item := v.Index(i)
+		for item.Kind() == reflect.Pointer || item.Kind() == reflect.Interface {
+			if item.IsNil() {
+				goto next
+			}
+			item = item.Elem()
+		}
+		values = append(values, item)
+	next:
+	}
+	return values
+}
+
+func reflectField(value reflect.Value, names ...string) reflect.Value {
+	if value.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	for _, name := range names {
+		field := value.FieldByName(name)
+		if field.IsValid() {
+			return field
+		}
+	}
+	return reflect.Value{}
+}
+
+func reflectStringField(value reflect.Value, names ...string) string {
+	field := reflectField(value, names...)
+	if !field.IsValid() {
+		return ""
+	}
+	if field.Kind() == reflect.String {
+		return field.String()
+	}
+	return fmt.Sprint(field.Interface())
+}
+
+func reflectFloatField(value reflect.Value, names ...string) float64 {
+	field := reflectField(value, names...)
+	if !field.IsValid() {
+		return 0
+	}
+	switch field.Kind() {
+	case reflect.Float32, reflect.Float64:
+		return field.Float()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return float64(field.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return float64(field.Uint())
+	case reflect.String:
+		parsed, _ := strconv.ParseFloat(field.String(), 64)
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func reflectInt64Field(value reflect.Value, names ...string) int64 {
+	field := reflectField(value, names...)
+	if !field.IsValid() {
+		return 0
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return field.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return int64(field.Uint())
+	case reflect.Float32, reflect.Float64:
+		return int64(field.Float())
+	case reflect.String:
+		parsed, _ := strconv.ParseInt(field.String(), 10, 64)
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// formatPrice 格式化价格字符串，使用指定的小数位数
+func formatPrice(price float64, decimals int) string {
+	return fmt.Sprintf("%.*f", decimals, price)
+}
