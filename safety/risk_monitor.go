@@ -3,6 +3,7 @@ package safety
 import (
 	"context"
 	"fmt"
+	"math"
 	"nexus-trade-bot/config"
 	"nexus-trade-bot/exchange"
 	"nexus-trade-bot/logger"
@@ -252,7 +253,7 @@ func (r *RiskMonitor) checkRecovery() (bool, []string) {
 	return recoveredCount >= threshold, details
 }
 
-// checkSymbolRecovery 检查单个币种是否恢复（价格>均价 且 成交量<均值×倍数）
+// checkSymbolRecovery 检查单个币种是否恢复（价格回到当前交易方向的非危险侧，且成交量恢复正常）
 // 解除风控必须使用完结的K线数据
 func (r *RiskMonitor) checkSymbolRecovery(symbol string) (bool, string) {
 	symbolData, exists := r.symbolDataMap[symbol]
@@ -304,17 +305,17 @@ func (r *RiskMonitor) checkSymbolRecovery(symbol string) (bool, string) {
 	avgPrice := totalPrice / float64(validCount)
 	avgVol := totalVol / float64(validCount)
 
-	// 恢复条件：价格 > 均价 且 成交量 < 均值×倍数（与触发条件对应）
-	priceAboveMA := currentPrice > avgPrice
+	// 恢复条件：价格回到非危险侧，且成交量恢复正常（与触发条件对应）
+	priceRecovered := r.priceRecovered(currentPrice, avgPrice)
 	volNormal := currentCandle.Volume < avgVol*r.cfg.RiskControl.VolumeMultiplier
 
-	if priceAboveMA && volNormal {
-		return true, "价格回归均线/量正常"
+	if priceRecovered && volNormal {
+		return true, fmt.Sprintf("%s/量正常", r.recoveryPriceDescription())
 	}
 
 	// 返回未恢复原因
-	if !priceAboveMA {
-		return false, fmt.Sprintf("价格%.2f<均价%.2f", currentPrice, avgPrice)
+	if !priceRecovered {
+		return false, r.unrecoveredPriceReason(currentPrice, avgPrice)
 	}
 	return false, fmt.Sprintf("量%.0f>均量×%.1f", currentCandle.Volume, r.cfg.RiskControl.VolumeMultiplier)
 }
@@ -367,12 +368,77 @@ func (r *RiskMonitor) checkSymbol(symbol string) (bool, string) {
 	priceDeviation := (currentPrice - avgPrice) / avgPrice * 100
 	volRatio := currentCandle.Volume / avgVol
 
-	// 触发条件：当前价格 < 均价 且 成交量放大（使用最新数据，包括未完结K线）
-	if currentPrice < avgPrice && currentCandle.Volume > avgVol*r.cfg.RiskControl.VolumeMultiplier {
-		return true, fmt.Sprintf("价格%.2f%%低于均线/量×%.1f", priceDeviation, volRatio)
+	// 触发条件：当前价格进入当前交易方向的危险侧，且成交量放大（使用最新数据，包括未完结K线）
+	if r.isAdversePriceMove(currentPrice, avgPrice) && currentCandle.Volume > avgVol*r.cfg.RiskControl.VolumeMultiplier {
+		return true, fmt.Sprintf("%s/量×%.1f", r.adversePriceDescription(priceDeviation), volRatio)
 	}
 
 	return false, ""
+}
+
+func (r *RiskMonitor) tradingDirection() string {
+	direction := strings.ToLower(strings.TrimSpace(r.cfg.Trading.Direction))
+	switch direction {
+	case "short", "neutral":
+		return direction
+	default:
+		return "long"
+	}
+}
+
+func (r *RiskMonitor) isAdversePriceMove(currentPrice, avgPrice float64) bool {
+	switch r.tradingDirection() {
+	case "short":
+		return currentPrice > avgPrice
+	case "neutral":
+		return math.Abs(currentPrice-avgPrice) > 0
+	default:
+		return currentPrice < avgPrice
+	}
+}
+
+func (r *RiskMonitor) priceRecovered(currentPrice, avgPrice float64) bool {
+	switch r.tradingDirection() {
+	case "short":
+		return currentPrice < avgPrice
+	case "neutral":
+		return true
+	default:
+		return currentPrice > avgPrice
+	}
+}
+
+func (r *RiskMonitor) adversePriceDescription(priceDeviation float64) string {
+	switch r.tradingDirection() {
+	case "short":
+		return fmt.Sprintf("价格%.2f%%高于均线", priceDeviation)
+	case "neutral":
+		return fmt.Sprintf("价格偏离均线%.2f%%", priceDeviation)
+	default:
+		return fmt.Sprintf("价格%.2f%%低于均线", priceDeviation)
+	}
+}
+
+func (r *RiskMonitor) recoveryPriceDescription() string {
+	switch r.tradingDirection() {
+	case "short":
+		return "价格回到均线下方"
+	case "neutral":
+		return "价格风控解除"
+	default:
+		return "价格回到均线上方"
+	}
+}
+
+func (r *RiskMonitor) unrecoveredPriceReason(currentPrice, avgPrice float64) string {
+	switch r.tradingDirection() {
+	case "short":
+		return fmt.Sprintf("价格%.2f>均价%.2f", currentPrice, avgPrice)
+	case "neutral":
+		return fmt.Sprintf("价格%.2f偏离均价%.2f", currentPrice, avgPrice)
+	default:
+		return fmt.Sprintf("价格%.2f<均价%.2f", currentPrice, avgPrice)
+	}
 }
 
 // IsTriggered 返回是否触发风控

@@ -43,6 +43,7 @@ CONFIG_PATH="${NEXUS_TRADE_BOT_CONFIG:-${APP_DIR}/config.yaml}"
 LOG_DIR="${APP_DIR}/logs"
 WEB_LOG="${LOG_DIR}/web-console.log"
 WEB_ERR_LOG="${LOG_DIR}/web-console-error.log"
+WEB_LEGACY_ERR_LOG="${LOG_DIR}/web-console.err.log"
 PID_FILE="${APP_DIR}/nexus-trade-bot.pid"
 
 say() { printf "%s\n" "$*"; }
@@ -375,6 +376,8 @@ print_access_block() {
   say " Server URL: ${access_url}"
   say " Bind Addr:  ${ADDR}"
   say " Log:        ${WEB_LOG}"
+  say " Error Log:  ${WEB_ERR_LOG}"
+  say " Daily Log:  ${LOG_DIR}/nexus-trade-bot-$(date +%F).log"
   say " Stop:       ${APP_DIR}/scripts/nexus-trade-bot.sh stop"
   say "----------------------------------------------------------------------"
   say " Open this in your browser: ${access_url}"
@@ -415,6 +418,7 @@ start_web() {
 
   : > "$WEB_LOG"
   : > "$WEB_ERR_LOG"
+  ln -sfn "$(basename "$WEB_ERR_LOG")" "$WEB_LEGACY_ERR_LOG" 2>/dev/null || true
   cd "$APP_DIR"
   info "Starting web console on ${ADDR}"
   nohup env NEXUS_TRADE_BOT_ADDR="$ADDR" "$BIN_PATH" "$CONFIG_PATH" </dev/null >>"$WEB_LOG" 2>>"$WEB_ERR_LOG" &
@@ -504,7 +508,9 @@ case "${1:-start}" in
   logs)
     mkdir -p "$LOG_DIR"
     touch "$WEB_LOG" "$WEB_ERR_LOG"
-    tail -n 80 -f "$WEB_LOG" "$WEB_ERR_LOG"
+    ln -sfn "$(basename "$WEB_ERR_LOG")" "$WEB_LEGACY_ERR_LOG" 2>/dev/null || true
+    touch "${LOG_DIR}/nexus-trade-bot-$(date +%F).log"
+    tail -n 80 -f "$WEB_LOG" "$WEB_ERR_LOG" "${LOG_DIR}/nexus-trade-bot-$(date +%F).log"
     ;;
   worker)
     run_worker

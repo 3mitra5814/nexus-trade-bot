@@ -139,6 +139,10 @@ func TestRecorderStoresRecentTradesByDelta(t *testing.T) {
 	assertNear(t, snap.RecentTrades[0].Quantity, 0.01)
 	assertNear(t, snap.RecentTrades[1].Quantity, 0.02)
 	assertNear(t, snap.RecentTrades[1].Price, 3001)
+	assertNear(t, snap.RecentTrades[0].PositionDelta, -0.01)
+	assertNear(t, snap.RecentTrades[0].PositionAfter, -0.01)
+	assertNear(t, snap.RecentTrades[1].PositionDelta, -0.02)
+	assertNear(t, snap.RecentTrades[1].PositionAfter, -0.03)
 	if snap.RecentTrades[1].Side != "SELL" || snap.RecentTrades[1].BookSide != "LONG" {
 		t.Fatalf("unexpected trade side: %+v", snap.RecentTrades[1])
 	}

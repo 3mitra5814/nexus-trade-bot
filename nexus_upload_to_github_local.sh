@@ -381,9 +381,7 @@ if [[ ${#SKIPPED_PATHS[@]} -gt 0 ]]; then
 fi
 
 if [[ ${#UPLOAD_PATHS[@]} -gt 0 || ${#REMOVAL_PATHS[@]} -gt 0 ]]; then
-  commit_time=$(printf '%02d:%02d:%02d' "$((RANDOM % 24))" "$((RANDOM % 60))" "$((RANDOM % 60))")
-  commit_date="2026-01-11 ${commit_time} +0800"
-  default_message="update: 2026-01-11 ${commit_time}"
+  default_message="update: $(date '+%Y-%m-%d %H:%M:%S')"
   commit_message="${NEXUS_UPLOAD_COMMIT_MESSAGE:-$default_message}"
 
   say
@@ -398,7 +396,7 @@ if [[ ${#UPLOAD_PATHS[@]} -gt 0 || ${#REMOVAL_PATHS[@]} -gt 0 ]]; then
     git --no-pager diff --cached --name-status
     say
     say "正在提交: ${commit_message}"
-    run env GIT_AUTHOR_DATE="$commit_date" GIT_COMMITTER_DATE="$commit_date" git commit -m "$commit_message"
+    run git commit -m "$commit_message"
   fi
 else
   say "没有检测到需要上传的安全变更。"

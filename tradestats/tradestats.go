@@ -46,6 +46,8 @@ type TradeRecord struct {
 	BookSide      string    `json:"book_side,omitempty"`
 	Quantity      float64   `json:"quantity"`
 	Price         float64   `json:"price"`
+	PositionDelta float64   `json:"position_delta,omitempty"`
+	PositionAfter float64   `json:"position_after,omitempty"`
 	RealizedPNL   float64   `json:"realized_pnl,omitempty"`
 }
 
@@ -238,9 +240,11 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 	daily := r.snapshot.Daily[dateKey]
 	daily.Volume += volume
 	daily.RealizedPNL += realized
+	positionDelta := signedPositionDelta(side, deltaQty)
 	r.snapshot.Daily[dateKey] = daily
 	r.snapshot.TotalVolume += volume
 	r.snapshot.TotalRealizedPNL += realized
+	positionAfter := lastRecordedPosition(r.snapshot) + positionDelta
 	now := time.Now()
 	r.snapshot.RecentTrades = append(r.snapshot.RecentTrades, TradeRecord{
 		Time:          timeForUpdate(update.UpdateTime, now),
@@ -250,6 +254,8 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 		BookSide:      bookSide,
 		Quantity:      deltaQty,
 		Price:         tradePrice,
+		PositionDelta: positionDelta,
+		PositionAfter: positionAfter,
 		RealizedPNL:   realized,
 	})
 	if len(r.snapshot.RecentTrades) > 100 {
@@ -257,6 +263,29 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 	}
 	r.snapshot.UpdatedAt = now
 	return true, nil
+}
+
+func lastRecordedPosition(snap Snapshot) float64 {
+	for i := len(snap.RecentTrades) - 1; i >= 0; i-- {
+		if snap.RecentTrades[i].PositionAfter != 0 {
+			return snap.RecentTrades[i].PositionAfter
+		}
+	}
+	return snap.TotalBuyQty - snap.TotalSellQty
+}
+
+func signedPositionDelta(side string, qty float64) float64 {
+	if qty <= 0 {
+		return 0
+	}
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "BUY":
+		return qty
+	case "SELL":
+		return -qty
+	default:
+		return 0
+	}
 }
 
 func isFillBearingStatus(status string) bool {

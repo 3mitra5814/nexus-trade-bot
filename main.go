@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -25,6 +26,10 @@ import (
 var Version = "v3.4.4"
 
 func main() {
+	logger.SetConsoleOutput(os.Stdout)
+	logger.SetLogDir(filepath.Join(appRootDir(), "logs"))
+	defer logger.Close()
+
 	logger.Info("🚀 nexus-trade-bot 做市商系统启动...")
 	logger.Info("📦 版本号: %s", Version)
 
@@ -431,6 +436,7 @@ func runTrader(configPath string) {
 				if lastTriggered {
 					logger.Info("✅ [风控解除] 市场恢复正常，恢复自动交易")
 					lastTriggered = false
+					scheduleAdjust("risk-recovered")
 				}
 
 				// 实时调整订单，不打印价格变化日志（避免日志过多）
@@ -507,8 +513,18 @@ func runTrader(configPath string) {
 
 	logger.Info("✅ 系统已安全退出 nexus-trade-bot")
 
-	// 关闭文件日志
-	logger.Close()
+}
+
+func appRootDir() string {
+	if len(os.Args) > 1 {
+		if os.Args[1] == "worker" && len(os.Args) > 2 {
+			return filepath.Dir(os.Args[2])
+		}
+		if os.Args[1] != "worker" {
+			return filepath.Dir(os.Args[1])
+		}
+	}
+	return "."
 }
 
 func cancelOwnedOrders(ctx context.Context, ex exchange.IExchange, cfg *config.Config) error {

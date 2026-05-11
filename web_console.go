@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/pbkdf2"
 	"crypto/rand"
@@ -141,6 +142,9 @@ type robotMetric struct {
 	AvailableBalance float64 `json:"available_balance"`
 	MarginBalance    float64 `json:"margin_balance"`
 	CurrentPrice     float64 `json:"current_price"`
+	LongPosition     float64 `json:"long_position"`
+	ShortPosition    float64 `json:"short_position"`
+	NetPosition      float64 `json:"net_position"`
 	UnrealizedPNL    float64 `json:"unrealized_pnl"`
 	TodayRealizedPNL float64 `json:"today_realized_pnl"`
 	TotalRealizedPNL float64 `json:"total_realized_pnl"`
@@ -195,6 +199,11 @@ type dashboardResponse struct {
 
 type recentTradesResponse struct {
 	Trades []tradestats.TradeRecord `json:"trades"`
+}
+
+type robotLogsResponse struct {
+	Logs string `json:"logs"`
+	Path string `json:"path,omitempty"`
 }
 
 type dashboardSummary struct {
@@ -830,6 +839,19 @@ func (s *consoleServer) handleRobotAction(w http.ResponseWriter, r *http.Request
 		writeJSON(w, recentTradesResponse{Trades: trades})
 		return
 	}
+	if action == "logs" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		logs, path, err := s.robotLogs(id, 256*1024)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, robotLogsResponse{Logs: logs, Path: path})
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -885,6 +907,33 @@ func (s *consoleServer) recentRobotTrades(id string, limit int) ([]tradestats.Tr
 		out = append(out, trades[i])
 	}
 	return out, nil
+}
+
+func (s *consoleServer) robotLogs(id string, maxBytes int) (string, string, error) {
+	if maxBytes <= 0 {
+		maxBytes = 256 * 1024
+	}
+	s.mu.RLock()
+	robot, ok := s.robots[id]
+	if !ok || robot == nil {
+		s.mu.RUnlock()
+		return "", "", fmt.Errorf("机器人不存在")
+	}
+	configPath := robot.ConfigPath
+	s.mu.RUnlock()
+
+	logPath := robotLogPath(configPath)
+	if !strings.HasPrefix(filepath.Clean(logPath), filepath.Clean(s.robotsDir)+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("机器人日志路径无效")
+	}
+	logs, err := tailTextFileBytes(logPath, maxBytes)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", logPath, nil
+		}
+		return "", "", fmt.Errorf("读取机器人日志失败: %w", err)
+	}
+	return logs, logPath, nil
 }
 
 func (s *consoleServer) createRobot(payload robotPayload) (*robotView, error) {
@@ -1035,6 +1084,8 @@ func (s *consoleServer) startRobot(id string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("无法创建机器人日志文件: %w", err)
 	}
+	_, _ = fmt.Fprintf(logFile, "\n===== robot start %s =====\nid=%s name=%s exchange=%s market=%s symbol=%s direction=%s config=%s\n",
+		time.Now().Format(time.RFC3339), robot.ID, robot.Name, robot.Config.App.CurrentExchange, robot.Config.App.MarketType, robot.Config.Trading.Symbol, robot.Config.Trading.Direction, robot.ConfigPath)
 	cmd := exec.Command(executable, "worker", robot.ConfigPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -2281,7 +2332,13 @@ func (s *consoleServer) fetchRobotMetric(robot *robotDefinition) robotMetric {
 		var exchangePNL float64
 		for _, pos := range positions {
 			exchangePNL += pos.UnrealizedPNL
+			if pos.Size > 0 {
+				statsMetric.LongPosition += pos.Size
+			} else if pos.Size < 0 {
+				statsMetric.ShortPosition += -pos.Size
+			}
 		}
+		statsMetric.NetPosition = statsMetric.LongPosition - statsMetric.ShortPosition
 		if exchangePNL != 0 {
 			statsMetric.UnrealizedPNL = exchangePNL
 		}
@@ -2362,12 +2419,9 @@ func tailTextFile(path string, maxBytes int) string {
 	if strings.TrimSpace(path) == "" || maxBytes <= 0 {
 		return ""
 	}
-	data, err := os.ReadFile(path)
+	data, err := readTailBytes(path, maxBytes)
 	if err != nil || len(data) == 0 {
 		return ""
-	}
-	if len(data) > maxBytes {
-		data = data[len(data)-maxBytes:]
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -2378,6 +2432,47 @@ func tailTextFile(path string, maxBytes int) string {
 		return line
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func tailTextFileBytes(path string, maxBytes int) (string, error) {
+	data, err := readTailBytes(path, maxBytes)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func readTailBytes(path string, maxBytes int) ([]byte, error) {
+	if strings.TrimSpace(path) == "" || maxBytes <= 0 {
+		return nil, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	size := info.Size()
+	offset := int64(0)
+	if size > int64(maxBytes) {
+		offset = size - int64(maxBytes)
+	}
+	if _, err := file.Seek(offset, 0); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	if offset > 0 {
+		if newline := bytes.IndexByte(data, '\n'); newline >= 0 && newline+1 < len(data) {
+			data = data[newline+1:]
+		}
+	}
+	return data, nil
 }
 
 func friendlyErrorMessage(err error) string {

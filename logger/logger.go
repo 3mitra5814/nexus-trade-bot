@@ -2,6 +2,7 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,12 +27,14 @@ var (
 	mu          sync.RWMutex
 
 	// 文件日志相关
-	fileLogger  *log.Logger
-	logFile     *os.File
-	currentDate string
-	fileMu      sync.Mutex
-	logDir      = "log" // 日志文件夹
-	logKeepDays = 14
+	fileLogger      *log.Logger
+	logFile         *os.File
+	currentDate     string
+	fileMu          sync.Mutex
+	logDir                    = "logs" // 日志文件夹
+	logKeepDays               = 14
+	fileLogEnabled            = true
+	stdLoggerOutput io.Writer = os.Stderr
 )
 
 // String 返回日志级别的字符串表示
@@ -77,18 +80,47 @@ func SetLevel(level LogLevel) {
 	defer mu.Unlock()
 	globalLevel = level
 
-	// 如果设置为DEBUG级别，启用文件日志
-	if level == DEBUG {
-		initFileLogger()
-	} else {
-		closeFileLogger()
-	}
+	initFileLogger()
 }
 
-// initFileLogger 初始化文件日志（当日志级别为DEBUG时）
+// SetLogDir 设置日志目录，并立即初始化日期归档日志。
+func SetLogDir(dir string) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return
+	}
+	fileMu.Lock()
+	if logFile != nil {
+		_ = logFile.Close()
+		logFile = nil
+		fileLogger = nil
+		currentDate = ""
+	}
+	logDir = dir
+	fileMu.Unlock()
+	initFileLogger()
+}
+
+// SetConsoleOutput 设置控制台日志输出目标。
+// 启动脚本会把 stdout/stderr 分流到不同文件，因此这里显式写 stdout，
+// 避免 INFO 日志被 Go 标准库默认写进 error 日志。
+func SetConsoleOutput(w io.Writer) {
+	if w == nil {
+		return
+	}
+	mu.Lock()
+	stdLoggerOutput = w
+	log.SetOutput(w)
+	mu.Unlock()
+}
+
+// initFileLogger 初始化日期归档日志。
 func initFileLogger() {
 	fileMu.Lock()
 	defer fileMu.Unlock()
+	if !fileLogEnabled {
+		return
+	}
 
 	// 如果已经初始化且日期相同，不需要重新初始化
 	today := time.Now().Format("2006-01-02")
@@ -221,20 +253,21 @@ func logf(level LogLevel, format string, args ...interface{}) {
 	prefix := fmt.Sprintf("[%s] ", level.String())
 	message := fmt.Sprintf(prefix+format, args...)
 
-	// 输出到控制台（标准输出）
-	log.Printf(prefix+format, args...)
+	mu.RLock()
+	consoleOutput := stdLoggerOutput
+	mu.RUnlock()
 
-	// 如果日志级别为DEBUG，同时写入文件
-	if currentLevel == DEBUG {
-		fileMu.Lock()
-		// 检查是否需要轮转日志文件
-		checkAndRotateLog()
-		if fileLogger != nil {
-			// 写入文件（包含时间戳）
-			fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), message)
-		}
-		fileMu.Unlock()
+	// 输出到控制台（启动脚本会重定向到 web-console.log 或机器人日志）
+	log.New(consoleOutput, "", log.LstdFlags).Printf(prefix+format, args...)
+
+	fileMu.Lock()
+	// 检查是否需要轮转日志文件
+	checkAndRotateLog()
+	if fileLogger != nil {
+		// 写入文件（包含时间戳）
+		fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), message)
 	}
+	fileMu.Unlock()
 }
 
 // logln 内部日志输出函数（无格式）
@@ -246,20 +279,21 @@ func logln(level LogLevel, args ...interface{}) {
 	prefix := fmt.Sprintf("[%s] ", level.String())
 	message := fmt.Sprintln(append([]interface{}{prefix}, args...)...)
 
-	// 输出到控制台（标准输出）
-	log.Println(append([]interface{}{prefix}, args...)...)
+	mu.RLock()
+	consoleOutput := stdLoggerOutput
+	mu.RUnlock()
 
-	// 如果日志级别为DEBUG，同时写入文件
-	if currentLevel == DEBUG {
-		fileMu.Lock()
-		// 检查是否需要轮转日志文件
-		checkAndRotateLog()
-		if fileLogger != nil {
-			// 写入文件（包含时间戳，去掉末尾的换行符，因为Println会自动添加）
-			fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), strings.TrimSuffix(message, "\n"))
-		}
-		fileMu.Unlock()
+	// 输出到控制台（启动脚本会重定向到 web-console.log 或机器人日志）
+	log.New(consoleOutput, "", log.LstdFlags).Println(append([]interface{}{prefix}, args...)...)
+
+	fileMu.Lock()
+	// 检查是否需要轮转日志文件
+	checkAndRotateLog()
+	if fileLogger != nil {
+		// 写入文件（包含时间戳，去掉末尾的换行符，因为Println会自动添加）
+		fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), strings.TrimSuffix(message, "\n"))
 	}
+	fileMu.Unlock()
 }
 
 // Debug 输出调试日志

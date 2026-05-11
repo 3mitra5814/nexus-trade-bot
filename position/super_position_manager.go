@@ -472,6 +472,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	if allowWindowRebalance {
 		if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
+			spm.mu.Unlock()
 			return err
 		} else if rebalanced {
 			spm.mu.Unlock()
