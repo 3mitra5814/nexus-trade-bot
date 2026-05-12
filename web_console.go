@@ -1159,6 +1159,20 @@ func (s *consoleServer) startRobot(id string) error {
 		go s.monitorAdoptedRobot(id, pid)
 		return nil
 	}
+	if pid, ok := findWorkerPIDForConfig(robot.ConfigPath); ok {
+		s.processes[id] = &robotProcess{
+			Status:        "running",
+			PID:           pid,
+			StartedAt:     time.Now(),
+			DesiredStatus: "running",
+			LogPath:       filepath.Join(s.robotsDir, id+".log"),
+			ExitReason:    "已按配置路径接管遗留 worker 进程",
+		}
+		_ = s.writeRobotPID(id, pid)
+		s.mu.Unlock()
+		go s.monitorAdoptedRobot(id, pid)
+		return nil
+	}
 	account, ok := s.accounts[robot.AccountID]
 	if !ok || account == nil {
 		s.mu.Unlock()
@@ -1433,6 +1447,22 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 				ExitReason:    "正在停止遗留 worker 进程",
 			}
 			s.processes[id] = proc
+		} else if robot, exists := s.robots[id]; exists && robot != nil {
+			if pid, found := findWorkerPIDForConfig(robot.ConfigPath); found {
+				proc = &robotProcess{
+					Status:        "running",
+					PID:           pid,
+					StartedAt:     time.Now(),
+					DesiredStatus: finalStatus,
+					LogPath:       filepath.Join(s.robotsDir, id+".log"),
+					ExitReason:    "正在停止按配置路径发现的遗留 worker 进程",
+				}
+				s.processes[id] = proc
+				_ = s.writeRobotPID(id, pid)
+			} else {
+				s.mu.Unlock()
+				return fmt.Errorf("机器人未运行")
+			}
 		} else {
 			s.mu.Unlock()
 			return fmt.Errorf("机器人未运行")
@@ -1444,6 +1474,22 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 			proc.Status = "running"
 			proc.PID = pid
 			proc.ExitReason = "正在停止遗留 worker 进程"
+		} else if robot, exists := s.robots[id]; exists && robot != nil {
+			if pid, found := findWorkerPIDForConfig(robot.ConfigPath); found {
+				proc.Status = "running"
+				proc.PID = pid
+				proc.ExitReason = "正在停止按配置路径发现的遗留 worker 进程"
+				_ = s.writeRobotPID(id, pid)
+			} else if proc.PID > 0 && processAlive(proc.PID) {
+				proc.Status = "running"
+			} else {
+				proc.Status = finalStatus
+				proc.ExitReason = "已停止自动重启"
+				proc.StoppedAt = time.Now()
+				s.removeRobotPIDIfCurrent(id, proc.PID)
+				s.mu.Unlock()
+				return nil
+			}
 		} else if proc.PID > 0 && processAlive(proc.PID) {
 			proc.Status = "running"
 		} else {
@@ -1545,10 +1591,18 @@ func (s *consoleServer) removeRobotPIDIfCurrent(id string, pid int) {
 func (s *consoleServer) recoverRobotProcesses() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id := range s.robots {
+	for id, robot := range s.robots {
 		pid, ok := s.runningPIDFromFile(id)
 		if !ok {
-			continue
+			if robot == nil {
+				continue
+			}
+			var found bool
+			pid, found = findWorkerPIDForConfig(robot.ConfigPath)
+			if !found {
+				continue
+			}
+			_ = s.writeRobotPID(id, pid)
 		}
 		s.processes[id] = &robotProcess{
 			Status:        "running",
@@ -1612,6 +1666,45 @@ func signalProcessGroup(pid int, sig syscall.Signal) error {
 		return err
 	}
 	return nil
+}
+
+func findWorkerPIDForConfig(configPath string) (int, bool) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return 0, false
+	}
+	absPath, err := filepath.Abs(configPath)
+	if err == nil {
+		configPath = absPath
+	}
+	out, err := exec.Command("ps", "ax", "-o", "pid=,command=").Output()
+	if err != nil {
+		return 0, false
+	}
+	lines := strings.Split(string(out), "\n")
+	currentPID := os.Getpid()
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 || pid == currentPID {
+			continue
+		}
+		cmdline := strings.Join(fields[1:], " ")
+		if !strings.Contains(cmdline, "worker") || !strings.Contains(cmdline, configPath) {
+			continue
+		}
+		if processAlive(pid) {
+			return pid, true
+		}
+	}
+	return 0, false
 }
 
 func (s *consoleServer) loadRobots() error {

@@ -1,6 +1,10 @@
 package bitget
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestMapBitgetOrderStatusAcceptsRESTAndWSVariants(t *testing.T) {
 	tests := map[string]OrderStatus{
@@ -32,5 +36,34 @@ func TestParseBitgetExecutedQtyFallsBackAcrossFields(t *testing.T) {
 	}
 	if got := parseBitgetExecutedQty("0.56", "0.12", "0.34"); got != 0.56 {
 		t.Fatalf("expected filledQty priority 0.56, got %.8f", got)
+	}
+}
+
+func TestParseBitgetBatchCancelFailuresReportsFailureList(t *testing.T) {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"successList": []map[string]string{{"orderId": "1"}},
+		"failureList": []map[string]string{{
+			"orderId":   "2",
+			"clientOid": "abc",
+			"errorMsg":  "still open",
+		}},
+	})
+
+	err := parseBitgetBatchCancelFailures(raw)
+	if err == nil {
+		t.Fatal("expected failure list to return error")
+	}
+	if !strings.Contains(err.Error(), "orderID=2") || !strings.Contains(err.Error(), "still open") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseBitgetBatchCancelFailuresAcceptsEmptyFailureList(t *testing.T) {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"successList": []map[string]string{{"orderId": "1"}},
+		"failureList": []map[string]string{},
+	})
+	if err := parseBitgetBatchCancelFailures(raw); err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 }

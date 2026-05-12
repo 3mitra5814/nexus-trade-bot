@@ -523,16 +523,35 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 			"orderIdList": orderIDList,   // 必需：订单ID列表
 		}
 
-		_, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/batch-cancel-orders", body)
+		resp, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/batch-cancel-orders", body)
 		if err != nil {
 			logger.Warn("⚠️ [Bitget] 批量撤单失败 (共%d个): %v", len(batch), err)
 			// 失败时尝试单个撤单
 			logger.Info("🔄 [Bitget] 改为逐个撤单...")
+			var failed []string
 			for _, orderID := range batch {
-				_ = b.CancelOrder(ctx, symbol, orderID)
+				if err := b.CancelOrder(ctx, symbol, orderID); err != nil {
+					failed = append(failed, fmt.Sprintf("%d: %v", orderID, err))
+				}
 				time.Sleep(100 * time.Millisecond) // 避免限频
 			}
+			if len(failed) > 0 {
+				return fmt.Errorf("Bitget 批量撤单失败，且 %d 个订单逐个撤销失败: %s", len(failed), strings.Join(failed, "; "))
+			}
 		} else {
+			if err := parseBitgetBatchCancelFailures(resp.Data); err != nil {
+				logger.Warn("⚠️ [Bitget] 批量撤单存在失败项: %v，改为逐个复撤", err)
+				var failed []string
+				for _, orderID := range batch {
+					if err := b.CancelOrder(ctx, symbol, orderID); err != nil {
+						failed = append(failed, fmt.Sprintf("%d: %v", orderID, err))
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				if len(failed) > 0 {
+					return fmt.Errorf("Bitget 批量撤单存在失败项，且 %d 个订单逐个撤销失败: %s", len(failed), strings.Join(failed, "; "))
+				}
+			}
 			logger.Info("✅ [Bitget] 批量撤单成功: %d 个订单", len(batch))
 		}
 
@@ -543,6 +562,35 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 	}
 
 	return nil
+}
+
+func parseBitgetBatchCancelFailures(raw json.RawMessage) error {
+	var data struct {
+		FailureList []struct {
+			OrderID   string `json:"orderId"`
+			ClientOid string `json:"clientOid"`
+			ErrorMsg  string `json:"errorMsg"`
+			ErrorCode string `json:"errorCode"`
+		} `json:"failureList"`
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return fmt.Errorf("解析批量撤单响应失败: %w", err)
+	}
+	if len(data.FailureList) == 0 {
+		return nil
+	}
+	failures := make([]string, 0, len(data.FailureList))
+	for _, item := range data.FailureList {
+		reason := strings.TrimSpace(item.ErrorMsg)
+		if reason == "" {
+			reason = strings.TrimSpace(item.ErrorCode)
+		}
+		failures = append(failures, fmt.Sprintf("orderID=%s clientOID=%s reason=%s", item.OrderID, item.ClientOid, reason))
+	}
+	return fmt.Errorf("%s", strings.Join(failures, "; "))
 }
 
 // CancelAllOrders 一键全撤所有订单（Bitget特有功能）

@@ -545,7 +545,7 @@ func appRootDir() string {
 }
 
 func cancelSymbolOpenOrdersUntilClear(ctx context.Context, ex exchange.IExchange, symbol string) error {
-	const maxAttempts = 8
+	const maxAttempts = 15
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		openOrders, err := ex.GetOpenOrders(ctx, symbol)
 		if err != nil {
@@ -564,12 +564,15 @@ func cancelSymbolOpenOrdersUntilClear(ctx context.Context, ex exchange.IExchange
 		logger.Warn("🧹 [%s] 清空交易对挂单: symbol=%s attempt=%d/%d count=%d",
 			ex.GetName(), symbol, attempt, maxAttempts, len(orderIDs))
 		if err := ex.BatchCancelOrders(ctx, symbol, orderIDs); err != nil {
-			return fmt.Errorf("批量撤销挂单失败: %w", err)
+			logger.Warn("⚠️ [%s] 批量撤销挂单失败，将继续复查并重试: %v", ex.GetName(), err)
+			if attempt == maxAttempts {
+				return fmt.Errorf("批量撤销挂单失败: %w", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+		case <-time.After(cancelRetryDelay(attempt)):
 		}
 	}
 	openOrders, err := ex.GetOpenOrders(ctx, symbol)
@@ -580,6 +583,17 @@ func cancelSymbolOpenOrdersUntilClear(ctx context.Context, ex exchange.IExchange
 		return fmt.Errorf("交易对 %s 仍有 %d 个挂单未清空", symbol, len(openOrders))
 	}
 	return nil
+}
+
+func cancelRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := time.Duration(attempt) * 500 * time.Millisecond
+	if delay > 3*time.Second {
+		return 3 * time.Second
+	}
+	return delay
 }
 
 // positionExchangeAdapter 适配器，将 exchange.IExchange 转换为 position.IExchange
