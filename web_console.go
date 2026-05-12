@@ -250,7 +250,7 @@ const (
 	hardcodedBuyWindowSize         = 5
 	hardcodedSellWindowSize        = 5
 	hardcodedReconcileInterval     = 60
-	hardcodedOrderCleanupThreshold = 50
+	hardcodedOrderCleanupThreshold = 10
 	hardcodedCleanupBatchSize      = 20
 	hardcodedMarginLockSeconds     = 20
 	hardcodedPositionSafetyCheck   = 100

@@ -659,10 +659,14 @@ func (w *WebSocketManager) handleOrderUpdate(data json.RawMessage) {
 
 		// 🔥 关键诊断：如果订单被撤销，打印完整的原始数据
 		if status == "cancelled" || status == "canceled" {
-			//updateBytes, _ := json.Marshal(update)
-			//logger.Warn("⚠️ [Bitget WS订单撤销] 完整数据: %s", string(updateBytes))
-			//2025/12/07 20:46:12 [WARN] ⚠️ [Bitget WS订单撤销] 完整数据: {"accBaseVolume":"0","cTime":"1765101259950","cancelReason":"normal_cancel","clientOid":"sqt_302711_B_1765101259932571318","enterPointSource":"API","feeDetail":[{"fee":"0.00000000","feeCoin":"USDT"}],"force":"post_only","instId":"ETHUSDT","leverage":"10","marginCoin":"USDT","marginMode":"crossed","notionalUsd":"30.2711","orderId":"1381500303017938945","orderType":"limit","posMode":"hedge_mode","posSide":"long","presetStopLossExecutePrice":"","presetStopLossType":"","presetStopSurplusExecutePrice":"","presetStopSurplusType":"","price":"3027.11","reduceOnly":"no","side":"buy","size":"0.01","status":"canceled","stpMode":"none","totalProfits":"0","tradeSide":"open","uTime":"1765111572322"}
-			logger.Warn("⚠️ [Bitget 订单被交易所撤销] ")
+			clientOID, _ := update["clientOid"].(string)
+			cancelReason, _ := update["cancelReason"].(string)
+			price, _ := update["price"].(string)
+			instID, _ := update["instId"].(string)
+			force, _ := update["force"].(string)
+			tradeSide, _ := update["tradeSide"].(string)
+			logger.Warn("⚠️ [Bitget 订单被交易所撤销] symbol=%s orderID=%s clientOID=%s side=%s tradeSide=%s price=%s filled=%s force=%s reason=%s",
+				instID, orderID, clientOID, side, tradeSide, price, accBaseVolume, force, cancelReason)
 		}
 
 		logger.Debug("🔍 [Bitget WS订单] ID=%s, 状态=%s, 方向=%s, 成交量=%s",
