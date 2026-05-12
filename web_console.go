@@ -75,8 +75,9 @@ type loginFailure struct {
 }
 
 type passwordRequest struct {
-	OldPassword string `json:"old_password"`
-	NewPassword string `json:"new_password"`
+	OldPassword     string `json:"old_password"`
+	NewPassword     string `json:"new_password"`
+	ConfirmPassword string `json:"confirm_password"`
 }
 
 type consoleStatus struct {
@@ -690,7 +691,11 @@ func (s *consoleServer) handleChangePassword(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	authSnapshot := s.authSnapshot()
-	if !verifyPasswordState(authSnapshot, req.OldPassword) {
+	if req.NewPassword != req.ConfirmPassword {
+		http.Error(w, "两次输入的新密码不一致", http.StatusBadRequest)
+		return
+	}
+	if !authSnapshot.MustChangePassword && !verifyPasswordState(authSnapshot, req.OldPassword) {
 		http.Error(w, "旧密码错误", http.StatusUnauthorized)
 		return
 	}
@@ -1055,6 +1060,9 @@ func (s *consoleServer) createRobot(payload robotPayload) (*robotView, error) {
 	if _, exists := s.robots[id]; exists {
 		return nil, fmt.Errorf("机器人 ID 冲突，请重试")
 	}
+	if err := s.ensureNoConflictingRobotLocked(id, account.ID, cfg); err != nil {
+		return nil, err
+	}
 	if err := config.SaveConfig(robot.ConfigPath, robot.Config); err != nil {
 		return nil, err
 	}
@@ -1087,6 +1095,9 @@ func (s *consoleServer) updateRobot(id string, payload robotPayload) (*robotView
 	}
 	if proc, exists := s.processes[id]; exists && proc.Status == "running" {
 		return nil, fmt.Errorf("编辑前必须先暂停机器人")
+	}
+	if err := s.ensureNoConflictingRobotLocked(id, account.ID, cfg); err != nil {
+		return nil, err
 	}
 	cfg.Trading.OrderTag = robotOrderTag(id)
 	oldConfigBytes, _ := json.Marshal(robot.Config)
@@ -1146,6 +1157,10 @@ func (s *consoleServer) startRobot(id string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("机器人已在运行")
 	}
+	if err := s.ensureNoConflictingRobotLocked(id, robot.AccountID, robot.Config); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	if pid, ok := s.runningPIDFromFile(id); ok {
 		s.processes[id] = &robotProcess{
 			Status:        "running",
@@ -1170,6 +1185,10 @@ func (s *consoleServer) startRobot(id string) error {
 			ExitReason:    "已按配置路径接管遗留 worker 进程",
 		}
 		_ = s.writeRobotPID(id, pid)
+		if len(pids) > 1 {
+			logger.Warn("⚠️ [进程接管] %s 发现 %d 个重复 worker，将保留首个并停止其余进程: %v", id, len(pids), pids[1:])
+			go stopExtraWorkerPIDs(pids[1:])
+		}
 		s.mu.Unlock()
 		go s.monitorAdoptedRobot(id, pid)
 		return nil
@@ -1848,6 +1867,79 @@ func (s *consoleServer) applyAccountToRobotConfig(accountID string, cfg *config.
 	return account, nil
 }
 
+func (s *consoleServer) ensureNoConflictingRobotLocked(id string, accountID string, cfg *config.Config) error {
+	scope := robotRuntimeScope(accountID, cfg)
+	if scope == "" {
+		return nil
+	}
+	for otherID, other := range s.robots {
+		if otherID == id || other == nil {
+			continue
+		}
+		if robotRuntimeScope(other.AccountID, other.Config) != scope {
+			continue
+		}
+		name := strings.TrimSpace(other.Name)
+		if name == "" {
+			name = other.ID
+		}
+		symbol := ""
+		if cfg != nil {
+			symbol = normalizeTradingSymbol(cfg.Trading.Symbol)
+		}
+		return fmt.Errorf("同一账户/交易所/市场/交易对只能保留一个机器人，否则暂停或删除时会互相撤单。请先停止并删除冲突机器人：%s (%s, %s)", name, other.ID, symbol)
+	}
+	return nil
+}
+
+func (s *consoleServer) ensureNoAccountUpdateConflictsLocked(accountID string, exchangeName string) error {
+	seen := make(map[string]*robotDefinition)
+	for _, robot := range s.robots {
+		if robot == nil || robot.Config == nil {
+			continue
+		}
+		cfg := robot.Config
+		if robot.AccountID == accountID {
+			cfg = cloneConfig(robot.Config)
+			cfg.App.CurrentExchange = exchangeName
+		}
+		scope := robotRuntimeScope(robot.AccountID, cfg)
+		if scope == "" {
+			continue
+		}
+		if other, exists := seen[scope]; exists && other != nil {
+			return fmt.Errorf("同一账户/交易所/市场/交易对只能保留一个机器人，否则暂停或删除时会互相撤单。请先停止并删除冲突机器人：%s (%s) 与 %s (%s)", robotDisplayName(other), other.ID, robotDisplayName(robot), robot.ID)
+		}
+		seen[scope] = robot
+	}
+	return nil
+}
+
+func robotRuntimeScope(accountID string, cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	accountID = strings.TrimSpace(accountID)
+	exchangeName := strings.ToLower(strings.TrimSpace(cfg.App.CurrentExchange))
+	marketType := normalizeMarketTypeParam(cfg.App.MarketType)
+	symbol := normalizeTradingSymbol(cfg.Trading.Symbol)
+	if accountID == "" || exchangeName == "" || marketType == "" || symbol == "" {
+		return ""
+	}
+	return accountID + "|" + exchangeName + "|" + marketType + "|" + symbol
+}
+
+func robotDisplayName(robot *robotDefinition) string {
+	if robot == nil {
+		return ""
+	}
+	name := strings.TrimSpace(robot.Name)
+	if name == "" {
+		return robot.ID
+	}
+	return name
+}
+
 func applyHardcodedRobotDefaults(cfg *config.Config) {
 	cfg.App.MarketType = normalizeMarketTypeParam(cfg.App.MarketType)
 	if cfg.App.MarketType == "spot" {
@@ -2110,6 +2202,9 @@ func (s *consoleServer) updateAccount(id string, payload accountPayload) (*accou
 	account, ok := s.accounts[id]
 	if !ok {
 		return nil, fmt.Errorf("账户不存在")
+	}
+	if err := s.ensureNoAccountUpdateConflictsLocked(id, payload.Exchange); err != nil {
+		return nil, err
 	}
 	account.Name = strings.TrimSpace(payload.Name)
 	account.Exchange = payload.Exchange

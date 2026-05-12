@@ -501,6 +501,8 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	enabledBookSides := spm.enabledBookSides()
 	desiredEntryPrices := make(map[string]map[float64]bool, len(enabledBookSides))
 	desiredEntrySlots := make(map[string][]float64, len(enabledBookSides))
+	desiredExitPrices := make(map[string]map[float64]bool, len(enabledBookSides))
+	desiredExitSlots := make(map[string][]float64, len(enabledBookSides))
 
 	for _, bookSide := range enabledBookSides {
 		desiredEntryPrices[bookSide] = make(map[float64]bool)
@@ -508,6 +510,12 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		for _, price := range slotPrices {
 			desiredEntryPrices[bookSide][price] = true
 			desiredEntrySlots[bookSide] = append(desiredEntrySlots[bookSide], price)
+		}
+		desiredExitPrices[bookSide] = make(map[float64]bool)
+		exitPrices := spm.calculateExitSlotPrices(currentGridPrice, currentPrice, sellWindowSize, bookSide)
+		for _, price := range exitPrices {
+			desiredExitPrices[bookSide][price] = true
+			desiredExitSlots[bookSide] = append(desiredExitSlots[bookSide], price)
 		}
 	}
 
@@ -519,7 +527,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			spm.mu.Unlock()
 			return spm.adjustOrders(currentPrice, false)
 		}
-		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, sellWindowSize); err != nil {
+		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, sellWindowSize, desiredExitPrices); err != nil {
 			spm.mu.Unlock()
 			return err
 		} else if rebalanced {
@@ -538,6 +546,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	var currentEntryOrderCount int
 	var currentExitOrderCount int
 	currentEntryOrdersByBook := make(map[string]int, len(enabledBookSides))
+	usedExitPricesByBook := make(map[string]map[float64]bool, len(enabledBookSides))
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
 		slot.mu.RLock()
@@ -554,6 +563,10 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 				currentEntryOrdersByBook[slot.BookSide]++
 			} else {
 				currentExitOrderCount++
+				if usedExitPricesByBook[slot.BookSide] == nil {
+					usedExitPricesByBook[slot.BookSide] = make(map[float64]bool)
+				}
+				usedExitPricesByBook[slot.BookSide][roundPrice(slot.OrderPrice, spm.priceDecimals)] = true
 			}
 		}
 		if key, ok := spm.activeOrderPlacementKey(slot); ok {
@@ -586,19 +599,10 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		if slot.PositionStatus != PositionStatusFilled || slot.SlotStatus != SlotStatusFree || slot.OrderID != 0 || slot.ClientOID != "" || slot.PositionQty <= 0 {
 			return true
 		}
-		exitPrice := spm.exitPrice(slotPrice, slot.BookSide)
-		if slot.BookSide == BookSideLong {
-			sellWindowMaxPrice := roundPrice(currentPrice+float64(sellWindowSize)*spm.config.Trading.PriceInterval, spm.priceDecimals)
-			if slotPrice > sellWindowMaxPrice {
-				return true
-			}
-		} else {
-			buyWindowMinPrice := roundPrice(currentPrice-float64(sellWindowSize)*spm.config.Trading.PriceInterval, spm.priceDecimals)
-			if slotPrice < buyWindowMinPrice {
-				return true
-			}
+		exitPrice, ok := spm.nextDesiredExitPrice(slot.BookSide, desiredExitSlots, usedExitPricesByBook)
+		if !ok {
+			return true
 		}
-		exitPrice = spm.makerSafeExitPrice(exitPrice, currentPrice, slot.BookSide)
 		exitQty, ok := spm.exitOrderQuantity(slot.PositionQty, exitPrice)
 		if !ok {
 			return true
@@ -607,6 +611,10 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		minValue := spm.minOrderValue()
 		if orderValue >= minValue {
 			exitCandidates = append(exitCandidates, exitCandidate{SlotPrice: slotPrice, ExitPrice: exitPrice, Quantity: exitQty, DistanceToMid: math.Abs(slotPrice - currentPrice), BookSide: slot.BookSide})
+			if usedExitPricesByBook[slot.BookSide] == nil {
+				usedExitPricesByBook[slot.BookSide] = make(map[float64]bool)
+			}
+			usedExitPricesByBook[slot.BookSide][exitPrice] = true
 		}
 		return true
 	})
@@ -973,7 +981,7 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 	return true, nil
 }
 
-func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrders int) (bool, error) {
+func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrders int, desiredExitPrices map[string]map[float64]bool) (bool, error) {
 	if maxActiveExitOrders <= 0 {
 		return false, nil
 	}
@@ -991,15 +999,49 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 		if slot.OrderID == 0 || slot.PositionQty <= 0 {
 			return true
 		}
+		orderPrice := roundPrice(slot.OrderPrice, spm.priceDecimals)
+		if desiredExitPrices != nil && desiredExitPrices[slot.BookSide] != nil && !desiredExitPrices[slot.BookSide][orderPrice] {
+			exits = append(exits, activeOrderCandidate{
+				SlotPrice:     slot.Price,
+				BookSide:      slot.BookSide,
+				OrderID:       slot.OrderID,
+				ClientOID:     slot.ClientOID,
+				DistanceToMid: math.Abs(orderPrice - currentPrice),
+			})
+			return true
+		}
 		exits = append(exits, activeOrderCandidate{
 			SlotPrice:     slot.Price,
 			BookSide:      slot.BookSide,
 			OrderID:       slot.OrderID,
 			ClientOID:     slot.ClientOID,
-			DistanceToMid: math.Abs(slot.Price - currentPrice),
+			DistanceToMid: math.Abs(orderPrice - currentPrice),
 		})
 		return true
 	})
+	if len(exits) <= maxActiveExitOrders {
+		var stale []activeOrderCandidate
+		if desiredExitPrices != nil {
+			for _, candidate := range exits {
+				slot := spm.getOrCreateSlot(candidate.SlotPrice, candidate.BookSide)
+				slot.mu.RLock()
+				orderPrice := roundPrice(slot.OrderPrice, spm.priceDecimals)
+				isStale := desiredExitPrices[candidate.BookSide] != nil && !desiredExitPrices[candidate.BookSide][orderPrice]
+				slot.mu.RUnlock()
+				if isStale {
+					stale = append(stale, candidate)
+				}
+			}
+		}
+		if len(stale) == 0 {
+			return false, nil
+		}
+		sort.Slice(stale, func(i, j int) bool {
+			return stale[i].DistanceToMid > stale[j].DistanceToMid
+		})
+		exits = stale
+		maxActiveExitOrders = len(exits) - 1
+	}
 	if len(exits) <= maxActiveExitOrders {
 		return false, nil
 	}
@@ -1573,6 +1615,58 @@ func (spm *SuperPositionManager) calculateEntrySlotPrices(gridPrice, currentPric
 	return prices
 }
 
+func (spm *SuperPositionManager) calculateExitSlotPrices(gridPrice, currentPrice float64, count int, bookSide string) []float64 {
+	if count <= 0 {
+		return nil
+	}
+	prices := make([]float64, 0, count)
+	seen := make(map[float64]struct{}, count)
+	priceInterval := spm.config.Trading.PriceInterval
+	if priceInterval <= 0 {
+		return prices
+	}
+	direction := "up"
+	if bookSide == BookSideShort {
+		direction = "down"
+	}
+	maxAttempts := count*4 + 20
+	for i := 0; len(prices) < count && i < maxAttempts; i++ {
+		price := gridPrice
+		if direction == "down" {
+			price = gridPrice - float64(i)*priceInterval
+		} else {
+			price = gridPrice + float64(i)*priceInterval
+		}
+		price = roundPrice(price, spm.priceDecimals)
+		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			if direction == "down" {
+				break
+			}
+			continue
+		}
+		if _, exists := seen[price]; exists {
+			continue
+		}
+		if !spm.isMakerSafeExitPrice(price, currentPrice, bookSide) {
+			continue
+		}
+		seen[price] = struct{}{}
+		prices = append(prices, price)
+	}
+	return prices
+}
+
+func (spm *SuperPositionManager) nextDesiredExitPrice(bookSide string, desiredExitSlots map[string][]float64, used map[string]map[float64]bool) (float64, bool) {
+	for _, price := range desiredExitSlots[bookSide] {
+		price = roundPrice(price, spm.priceDecimals)
+		if used[bookSide] != nil && used[bookSide][price] {
+			continue
+		}
+		return price, true
+	}
+	return 0, false
+}
+
 func (spm *SuperPositionManager) entryOrderQuantity(price float64) (float64, bool) {
 	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
 		return 0, false
@@ -1635,6 +1729,14 @@ func (spm *SuperPositionManager) isMakerSafeEntryPrice(price, currentPrice float
 		return price > currentPrice+safetyBuffer
 	}
 	return price < currentPrice-safetyBuffer
+}
+
+func (spm *SuperPositionManager) isMakerSafeExitPrice(price, currentPrice float64, bookSide string) bool {
+	safetyBuffer := spm.config.Trading.PriceInterval * 0.1
+	if bookSide == BookSideShort {
+		return price < currentPrice-safetyBuffer
+	}
+	return price > currentPrice+safetyBuffer
 }
 
 func (spm *SuperPositionManager) makerSafeExitPrice(targetPrice, currentPrice float64, bookSide string) float64 {
@@ -2494,10 +2596,15 @@ func (spm *SuperPositionManager) PrintPositions() {
 
 	// 计算开仓窗口范围；多头在当前价下方，空头在当前价上方。
 	buyWindowSize := spm.config.Trading.BuyWindowSize
+	sellWindowSize := spm.config.Trading.SellWindowSize
 	windowSlotMap := make(map[string]bool)
+	exitWindowPriceMap := make(map[string]bool)
 	for _, bookSide := range spm.enabledBookSides() {
 		for _, p := range spm.calculateEntrySlotPrices(currentGridPrice, lastPrice, buyWindowSize, bookSide) {
 			windowSlotMap[spm.slotKey(p, bookSide)] = true
+		}
+		for _, p := range spm.calculateExitSlotPrices(currentGridPrice, lastPrice, sellWindowSize, bookSide) {
+			exitWindowPriceMap[formatPrice(p, spm.priceDecimals)] = true
 		}
 	}
 
@@ -2520,7 +2627,6 @@ func (spm *SuperPositionManager) PrintPositions() {
 				filledSlotCount++
 			} else {
 				statusDesc = "无持仓"
-				emptySlotCount++
 			}
 
 			orderInfo := ""
@@ -2531,6 +2637,9 @@ func (spm *SuperPositionManager) PrintPositions() {
 					slot.OrderStatus == OrderStatusPartiallyFilled) {
 					entryOrderCount++
 				}
+			}
+			if slot.PositionStatus != PositionStatusFilled && orderInfo == "" && slot.SlotStatus == SlotStatusFree {
+				emptySlotCount++
 			}
 
 			// 🔥 总是显示槽位状态,便于调试
@@ -2548,6 +2657,14 @@ func (spm *SuperPositionManager) PrintPositions() {
 
 	logger.Info("窗口统计: %d 个开仓单活跃, %d 个已持仓, %d 个空槽位",
 		entryOrderCount, filledSlotCount, emptySlotCount)
+	if len(exitWindowPriceMap) > 0 {
+		exitPrices := make([]string, 0, len(exitWindowPriceMap))
+		for price := range exitWindowPriceMap {
+			exitPrices = append(exitPrices, price)
+		}
+		sort.Slice(exitPrices, func(i, j int) bool { return exitPrices[i] > exitPrices[j] })
+		logger.Info("平仓窗口价格: %v", exitPrices)
+	}
 	logger.Info("==========================")
 }
 

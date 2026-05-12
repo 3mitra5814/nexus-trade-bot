@@ -313,6 +313,67 @@ func TestApplyAccountConfigToRobotRefreshesSecrets(t *testing.T) {
 	}
 }
 
+func TestCreateRobotRejectsSameAccountExchangeMarketSymbolConflict(t *testing.T) {
+	server := newTestConsoleServer(t)
+
+	if _, err := server.createRobot(robotPayload{Name: "alpha", AccountID: "acc-1", Config: testRobotConfig("M/USDT", "futures")}); err != nil {
+		t.Fatalf("create first robot: %v", err)
+	}
+	if _, err := server.createRobot(robotPayload{Name: "beta", AccountID: "acc-1", Config: testRobotConfig("MUSDT", "futures")}); err == nil {
+		t.Fatalf("expected second robot with same account/exchange/market/symbol to be rejected")
+	} else if !strings.Contains(err.Error(), "同一账户/交易所/市场/交易对只能保留一个机器人") {
+		t.Fatalf("unexpected conflict error: %v", err)
+	}
+}
+
+func TestUpdateRobotRejectsSymbolConflict(t *testing.T) {
+	server := newTestConsoleServer(t)
+
+	if _, err := server.createRobot(robotPayload{Name: "alpha", AccountID: "acc-1", Config: testRobotConfig("CLUSDT", "futures")}); err != nil {
+		t.Fatalf("create first robot: %v", err)
+	}
+	second, err := server.createRobot(robotPayload{Name: "beta", AccountID: "acc-1", Config: testRobotConfig("MUSDT", "futures")})
+	if err != nil {
+		t.Fatalf("create second robot: %v", err)
+	}
+
+	_, err = server.updateRobot(second.ID, robotPayload{Name: "beta", AccountID: "acc-1", Config: testRobotConfig("CL/USDT", "futures")})
+	if err == nil {
+		t.Fatalf("expected update into an existing robot scope to be rejected")
+	}
+	if !strings.Contains(err.Error(), "同一账户/交易所/市场/交易对只能保留一个机器人") {
+		t.Fatalf("unexpected conflict error: %v", err)
+	}
+}
+
+func TestStartRobotRejectsLoadedConflictingRobots(t *testing.T) {
+	server := newTestConsoleServer(t)
+	server.robots["alpha"] = &robotDefinition{
+		ID:         "alpha",
+		Name:       "alpha",
+		AccountID:  "acc-1",
+		ConfigPath: filepath.Join(server.robotsDir, "alpha.yaml"),
+		Config:     testRobotConfig("MUSDT", "futures"),
+	}
+	server.robots["beta"] = &robotDefinition{
+		ID:         "beta",
+		Name:       "beta",
+		AccountID:  "acc-1",
+		ConfigPath: filepath.Join(server.robotsDir, "beta.yaml"),
+		Config:     testRobotConfig("M/USDT", "futures"),
+	}
+	server.robots["alpha"].Config.App.CurrentExchange = "bitget"
+	server.robots["beta"].Config.App.CurrentExchange = "bitget"
+
+	err := server.startRobot("beta")
+	if err == nil {
+		t.Fatalf("expected startRobot to reject conflicting loaded robots")
+	}
+	if !strings.Contains(err.Error(), "同一账户/交易所/市场/交易对只能保留一个机器人") {
+		t.Fatalf("unexpected conflict error: %v", err)
+	}
+}
+
 func TestEnsureRobotOrderTagIsStableAndSafe(t *testing.T) {
 	robot := &robotDefinition{ID: "My Robot-123", Config: &config.Config{}}
 	ensureRobotOrderTag(robot)
@@ -340,4 +401,40 @@ type testError string
 
 func (e testError) Error() string {
 	return string(e)
+}
+
+func newTestConsoleServer(t *testing.T) *consoleServer {
+	t.Helper()
+	dir := t.TempDir()
+	return &consoleServer{
+		robotsDir:    dir,
+		robotsPath:   filepath.Join(dir, "robots.json"),
+		accountsPath: filepath.Join(dir, "accounts.json"),
+		robots:       make(map[string]*robotDefinition),
+		processes:    make(map[string]*robotProcess),
+		accounts: map[string]*accountProfile{
+			"acc-1": {
+				ID:       "acc-1",
+				Name:     "main",
+				Exchange: "bitget",
+				Config:   config.ExchangeConfig{APIKey: "api", SecretKey: "secret", Passphrase: "pass", FeeRate: 0.0002},
+			},
+		},
+	}
+}
+
+func testRobotConfig(symbol string, marketType string) *config.Config {
+	cfg := &config.Config{}
+	cfg.App.CurrentExchange = "bitget"
+	cfg.App.MarketType = marketType
+	cfg.Exchanges = map[string]config.ExchangeConfig{
+		"bitget": {APIKey: "api", SecretKey: "secret", Passphrase: "pass", FeeRate: 0.0002},
+	}
+	cfg.Trading.Direction = "short"
+	cfg.Trading.Symbol = symbol
+	cfg.Trading.PriceInterval = 0.05
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	return cfg
 }

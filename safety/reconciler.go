@@ -142,10 +142,12 @@ func (r *Reconciler) Reconcile() error {
 
 	// 4. 计算本地持仓统计
 	var localTotal float64
-	var localPendingSellQty float64
+	var localPendingExitQty float64
 	var localFilledPosition float64
 	var activeBuyOrders int
 	var activeSellOrders int
+	var activeEntryOrders int
+	var activeExitOrders int
 
 	// 订单状态常量（与 position 包保持一致）
 	const (
@@ -191,15 +193,24 @@ func (r *Reconciler) Reconcile() error {
 			isExitOrder := (bookSide == "SHORT" && orderSide == "BUY") || (bookSide != "SHORT" && orderSide == "SELL")
 			if isExitOrder && (orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
 				orderStatus == OrderStatusPartiallyFilled || orderStatus == OrderStatusCancelRequested) {
-				localPendingSellQty += positionQty
-				activeSellOrders++
+				localPendingExitQty += positionQty
+				activeExitOrders++
 			}
 		}
 
 		isEntryOrder := (bookSide == "SHORT" && orderSide == "SELL") || (bookSide != "SHORT" && orderSide == "BUY")
 		if isEntryOrder && (orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
 			orderStatus == OrderStatusPartiallyFilled) {
-			activeBuyOrders++
+			activeEntryOrders++
+		}
+		if orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
+			orderStatus == OrderStatusPartiallyFilled || orderStatus == OrderStatusCancelRequested {
+			switch orderSide {
+			case "BUY":
+				activeBuyOrders++
+			case "SELL":
+				activeSellOrders++
+			}
 		}
 
 		return true
@@ -207,15 +218,15 @@ func (r *Reconciler) Reconcile() error {
 
 	localTotal = localFilledPosition
 
-	logger.Debug("📊 [对账统计] 本地持仓: %.4f, 挂单卖单: %d 个 (%.4f), 挂单买单: %d 个",
-		localTotal, activeSellOrders, localPendingSellQty, activeBuyOrders)
+	logger.Debug("📊 [对账统计] 本地持仓: %.4f, 活跃挂单: BUY=%d/SELL=%d, 开仓=%d, 平仓=%d (%.4f)",
+		localTotal, activeBuyOrders, activeSellOrders, activeEntryOrders, activeExitOrders, localPendingExitQty)
 
 	r.pm.IncrementReconcileCount()
 
 	// 5. 输出对账统计（从交易所接口获取基础币种，支持U本位和币本位合约）
 	baseCurrency := r.exchange.GetBaseAsset()
-	logger.Info("✅ [对账完成] 本地持仓: %.4f %s, 挂单卖单: %d 个 (%.4f), 挂单买单: %d 个",
-		localTotal, baseCurrency, activeSellOrders, localPendingSellQty, activeBuyOrders)
+	logger.Info("✅ [对账完成] 本地持仓: %.4f %s, 活跃挂单: BUY=%d/SELL=%d, 开仓=%d, 平仓=%d (%.4f %s)",
+		localTotal, baseCurrency, activeBuyOrders, activeSellOrders, activeEntryOrders, activeExitOrders, localPendingExitQty, baseCurrency)
 
 	r.pm.UpdateLastReconcileTime(time.Now())
 
