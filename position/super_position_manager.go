@@ -894,20 +894,6 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desiredEntryPrices map[string]map[float64]bool, desiredEntrySlots map[string][]float64) (bool, error) {
 	staleByBook := make(map[string][]staleEntryCandidate, len(desiredEntryPrices))
-	activeEntryCountByBook := make(map[string]int, len(desiredEntryPrices))
-	missingByBook := make(map[string]int, len(desiredEntryPrices))
-
-	for bookSide, prices := range desiredEntrySlots {
-		for _, price := range prices {
-			slot := spm.getOrCreateSlot(price, bookSide)
-			slot.mu.Lock()
-			slot.BookSide = bookSide
-			if slot.SlotStatus == SlotStatusFree && slot.PositionStatus == PositionStatusEmpty && !spm.slotHasActiveOrder(slot) && slot.OrderID == 0 && slot.ClientOID == "" {
-				missingByBook[bookSide]++
-			}
-			slot.mu.Unlock()
-		}
-	}
 
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
@@ -922,7 +908,6 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 		if slot.OrderID == 0 || slot.PositionStatus != PositionStatusEmpty {
 			return true
 		}
-		activeEntryCountByBook[slot.BookSide]++
 		if desiredEntryPrices[slot.BookSide][slot.Price] {
 			return true
 		}
@@ -937,21 +922,14 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 	})
 
 	var candidates []staleEntryCandidate
-	for bookSide, stale := range staleByBook {
-		needed := missingByBook[bookSide]
-		overflow := activeEntryCountByBook[bookSide] - spm.config.Trading.BuyWindowSize
-		if overflow > needed {
-			needed = overflow
-		}
-		if needed <= 0 {
+	for _, stale := range staleByBook {
+		needed := len(stale)
+		if needed == 0 {
 			continue
 		}
 		sort.Slice(stale, func(i, j int) bool {
 			return stale[i].Distance > stale[j].Distance
 		})
-		if needed > len(stale) {
-			needed = len(stale)
-		}
 		candidates = append(candidates, stale[:needed]...)
 	}
 	if len(candidates) == 0 {

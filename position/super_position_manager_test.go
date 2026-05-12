@@ -1270,7 +1270,7 @@ func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries
 	}
 }
 
-func TestDirectionalPriceGridShiftBackfillsWithoutCancelingEntries(t *testing.T) {
+func TestDirectionalPriceGridShiftRebalancesEntryWindow(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -1289,29 +1289,26 @@ func TestDirectionalPriceGridShiftBackfillsWithoutCancelingEntries(t *testing.T)
 	if err := spm.AdjustOrders(100); err != nil {
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
-	if err := spm.AdjustOrders(95); err != nil {
+	if err := spm.AdjustOrdersWithRebalance(95, true); err != nil {
 		t.Fatalf("price shift AdjustOrders() error = %v", err)
 	}
-	if len(executor.canceled) != 0 {
-		t.Fatalf("price-grid shift should backfill like opensqt and leave cleanup to order cleaner, got cancels=%v", executor.canceled)
+	if len(executor.canceled) == 0 {
+		t.Fatalf("expected price-grid shift to cancel stale far entry orders, got none")
 	}
 
-	has96 := false
-	has97 := false
+	wantSells := map[float64]bool{96: false, 97: false, 98: false}
 	for _, order := range executor.orders {
 		if order.Side != "SELL" || order.ReduceOnly {
 			continue
 		}
-		switch order.Price {
-		case 96:
-			has96 = true
-		case 97:
-			has97 = true
+		if _, ok := wantSells[order.Price]; ok {
+			wantSells[order.Price] = true
 		}
 	}
-	if !has96 || !has97 {
-		t.Fatalf("expected current short entry window to be refilled at 96 and 97, got has96=%v has97=%v orders=%v",
-			has96, has97, executor.orders)
+	for price, seen := range wantSells {
+		if !seen {
+			t.Fatalf("expected current short entry window to include %.2f, orders=%v", price, executor.orders)
+		}
 	}
 }
 

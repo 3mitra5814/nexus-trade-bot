@@ -460,10 +460,10 @@ func runTrader(configPath string) {
 					return
 				}
 
-				// 价格流只在跨过完整网格间隔时触发补单，避免每个价格 tick 都撤单重挂。
+				// 价格流只在跨过完整网格间隔时触发补单；跨格时允许重平衡，把远端旧窗口撤掉再补新窗口。
 				if priceInterval > 0 && priceEvent.NewPrice > 0 && math.Abs(priceEvent.NewPrice-lastGridAdjustPrice) >= priceInterval {
 					lastGridAdjustPrice = priceEvent.NewPrice
-					scheduleAdjust("price-grid-shift", false)
+					scheduleAdjust("price-grid-shift", true)
 				}
 			})
 		}
