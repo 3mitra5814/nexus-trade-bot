@@ -224,13 +224,14 @@ func (spm *SuperPositionManager) tradingDirection() string {
 }
 
 func (spm *SuperPositionManager) enabledBookSides() []string {
+	if strings.EqualFold(strings.TrimSpace(spm.config.App.MarketType), "spot") {
+		return []string{BookSideLong}
+	}
 	switch spm.tradingDirection() {
-	case "short":
-		return []string{BookSideShort}
-	case "neutral":
+	case "long", "short", "neutral":
 		return []string{BookSideLong, BookSideShort}
 	default:
-		return []string{BookSideLong}
+		return []string{BookSideLong, BookSideShort}
 	}
 }
 
@@ -328,7 +329,7 @@ func (spm *SuperPositionManager) Initialize(initialPrice float64, initialPriceSt
 	logger.Info("✅ 初始网格价格: %s (使用锚点价格)", formatPrice(initialGridPrice, spm.priceDecimals))
 
 	for _, bookSide := range spm.enabledBookSides() {
-		slotPrices := spm.calculateSlotPrices(initialGridPrice, spm.config.Trading.BuyWindowSize, spm.entrySlotDirection(bookSide))
+		slotPrices := spm.calculateEntrySlotPrices(initialGridPrice, initialPrice, spm.config.Trading.BuyWindowSize, bookSide)
 		for _, price := range slotPrices {
 			slot := spm.getOrCreateSlot(price, bookSide)
 			slot.mu.Lock()
@@ -490,13 +491,13 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	currentGridPrice := spm.findNearestGridPrice(currentPrice)
 	spm.pruneEmptyFarSlots(currentGridPrice, maxInt(buyWindowSize, sellWindowSize)*4+10)
 
-	// 计算允许创建的订单数量上限
+	// 计算允许创建的订单数量上限。实时网格按买侧/卖侧各自封顶：
+	// 下方 BUY 合计最多 buyWindowSize，上方 SELL 合计最多 sellWindowSize。
 	threshold := spm.config.Trading.OrderCleanupThreshold
-	if threshold <= 0 {
+	sideWindowOrderLimit := buyWindowSize + sellWindowSize
+	if threshold <= 0 || threshold < sideWindowOrderLimit {
 		threshold = buyWindowSize + sellWindowSize
 	}
-	maxActiveEntryOrders := buyWindowSize
-	maxActiveExitOrders := sellWindowSize
 
 	enabledBookSides := spm.enabledBookSides()
 	desiredEntryPrices := make(map[string]map[float64]bool, len(enabledBookSides))
@@ -545,7 +546,6 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	var currentSellOrderCount int
 	var currentEntryOrderCount int
 	var currentExitOrderCount int
-	currentEntryOrdersByBook := make(map[string]int, len(enabledBookSides))
 	usedExitPricesByBook := make(map[string]map[float64]bool, len(enabledBookSides))
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
@@ -560,7 +560,6 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			}
 			if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
 				currentEntryOrderCount++
-				currentEntryOrdersByBook[slot.BookSide]++
 			} else {
 				currentExitOrderCount++
 				if usedExitPricesByBook[slot.BookSide] == nil {
@@ -575,6 +574,14 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		slot.mu.RUnlock()
 		return true
 	})
+	remainingBuySlots := buyWindowSize - currentBuyOrderCount
+	if remainingBuySlots < 0 {
+		remainingBuySlots = 0
+	}
+	remainingSellSlots := sellWindowSize - currentSellOrderCount
+	if remainingSellSlots < 0 {
+		remainingSellSlots = 0
+	}
 
 	// 🔥 核心改进：不预留空间，允许订单数达到threshold上限
 	// 剩余可用订单数 = 阈值 - 当前订单数
@@ -620,7 +627,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	})
 	sort.Slice(exitCandidates, func(i, j int) bool { return exitCandidates[i].DistanceToMid < exitCandidates[j].DistanceToMid })
 
-	allowedNewExitOrders := maxActiveExitOrders - currentExitOrderCount
+	allowedNewExitOrders := remainingBuySlots + remainingSellSlots
 	if allowedNewExitOrders < 0 {
 		allowedNewExitOrders = 0
 	}
@@ -636,6 +643,16 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	exitOrdersToCreate := 0
 	for i := 0; i < len(exitCandidates) && exitOrdersToCreate < allowedNewExitOrders; i++ {
 		candidate := exitCandidates[i]
+		exitSide := spm.exitOrderSide(candidate.BookSide)
+		if exitSide == "BUY" {
+			if remainingBuySlots <= 0 {
+				continue
+			}
+		} else if exitSide == "SELL" {
+			if remainingSellSlots <= 0 {
+				continue
+			}
+		}
 		slot := spm.getOrCreateSlot(candidate.SlotPrice, candidate.BookSide)
 		slot.mu.Lock()
 		if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
@@ -644,7 +661,6 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		}
 		slot.SlotStatus = SlotStatusPending
 		usePostOnly := true
-		exitSide := spm.exitOrderSide(candidate.BookSide)
 		clientOID := spm.generateClientOrderID(candidate.SlotPrice, exitSide, candidate.BookSide)
 		placementKey := spm.orderPlacementKey(exitSide, candidate.BookSide, candidate.ExitPrice)
 		if _, exists := plannedOrderKeys[placementKey]; exists {
@@ -663,6 +679,11 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		slot.mu.Unlock()
 		ordersToPlace = append(ordersToPlace, &OrderRequest{Symbol: spm.config.Trading.Symbol, Side: exitSide, Price: candidate.ExitPrice, Quantity: candidate.Quantity, PriceDecimals: spm.priceDecimals, ReduceOnly: true, PostOnly: usePostOnly, ClientOrderID: clientOID})
 		exitOrdersToCreate++
+		if exitSide == "BUY" {
+			remainingBuySlots--
+		} else if exitSide == "SELL" {
+			remainingSellSlots--
+		}
 	}
 
 	remainingOrdersForEntry = threshold - currentOrderCount - exitOrdersToCreate
@@ -670,47 +691,30 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		remainingOrdersForEntry = 0
 	}
 
-	allowedNewEntryOrders := maxActiveEntryOrders - currentEntryOrderCount
+	allowedNewEntryOrders := remainingBuySlots + remainingSellSlots
 	if allowedNewEntryOrders < 0 {
 		allowedNewEntryOrders = 0
 	}
 	if allowedNewEntryOrders > remainingOrdersForEntry {
 		allowedNewEntryOrders = remainingOrdersForEntry
 	}
-	entryOrderQuotaByBook := make(map[string]int, len(enabledBookSides))
-	for _, bookSide := range enabledBookSides {
-		quota := allowedNewEntryOrders
-		if quota > maxActiveEntryOrders-currentEntryOrdersByBook[bookSide] {
-			quota = maxActiveEntryOrders - currentEntryOrdersByBook[bookSide]
-		}
-		if quota < 0 {
-			quota = 0
-		}
-		entryOrderQuotaByBook[bookSide] = quota
-	}
-	if len(enabledBookSides) > 1 && remainingOrdersForEntry < buyWindowSize*len(enabledBookSides) {
-		baseQuota := remainingOrdersForEntry / len(enabledBookSides)
-		extraQuota := remainingOrdersForEntry % len(enabledBookSides)
-		for i, bookSide := range enabledBookSides {
-			quota := baseQuota
-			if i < extraQuota {
-				quota++
-			}
-			if quota > maxActiveEntryOrders-currentEntryOrdersByBook[bookSide] {
-				quota = maxActiveEntryOrders - currentEntryOrdersByBook[bookSide]
-			}
-			if quota < 0 {
-				quota = 0
-			}
-			entryOrderQuotaByBook[bookSide] = quota
-		}
-	}
 	entryOrdersToCreate := 0
-	entryOrdersByBook := make(map[string]int, len(enabledBookSides))
 
 	for _, bookSide := range enabledBookSides {
 		entrySide := spm.entryOrderSide(bookSide)
 		for _, price := range desiredEntrySlots[bookSide] {
+			if entryOrdersToCreate >= allowedNewEntryOrders {
+				break
+			}
+			if entrySide == "BUY" {
+				if remainingBuySlots <= 0 {
+					break
+				}
+			} else if entrySide == "SELL" {
+				if remainingSellSlots <= 0 {
+					break
+				}
+			}
 			slot := spm.getOrCreateSlot(price, bookSide)
 			slot.mu.Lock()
 			slot.BookSide = bookSide
@@ -719,7 +723,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 				continue
 			}
 			hasActiveOrder := slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed || slot.OrderStatus == OrderStatusPartiallyFilled
-			if hasActiveOrder || slot.OrderID != 0 || slot.ClientOID != "" || entryOrdersByBook[bookSide] >= entryOrderQuotaByBook[bookSide] {
+			if hasActiveOrder || slot.OrderID != 0 || slot.ClientOID != "" {
 				slot.mu.Unlock()
 				continue
 			}
@@ -757,12 +761,16 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 				ClientOrderID: clientOID,
 			})
 			entryOrdersToCreate++
-			entryOrdersByBook[bookSide]++
+			if entrySide == "BUY" {
+				remainingBuySlots--
+			} else if entrySide == "SELL" {
+				remainingSellSlots--
+			}
 		}
 	}
 
-	logger.Info("📊 [订单配额] 阈值:%d, 当前订单:%d(买:%d/卖:%d), 开仓:%d/%d, 平仓:%d/%d, 剩余:%d, 平仓候选:%d, 新增平仓:%d, 新增开仓:%d",
-		threshold, currentOrderCount, currentBuyOrderCount, currentSellOrderCount, currentEntryOrderCount, maxActiveEntryOrders, currentExitOrderCount, maxActiveExitOrders, remainingOrders, len(exitCandidates), exitOrdersToCreate, entryOrdersToCreate)
+	logger.Info("📊 [订单配额] 阈值:%d, 当前订单:%d(买:%d/%d 卖:%d/%d), 开仓:%d, 平仓:%d, 剩余:%d, 平仓候选:%d, 新增平仓:%d, 新增开仓:%d",
+		threshold, currentOrderCount, currentBuyOrderCount, buyWindowSize, currentSellOrderCount, sellWindowSize, currentEntryOrderCount, currentExitOrderCount, remainingOrders, len(exitCandidates), exitOrdersToCreate, entryOrdersToCreate)
 
 	// 下单是网络 I/O，不能持有全局锁。槽位已经标记为 PENDING，结果回写依赖槽位锁。
 	spm.mu.Unlock()

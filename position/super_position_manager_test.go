@@ -497,6 +497,115 @@ func TestNeutralAdjustOrdersCreatesEntryQuotaPerBook(t *testing.T) {
 	}
 }
 
+func TestDirectionalFuturesStillPlacesFiveOrdersOnBothSides(t *testing.T) {
+	for _, direction := range []string{"long", "short"} {
+		t.Run(direction, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.App.MarketType = "futures"
+			cfg.Trading.Symbol = "ETHUSDT"
+			cfg.Trading.Direction = direction
+			cfg.Trading.PriceInterval = 1
+			cfg.Trading.OrderQuantity = 30
+			cfg.Trading.BuyWindowSize = 5
+			cfg.Trading.SellWindowSize = 5
+			cfg.Trading.OrderCleanupThreshold = 10
+
+			executor := &captureExecutor{}
+			spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+			if err := spm.Initialize(2308, "2308.00"); err != nil {
+				t.Fatalf("Initialize() error = %v", err)
+			}
+			if err := spm.AdjustOrders(2308); err != nil {
+				t.Fatalf("AdjustOrders() error = %v", err)
+			}
+
+			buys := map[float64]bool{2307: false, 2306: false, 2305: false, 2304: false, 2303: false}
+			sells := map[float64]bool{2309: false, 2310: false, 2311: false, 2312: false, 2313: false}
+			for _, order := range executor.orders {
+				if order.ReduceOnly {
+					continue
+				}
+				switch order.Side {
+				case "BUY":
+					if _, ok := buys[order.Price]; ok {
+						buys[order.Price] = true
+					}
+				case "SELL":
+					if _, ok := sells[order.Price]; ok {
+						sells[order.Price] = true
+					}
+				}
+			}
+			for price, seen := range buys {
+				if !seen {
+					t.Fatalf("%s expected BUY at %.2f, orders=%v", direction, price, executor.orders)
+				}
+			}
+			for price, seen := range sells {
+				if !seen {
+					t.Fatalf("%s expected SELL at %.2f, orders=%v", direction, price, executor.orders)
+				}
+			}
+		})
+	}
+}
+
+func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2308, "2308.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2308); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2309); err != nil {
+		t.Fatalf("second AdjustOrders() error = %v", err)
+	}
+
+	wantBuys := map[float64]bool{2308: false, 2307: false, 2306: false, 2305: false, 2304: false}
+	wantSells := map[float64]bool{2310: false, 2311: false, 2312: false, 2313: false, 2314: false}
+	for _, order := range executor.orders {
+		if order.ReduceOnly {
+			continue
+		}
+		if order.Side == "BUY" {
+			if _, ok := wantBuys[order.Price]; ok {
+				wantBuys[order.Price] = true
+			}
+		}
+		if order.Side == "SELL" {
+			if _, ok := wantSells[order.Price]; ok {
+				wantSells[order.Price] = true
+			}
+		}
+	}
+	for price, seen := range wantBuys {
+		if !seen {
+			t.Fatalf("expected moved BUY window to include %.2f, orders=%v", price, executor.orders)
+		}
+	}
+	for price, seen := range wantSells {
+		if !seen {
+			t.Fatalf("expected moved SELL window to include %.2f, orders=%v", price, executor.orders)
+		}
+	}
+	if len(executor.canceled) == 0 {
+		t.Fatalf("expected stale orders to be canceled when price window moves")
+	}
+}
+
 func TestAdjustOrdersBackfillsEntryWindowAfterSkippingMarketableGrid(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -646,10 +755,16 @@ func TestAdjustOrdersFloorsEntryQuantityToAvoidOversizing(t *testing.T) {
 	if err := spm.AdjustOrders(30.97); err != nil {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
-	if len(executor.orders) != 1 {
-		t.Fatalf("expected one order, got %d", len(executor.orders))
+	var order *OrderRequest
+	for _, candidate := range executor.orders {
+		if candidate.Side == "BUY" {
+			order = candidate
+			break
+		}
 	}
-	order := executor.orders[0]
+	if order == nil {
+		t.Fatalf("expected one BUY entry order, got %v", executor.orders)
+	}
 	if order.Price != 29.97 {
 		t.Fatalf("expected entry at 29.97, got %.8f", order.Price)
 	}
@@ -863,11 +978,14 @@ func TestAdjustOrdersPrioritizesExitOrdersOverEntries(t *testing.T) {
 	if err := spm.AdjustOrders(100); err != nil {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
-	if len(executor.orders) != 1 {
-		t.Fatalf("expected exactly one order under threshold, got %d", len(executor.orders))
+	var exitSeen bool
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && order.ReduceOnly {
+			exitSeen = true
+		}
 	}
-	if executor.orders[0].Side != "SELL" || !executor.orders[0].ReduceOnly {
-		t.Fatalf("expected exit order to be prioritized, got side=%s reduceOnly=%v", executor.orders[0].Side, executor.orders[0].ReduceOnly)
+	if !exitSeen {
+		t.Fatalf("expected exit order to be prioritized, orders=%v", executor.orders)
 	}
 }
 
@@ -908,11 +1026,14 @@ func TestAdjustOrdersPlacesExitEvenWhenEntryThresholdIsFull(t *testing.T) {
 	if err := spm.AdjustOrders(100); err != nil {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
-	if len(executor.orders) != 1 {
-		t.Fatalf("expected one protective exit despite full entry threshold, got %d", len(executor.orders))
+	var exitSeen bool
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && order.ReduceOnly {
+			exitSeen = true
+		}
 	}
-	if executor.orders[0].Side != "SELL" || !executor.orders[0].ReduceOnly {
-		t.Fatalf("expected protective exit order, got side=%s reduceOnly=%v", executor.orders[0].Side, executor.orders[0].ReduceOnly)
+	if !exitSeen {
+		t.Fatalf("expected protective exit order, orders=%v", executor.orders)
 	}
 }
 
@@ -992,7 +1113,11 @@ func TestAdjustOrdersDoesNotDuplicateWhenExchangeReturnsBlankClientOID(t *testin
 			firstCount, len(executor.orders))
 	}
 	for _, req := range executor.orders {
-		slot := spm.getOrCreateSlot(req.Price, BookSideLong)
+		_, _, bookSide, valid := spm.parseClientOrderID(req.ClientOrderID)
+		if !valid {
+			t.Fatalf("invalid request clientOID %q", req.ClientOrderID)
+		}
+		slot := spm.getOrCreateSlot(req.Price, bookSide)
 		slot.mu.RLock()
 		gotOID := slot.ClientOID
 		gotStatus := slot.SlotStatus
@@ -1043,11 +1168,13 @@ func TestAdjustOrdersCancelsConflictingSamePriceOrder(t *testing.T) {
 	if err := spm.AdjustOrders(100); err != nil {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
-	if len(executor.canceled) != 1 {
+	if len(executor.canceled) == 0 {
 		t.Fatalf("expected conflicting new order to be canceled, got %v", executor.canceled)
 	}
-	if executor.canceled[0] == oldOID {
-		t.Fatalf("must cancel the new conflicting order, not the original tracked order")
+	for _, orderID := range executor.canceled {
+		if orderID == oldOID {
+			t.Fatalf("must cancel the new conflicting order, not the original tracked order")
+		}
 	}
 
 	slot := spm.getOrCreateSlot(101, BookSideShort)
