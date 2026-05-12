@@ -49,8 +49,6 @@ type consoleServer struct {
 	processes     map[string]*robotProcess
 	baseConfig    *config.Config
 	baseRawYAML   []byte
-	updateState   autoUpdateState
-	updateMu      sync.Mutex
 	priceBaseMu   sync.Mutex
 	mu            sync.RWMutex
 }
@@ -202,19 +200,6 @@ type dashboardResponse struct {
 	Summary  dashboardSummary     `json:"summary"`
 	Robots   []robotView          `json:"robots"`
 	Accounts []accountBalanceView `json:"accounts"`
-	Update   autoUpdateState      `json:"update"`
-}
-
-type autoUpdateState struct {
-	Enabled       bool      `json:"enabled"`
-	Checking      bool      `json:"checking"`
-	Updating      bool      `json:"updating"`
-	CurrentCommit string    `json:"current_commit,omitempty"`
-	RemoteCommit  string    `json:"remote_commit,omitempty"`
-	LastCheck     time.Time `json:"last_check,omitempty"`
-	LastUpdate    time.Time `json:"last_update,omitempty"`
-	Message       string    `json:"message,omitempty"`
-	Error         string    `json:"error,omitempty"`
 }
 
 type recentTradesResponse struct {
@@ -306,7 +291,6 @@ func runWebConsole(configPath string) error {
 	if err != nil {
 		return err
 	}
-	server.startAutoUpdater()
 	return server.run()
 }
 
@@ -335,7 +319,6 @@ func newConsoleServer(configPath string) (*consoleServer, error) {
 		processes:     make(map[string]*robotProcess),
 		baseConfig:    baseCfg,
 		baseRawYAML:   baseRawYAML,
-		updateState:   autoUpdateState{Enabled: autoUpdateEnabled(), Message: "等待检查更新"},
 	}
 	if err := os.MkdirAll(server.robotsDir, 0700); err != nil {
 		return nil, err
@@ -394,31 +377,6 @@ func consoleListenAddr() string {
 		return addr
 	}
 	return "127.0.0.1:8080"
-}
-
-func autoUpdateEnabled() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUS_TRADE_BOT_AUTO_UPDATE")))
-	return value != "0" && value != "false" && value != "off" && value != "disabled"
-}
-
-func autoUpdateInterval() time.Duration {
-	value := strings.TrimSpace(os.Getenv("NEXUS_TRADE_BOT_UPDATE_INTERVAL"))
-	if value == "" {
-		return 10 * time.Second
-	}
-	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
-		if seconds < 10 {
-			seconds = 10
-		}
-		return time.Duration(seconds) * time.Second
-	}
-	if d, err := time.ParseDuration(value); err == nil && d > 0 {
-		if d < 10*time.Second {
-			d = 10 * time.Second
-		}
-		return d
-	}
-	return 10 * time.Second
 }
 
 func (s *consoleServer) loadAuth() error {
@@ -745,7 +703,6 @@ func (s *consoleServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 	views := s.collectRobotViews()
 	activeConfigPaths := s.collectRobotConfigPaths()
 	accountBalances := s.collectAccountBalances()
-	updateState := s.autoUpdateSnapshot()
 	var summary dashboardSummary
 	summary.RobotCount = len(views)
 	for _, robot := range views {
@@ -773,7 +730,7 @@ func (s *consoleServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		summary.TotalBalance += account.Balance
 		summary.TotalAvailable += account.AvailableBalance
 	}
-	writeJSON(w, dashboardResponse{Summary: summary, Robots: views, Accounts: accountBalances, Update: updateState})
+	writeJSON(w, dashboardResponse{Summary: summary, Robots: views, Accounts: accountBalances})
 }
 
 func (s *consoleServer) handleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -1414,43 +1371,6 @@ func (s *consoleServer) restartRobotAfter(id string, cmd *exec.Cmd, delay time.D
 
 func (s *consoleServer) stopRobot(id string) error {
 	return s.stopRobotWithStatus(id, "stopped")
-}
-
-func (s *consoleServer) restartRobotForUpdate(id string) error {
-	s.mu.RLock()
-	proc, ok := s.processes[id]
-	if !ok || proc == nil || proc.Status != "running" || proc.Cmd == nil || proc.Cmd.Process == nil {
-		s.mu.RUnlock()
-		return nil
-	}
-	pid := proc.Cmd.Process.Pid
-	s.mu.RUnlock()
-
-	if err := syscall.Kill(-pid, syscall.SIGUSR1); err != nil {
-		return err
-	}
-	deadline := time.Now().Add(8 * time.Second)
-	stopped := false
-	for time.Now().Before(deadline) {
-		s.mu.RLock()
-		current := s.processes[id]
-		stopped = current == nil || current.Status != "running"
-		s.mu.RUnlock()
-		if stopped {
-			break
-		}
-		time.Sleep(150 * time.Millisecond)
-	}
-	if !stopped {
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		time.Sleep(300 * time.Millisecond)
-	}
-	s.mu.Lock()
-	if proc, ok := s.processes[id]; ok && proc != nil {
-		proc.DesiredStatus = "running"
-	}
-	s.mu.Unlock()
-	return s.startRobot(id)
 }
 
 func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
@@ -2943,430 +2863,6 @@ func (s *consoleServer) savePriceBaselineStore(store priceBaselineStore) {
 	if err := os.WriteFile(s.priceBasePath, data, 0600); err == nil {
 		_ = os.Chmod(s.priceBasePath, 0600)
 	}
-}
-
-func (s *consoleServer) startAutoUpdater() {
-	if !autoUpdateEnabled() {
-		s.setAutoUpdateState(func(st *autoUpdateState) {
-			st.Enabled = false
-			st.Message = "自动更新已关闭"
-		})
-		return
-	}
-	go s.autoUpdateLoop(autoUpdateInterval())
-}
-
-func (s *consoleServer) autoUpdateLoop(interval time.Duration) {
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for {
-		<-timer.C
-		runProtected("自动更新检查", func() {
-			s.checkAndApplyGitHubUpdate()
-		})
-		timer.Reset(interval)
-	}
-}
-
-func (s *consoleServer) autoUpdateSnapshot() autoUpdateState {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	return s.updateState
-}
-
-func (s *consoleServer) setAutoUpdateState(fn func(*autoUpdateState)) {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	fn(&s.updateState)
-}
-
-func (s *consoleServer) checkAndApplyGitHubUpdate() {
-	rootDir := filepath.Dir(s.configPath)
-	if _, err := os.Stat(filepath.Join(rootDir, ".git")); err != nil {
-		s.setAutoUpdateState(func(st *autoUpdateState) {
-			st.Enabled = true
-			st.Checking = false
-			st.Updating = false
-			st.LastCheck = time.Now()
-			st.Message = "当前不是 Git 安装目录，跳过自动更新"
-			st.Error = ""
-		})
-		return
-	}
-	if !s.beginAutoUpdateCheck() {
-		return
-	}
-	defer s.finishAutoUpdateCheck()
-
-	current, err := gitOutput(rootDir, "rev-parse", "HEAD")
-	if err != nil {
-		s.markAutoUpdateError("读取本地版本失败: " + err.Error())
-		return
-	}
-	if err := runGit(rootDir, "fetch", "--quiet", "origin", "main"); err != nil {
-		s.markAutoUpdateError("检查 GitHub 更新失败: " + err.Error())
-		return
-	}
-	remote, err := gitOutput(rootDir, "rev-parse", "origin/main")
-	if err != nil {
-		s.markAutoUpdateError("读取 GitHub 版本失败: " + err.Error())
-		return
-	}
-	s.setAutoUpdateState(func(st *autoUpdateState) {
-		st.CurrentCommit = shortCommit(current)
-		st.RemoteCommit = shortCommit(remote)
-		st.LastCheck = time.Now()
-		st.Error = ""
-	})
-	if current == remote {
-		s.setAutoUpdateState(func(st *autoUpdateState) {
-			st.Message = "已是最新版本"
-		})
-		return
-	}
-	if dirty, err := gitOutput(rootDir, "status", "--porcelain"); err != nil {
-		s.markAutoUpdateError("检查本地改动失败: " + err.Error())
-		return
-	} else if strings.TrimSpace(dirty) != "" {
-		logger.Warn("⚠️ [自动更新] 检测到服务器本地代码有未提交改动，将以 GitHub 最新版本为准并保留运行配置")
-	}
-	s.applyGitHubUpdate(rootDir, current, remote)
-}
-
-func (s *consoleServer) beginAutoUpdateCheck() bool {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	if s.updateState.Checking || s.updateState.Updating {
-		return false
-	}
-	s.updateState.Enabled = true
-	s.updateState.Checking = true
-	s.updateState.Message = "正在检查 GitHub 更新"
-	s.updateState.Error = ""
-	return true
-}
-
-func (s *consoleServer) finishAutoUpdateCheck() {
-	s.setAutoUpdateState(func(st *autoUpdateState) {
-		st.Checking = false
-	})
-}
-
-func (s *consoleServer) markAutoUpdateError(message string) {
-	logger.Warn("⚠️ [自动更新] %s", message)
-	s.setAutoUpdateState(func(st *autoUpdateState) {
-		st.Checking = false
-		st.Updating = false
-		st.LastCheck = time.Now()
-		st.Error = message
-		st.Message = message
-	})
-}
-
-func (s *consoleServer) applyGitHubUpdate(rootDir, current, remote string) {
-	s.setAutoUpdateState(func(st *autoUpdateState) {
-		st.Updating = true
-		st.Message = "发现新版本，正在验证"
-		st.Error = ""
-	})
-	tmpDir, err := os.MkdirTemp("", "nexus-trade-bot-update-*")
-	if err != nil {
-		s.markAutoUpdateError("创建更新临时目录失败: " + err.Error())
-		return
-	}
-	defer os.RemoveAll(tmpDir)
-
-	if err := copyGitWorktree(rootDir, tmpDir, remote); err != nil {
-		s.markAutoUpdateError("准备更新版本失败: " + err.Error())
-		return
-	}
-	if err := runCommand(tmpDir, "go", "test", "./..."); err != nil {
-		s.markAutoUpdateError("新版本测试失败，已保留当前版本: " + err.Error())
-		return
-	}
-	tmpBin := filepath.Join(tmpDir, "nexus-trade-bot.update")
-	if err := runCommand(tmpDir, "go", "build", "-o", tmpBin, "."); err != nil {
-		s.markAutoUpdateError("新版本编译失败，已保留当前版本: " + err.Error())
-		return
-	}
-
-	runningIDs := s.runningRobotIDs()
-	backupDir, err := backupRuntimeFiles(rootDir, s.runtimePreservePaths())
-	if err != nil {
-		s.markAutoUpdateError("备份运行配置失败，已保留当前版本: " + err.Error())
-		return
-	}
-	defer os.RemoveAll(backupDir)
-	s.setAutoUpdateState(func(st *autoUpdateState) {
-		st.Message = fmt.Sprintf("验证通过，正在应用更新并重启 %d 个机器人", len(runningIDs))
-	})
-	if err := runGit(rootDir, "reset", "--hard", remote); err != nil {
-		s.markAutoUpdateError("切换到新版本失败: " + err.Error())
-		return
-	}
-	if err := runGit(rootDir, "clean", "-fd"); err != nil {
-		s.markAutoUpdateError("清理旧文件失败: " + err.Error())
-		_ = runGit(rootDir, "reset", "--hard", current)
-		_ = restoreRuntimeFiles(rootDir, backupDir)
-		return
-	}
-	if err := restoreRuntimeFiles(rootDir, backupDir); err != nil {
-		s.markAutoUpdateError("恢复运行配置失败: " + err.Error())
-		_ = runGit(rootDir, "reset", "--hard", current)
-		return
-	}
-	binPath, err := os.Executable()
-	if err != nil {
-		s.markAutoUpdateError("定位当前程序失败: " + err.Error())
-		return
-	}
-	if err := installVerifiedBinary(tmpBin, binPath); err != nil {
-		s.markAutoUpdateError("替换程序失败: " + err.Error())
-		_ = runGit(rootDir, "reset", "--hard", current)
-		_ = restoreRuntimeFiles(rootDir, backupDir)
-		return
-	}
-	for _, id := range runningIDs {
-		if err := s.restartRobotForUpdate(id); err != nil {
-			logger.Warn("⚠️ [自动更新] 机器人 %s 更新重启失败: %v", id, err)
-		}
-	}
-	s.setAutoUpdateState(func(st *autoUpdateState) {
-		st.Updating = false
-		st.LastUpdate = time.Now()
-		st.CurrentCommit = shortCommit(remote)
-		st.RemoteCommit = shortCommit(remote)
-		st.Message = fmt.Sprintf("已自动更新到 %s，运行中的机器人已恢复", shortCommit(remote))
-		st.Error = ""
-	})
-	logger.Info("✅ [自动更新] 已从 %s 更新到 %s", shortCommit(current), shortCommit(remote))
-}
-
-func (s *consoleServer) runningRobotIDs() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ids := make([]string, 0)
-	for id, proc := range s.processes {
-		if proc != nil && proc.Status == "running" && proc.DesiredStatus == "running" {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids
-}
-
-func (s *consoleServer) runtimePreservePaths() []string {
-	rootDir := filepath.Dir(s.configPath)
-	paths := []string{
-		s.configPath,
-		s.authPath,
-		s.accountsPath,
-		s.robotsPath,
-		s.robotsDir,
-		s.priceBasePath,
-		filepath.Join(rootDir, "logs"),
-		filepath.Join(rootDir, "nexus-trade-bot.pid"),
-	}
-	s.mu.RLock()
-	for _, robot := range s.robots {
-		if robot == nil {
-			continue
-		}
-		if strings.TrimSpace(robot.ConfigPath) != "" {
-			paths = append(paths, robot.ConfigPath)
-			paths = append(paths, robot.ConfigPath+".stats.json")
-			paths = append(paths, robotLogPath(robot.ConfigPath))
-		}
-	}
-	s.mu.RUnlock()
-	return paths
-}
-
-func gitOutput(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func runGit(dir string, args ...string) error {
-	_, err := gitOutput(dir, args...)
-	return err
-}
-
-func runCommand(dir, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
-	}
-	return nil
-}
-
-func backupRuntimeFiles(rootDir string, paths []string) (string, error) {
-	backupDir, err := os.MkdirTemp("", "nexus-trade-bot-runtime-*")
-	if err != nil {
-		return "", err
-	}
-	seen := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
-		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
-		}
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			os.RemoveAll(backupDir)
-			return "", err
-		}
-		rel, err := filepath.Rel(rootDir, absPath)
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			continue
-		}
-		if _, exists := seen[rel]; exists {
-			continue
-		}
-		seen[rel] = struct{}{}
-		if _, err := os.Stat(absPath); errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			os.RemoveAll(backupDir)
-			return "", err
-		}
-		if err := copyPath(absPath, filepath.Join(backupDir, rel)); err != nil {
-			os.RemoveAll(backupDir)
-			return "", err
-		}
-	}
-	return backupDir, nil
-}
-
-func restoreRuntimeFiles(rootDir, backupDir string) error {
-	if strings.TrimSpace(backupDir) == "" {
-		return nil
-	}
-	return filepath.WalkDir(backupDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if path == backupDir {
-			return nil
-		}
-		rel, err := filepath.Rel(backupDir, path)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(rootDir, rel)
-		if d.IsDir() {
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			return os.MkdirAll(dst, info.Mode().Perm())
-		}
-		return copyFile(path, dst)
-	})
-}
-
-func copyPath(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return copyDir(src, dst)
-	}
-	return copyFile(src, dst)
-}
-
-func copyDir(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return os.MkdirAll(target, info.Mode().Perm())
-		}
-		return copyFile(path, target)
-	})
-}
-
-func copyFile(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
-		return err
-	}
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, info.Mode().Perm())
-}
-
-func copyGitWorktree(rootDir, tmpDir, commit string) error {
-	cmd := exec.Command("git", "archive", commit)
-	cmd.Dir = rootDir
-	tarCmd := exec.Command("tar", "-x", "-C", tmpDir)
-	pipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	tarCmd.Stdin = pipe
-	cmd.Stderr = &bytes.Buffer{}
-	tarCmd.Stderr = &bytes.Buffer{}
-	if err := tarCmd.Start(); err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		_ = tarCmd.Process.Kill()
-		return err
-	}
-	cmdErr := cmd.Wait()
-	tarErr := tarCmd.Wait()
-	if cmdErr != nil {
-		return cmdErr
-	}
-	return tarErr
-}
-
-func installVerifiedBinary(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	tmp := dst + ".new"
-	if err := os.WriteFile(tmp, data, 0755); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, 0755); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, dst)
-}
-
-func shortCommit(commit string) string {
-	commit = strings.TrimSpace(commit)
-	if len(commit) > 12 {
-		return commit[:12]
-	}
-	return commit
 }
 
 func robotStatsMetric(configPath string, markPrice float64) robotMetric {
