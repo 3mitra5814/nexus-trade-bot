@@ -420,7 +420,7 @@ if [[ "$remote_has_branch" == "true" ]]; then
     pause
     exit 1
   fi
-  if ! git rebase --progress "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+  if ! git rebase "refs/remotes/origin/${DEFAULT_BRANCH}"; then
     say
     say "同步远程分支失败，可能有冲突或远程仓库有不相关历史。"
     say "为避免覆盖远程内容，脚本已停止。处理后再次双击即可。"
