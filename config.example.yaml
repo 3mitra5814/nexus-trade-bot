@@ -72,20 +72,19 @@ trading:
 #####################################
 
   # 滑动窗口配置
-  buy_window_size: 5           # 做多/做空每个方向最多保留 5 个开仓挂单，节约保证金
-  sell_window_size: 5          # 每个方向最多保留 5 个平仓保护挂单
+  buy_window_size: 10          # 做多/做空每个方向最多保留 10 个开仓挂单
+  sell_window_size: 10         # 每个方向最多保留 10 个平仓保护挂单
 
   # 对账配置
   reconcile_interval: 60      # 对账间隔（秒）
 
   # 订单管理配置
-  order_cleanup_threshold: 20      # 订单清理上限（超过此数量时触发清理）
+  order_cleanup_threshold: 50      # 订单清理上限（超过此数量时触发清理）
   cleanup_batch_size: 20           # 清理批次大小（每次清理的买单和卖单数量）
   margin_lock_duration_seconds: 20  # 保证金不足时锁定时间（秒，默认10秒）
   
   # 持仓安全性配置
   position_safety_check: 100        # 持仓安全性检查（默认100，最少能向下持有多少仓）
-  adopt_existing_position: false    # 是否接管启动/对账时交易所已有持仓；默认false，保护手动底仓不被机器人平掉
 
 
 # 时间间隔配置

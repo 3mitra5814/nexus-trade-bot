@@ -184,7 +184,6 @@ nexus-trade-bot 可協助您從乾淨的 Web 控制台執行網格策略：
 | `price_interval` | 網格層之間的價格距離 | 間隔越小，交易越多，手續費也越多。 |
 | `order_quantity` | 每筆訂單使用的金額 | 金額越大，成交量和回撤都會放大。確認介面在你的交易所和市場類型下顯示的是報價幣金額還是基礎幣數量。 |
 | `min_order_value` | 最小訂單名義價值 | 必須滿足交易所最小下單要求。 |
-| `trading.adopt_existing_position` | 機器人是否應把交易所已有倉位接管為機器人庫存 | 預設是 `false`，所以手動 Bitget 底倉不會被當作網格庫存，也不會被網格退出單意外平掉。只有你明確想讓機器人管理已有倉位時才開啟。 |
 | `risk_control.enabled` | 市場異常保護 | 除非你非常清楚原因，否則保持開啟。 |
 
 
@@ -264,7 +263,6 @@ scripts/nexus-trade-bot.sh stop
 - 您了解網格可以累積多少位置。
 - 您有一個單向市場計劃。
 - 您的伺服器防火牆僅在需要時才會公開 Web 連接埠。
-- 對於Bitget期貨，先用小倉進行測試，確認機器人方向、部位模式、`trading.adopt_existing_position`是否符合您的要求。
 
 
 ## 免責聲明

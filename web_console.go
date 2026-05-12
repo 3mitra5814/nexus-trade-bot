@@ -262,10 +262,10 @@ const (
 	hardcodedPricePollInterval     = 500
 	hardcodedStatusPrintInterval   = 1
 	hardcodedOrderCleanupInterval  = 60
-	hardcodedBuyWindowSize         = 5
-	hardcodedSellWindowSize        = 5
+	hardcodedBuyWindowSize         = 10
+	hardcodedSellWindowSize        = 10
 	hardcodedReconcileInterval     = 60
-	hardcodedOrderCleanupThreshold = 10
+	hardcodedOrderCleanupThreshold = 50
 	hardcodedCleanupBatchSize      = 20
 	hardcodedMarginLockSeconds     = 20
 	hardcodedPositionSafetyCheck   = 100
@@ -1895,8 +1895,6 @@ func applyHardcodedRobotDefaults(cfg *config.Config) {
 	cfg.Trading.CleanupBatchSize = hardcodedCleanupBatchSize
 	cfg.Trading.MarginLockDurationSec = hardcodedMarginLockSeconds
 	cfg.Trading.PositionSafetyCheck = hardcodedPositionSafetyCheck
-	// 默认不接管已有交易所持仓，避免 Web 新建机器人误把手动底仓当作网格仓位平掉。
-	cfg.Trading.AdoptExistingPosition = false
 }
 
 func (s *consoleServer) loadAccounts() error {
@@ -2571,7 +2569,6 @@ func accountConfig(exchangeName string, exchangeConfig config.ExchangeConfig, sy
 	cfg.Trading.CleanupBatchSize = hardcodedCleanupBatchSize
 	cfg.Trading.MarginLockDurationSec = hardcodedMarginLockSeconds
 	cfg.Trading.PositionSafetyCheck = hardcodedPositionSafetyCheck
-	cfg.Trading.AdoptExistingPosition = false
 	applyHardcodedRobotDefaults(cfg)
 	return cfg
 }

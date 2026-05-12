@@ -180,11 +180,10 @@ Use neutral mode when you want both long-side and short-side grid behavior. Star
 | --- | --- | --- |
 | `symbol` | Trading pair | Start with liquid pairs such as BTC or ETH. |
 | `app.market_type` | `futures` or `spot` | Defaults to `futures`. Spot live trading supports Binance, Bitget, Bybit, OKX, Gate, and Hyperliquid through dedicated adapters. |
-| `direction` | `long`, `short`, or `neutral` | Long grids need margin for drawdowns. Short grids must not accidentally adopt an unrelated manual short position unless you intentionally enable that behavior. |
+| `direction` | `long`, `short`, or `neutral` | Long grids need margin for drawdowns. Existing exchange positions are restored as bot inventory at startup. |
 | `price_interval` | Distance between grid levels | Smaller interval means more trades and more fees. |
 | `order_quantity` | Amount used per order | Larger amount increases turnover and drawdown. Confirm whether the UI is showing quote value or base quantity for your exchange and market type. |
 | `min_order_value` | Minimum order notional | Must satisfy exchange minimums. |
-| `trading.adopt_existing_position` | Whether the bot should adopt an existing exchange position as bot inventory | Defaults to `false` so a manual Bitget base position is not treated as grid inventory and accidentally closed by grid exit orders. Enable only when you deliberately want the bot to manage an existing position. |
 | `risk_control.enabled` | Market abnormality protection | Keep it enabled unless you know exactly why not. |
 
 
@@ -264,7 +263,6 @@ Check these first:
 - You understand how much position the grid can accumulate.
 - You have a plan for one-way markets.
 - Your server firewall exposes the web port only when intended.
-- For Bitget futures, test with small size first and confirm that the bot direction, position mode, and `trading.adopt_existing_position` match what you want.
 
 
 ## Disclaimer

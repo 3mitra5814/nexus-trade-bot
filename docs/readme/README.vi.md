@@ -184,7 +184,6 @@ Sử dụng chế độ trung tính khi bạn muốn cả hoạt động của l
 | `price_interval` | Khoảng cách giữa các cấp lưới | Khoảng thời gian nhỏ hơn có nghĩa là nhiều giao dịch hơn và nhiều phí hơn. |
 | `order_quantity` | Số tiền sử dụng cho mỗi đơn hàng | Số tiền lớn hơn làm tăng doanh thu và rút tiền. Xác nhận xem giao diện người dùng đang hiển thị giá trị báo giá hay số lượng cơ bản cho loại thị trường và sàn giao dịch của bạn. |
 | `min_order_value` | Danh nghĩa đơn hàng tối thiểu | Phải đáp ứng mức trao đổi tối thiểu. |
-| `trading.adopt_existing_position` | Liệu bot có nên sử dụng vị trí trao đổi hiện có làm kho lưu trữ bot hay không | Mặc định là `false` để vị trí cơ sở Bitget thủ công không được coi là kho lưu trữ lưới và vô tình bị đóng bởi các lệnh thoát lưới. Chỉ kích hoạt khi bạn cố tình muốn bot quản lý một vị trí hiện có. |
 | `risk_control.enabled` | Bảo vệ sự bất thường của thị trường | Hãy luôn kích hoạt nó trừ khi bạn biết chính xác lý do tại sao không. |
 
 
@@ -264,7 +263,6 @@ Hãy kiểm tra những điều này trước:
 - Bạn hiểu lưới có thể tích lũy được bao nhiêu vị trí.
 - Bạn có kế hoạch cho thị trường một chiều.
 - Tường lửa máy chủ của bạn chỉ hiển thị cổng web khi có ý định.
-- Đối với hợp đồng tương lai Bitget, trước tiên hãy thử nghiệm với kích thước nhỏ và xác nhận rằng hướng bot, chế độ vị trí và `trading.adopt_existing_position` phù hợp với những gì bạn muốn.
 
 
 ## Tuyên bố từ chối trách nhiệm

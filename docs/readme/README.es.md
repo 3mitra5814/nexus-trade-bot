@@ -184,7 +184,6 @@ Utilice el modo neutral cuando desee un comportamiento de cuadrícula tanto en e
 | `price_interval` | Distancia entre niveles de cuadrícula | Un intervalo más pequeño significa más operaciones y más tarifas. |
 | `order_quantity` | Cantidad utilizada por pedido | Una cantidad mayor aumenta la rotación y la reducción. Confirme si la interfaz de usuario muestra el valor de cotización o la cantidad base para su intercambio y tipo de mercado. |
 | `min_order_value` | Pedido mínimo teórico | Debe satisfacer los mínimos de cambio. |
-| `trading.adopt_existing_position` | Si el bot debería adoptar una posición de intercambio existente como inventario de bot | El valor predeterminado es `false`, por lo que una posición base manual de Bitget no se trata como inventario de la red y se cierra accidentalmente mediante órdenes de salida de la red. Habilítelo solo cuando desee deliberadamente que el bot administre una posición existente. |
 | `risk_control.enabled` | Protección contra anomalías del mercado | Mantenlo habilitado a menos que sepas exactamente por qué no. |
 
 
@@ -264,7 +263,6 @@ Comprueba estos primero:
 - Entiendes cuánta posición puede acumular la cuadrícula.
 - Tiene un plan para mercados unidireccionales.
 - El firewall de su servidor expone el puerto web sólo cuando está previsto.
-- Para futuros de Bitget, pruebe primero con un tamaño pequeño y confirme que la dirección del bot, el modo de posición y `trading.adopt_existing_position` coincidan con lo que desea.
 
 
 ## Descargo de responsabilidad

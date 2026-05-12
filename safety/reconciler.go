@@ -53,6 +53,10 @@ type realizedPNLProvider interface {
 	GetRealizedPNL() float64
 }
 
+type unrealizedPNLProvider interface {
+	EstimateUnrealizedPNL(markPrice float64) float64
+}
+
 // Reconciler 持仓对账器
 type Reconciler struct {
 	cfg          *config.Config
@@ -250,14 +254,57 @@ func (r *Reconciler) Reconcile() error {
 	if provider, ok := r.pm.(realizedPNLProvider); ok {
 		realizedPNL = provider.GetRealizedPNL()
 	}
-	unrealizedPNL := sumPositionUnrealizedPNL(positionsRaw)
+	unrealizedPNL := r.reconciledUnrealizedPNL(positionsRaw)
 	logger.Info("📊 [统计] 对账次数: %d, 累计买入: %.4f, 累计卖出: %.4f, 已实现盈亏: %.4f USD, 未实现盈亏: %.4f USD",
 		r.pm.GetReconcileCount(), totalBuyQty, totalSellQty, realizedPNL, unrealizedPNL)
 	logger.Debugln("🔍 ===== 对账完成 =====")
 	return nil
 }
 
+func (r *Reconciler) reconciledUnrealizedPNL(positionsRaw interface{}) float64 {
+	markPrice := firstPositivePositionField(positionsRaw, "MarkPrice")
+	if provider, ok := r.pm.(unrealizedPNLProvider); ok && markPrice > 0 {
+		return provider.EstimateUnrealizedPNL(markPrice)
+	}
+	return sumPositionUnrealizedPNL(positionsRaw)
+}
+
 func sumPositionUnrealizedPNL(raw interface{}) float64 {
+	return sumPositionField(raw, "UnrealizedPNL")
+}
+
+func firstPositivePositionField(raw interface{}, fieldName string) float64 {
+	v := reflect.ValueOf(raw)
+	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return 0
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+		return 0
+	}
+	for i := 0; i < v.Len(); i++ {
+		item := v.Index(i)
+		for item.Kind() == reflect.Pointer || item.Kind() == reflect.Interface {
+			if item.IsNil() {
+				item = reflect.Value{}
+				break
+			}
+			item = item.Elem()
+		}
+		if !item.IsValid() || item.Kind() != reflect.Struct {
+			continue
+		}
+		field := item.FieldByName(fieldName)
+		if field.IsValid() && field.CanFloat() && field.Float() > 0 {
+			return field.Float()
+		}
+	}
+	return 0
+}
+
+func sumPositionField(raw interface{}, fieldName string) float64 {
 	v := reflect.ValueOf(raw)
 	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
 		if v.IsNil() {
@@ -281,7 +328,7 @@ func sumPositionUnrealizedPNL(raw interface{}) float64 {
 		if !item.IsValid() || item.Kind() != reflect.Struct {
 			continue
 		}
-		field := item.FieldByName("UnrealizedPNL")
+		field := item.FieldByName(fieldName)
 		if field.IsValid() && field.CanFloat() {
 			total += field.Float()
 		}

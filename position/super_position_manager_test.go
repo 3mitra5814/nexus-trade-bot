@@ -85,7 +85,6 @@ func TestInitializeRestoresExistingLongAndAdjustPlacesEntryAndExit(t *testing.T)
 	cfg.Trading.BuyWindowSize = 3
 	cfg.Trading.SellWindowSize = 3
 	cfg.Trading.OrderCleanupThreshold = 100
-	cfg.Trading.AdoptExistingPosition = true
 
 	executor := &captureExecutor{}
 	exchange := seededExchange{positions: []*PositionInfo{{
@@ -827,6 +826,52 @@ func TestAdjustOrdersBackfillsEntryWindowAfterSkippingMarketableGrid(t *testing.
 	}
 }
 
+func TestShortEntryBackfillSkipsMarketableGridSlots(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2275.22, "2275.22"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2277.23); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	for _, order := range executor.orders {
+		if order.ReduceOnly || order.Side != "SELL" {
+			continue
+		}
+		if order.Price <= 2277.23 {
+			t.Fatalf("short entry SELL must stay above current market, got order %.2f at current 2277.23 orders=%v",
+				order.Price, executor.orders)
+		}
+	}
+
+	wantSells := map[float64]bool{2278.22: false, 2279.22: false, 2280.22: false, 2281.22: false, 2282.22: false}
+	for _, order := range executor.orders {
+		if order.ReduceOnly || order.Side != "SELL" {
+			continue
+		}
+		if _, ok := wantSells[order.Price]; ok {
+			wantSells[order.Price] = true
+		}
+	}
+	for price, seen := range wantSells {
+		if !seen {
+			t.Fatalf("expected maker-safe short entry at %.2f, orders=%v", price, executor.orders)
+		}
+	}
+}
+
 func TestTaggedManagerRejectsOtherRobotOrderUpdates(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -1035,7 +1080,6 @@ func TestLargeRestoredShortPositionIsSplitAndExitOrdersAreCapped(t *testing.T) {
 	cfg.Trading.BuyWindowSize = 2
 	cfg.Trading.SellWindowSize = 3
 	cfg.Trading.OrderCleanupThreshold = 100
-	cfg.Trading.AdoptExistingPosition = true
 
 	executor := &captureExecutor{}
 	exchange := seededExchange{positions: []*PositionInfo{{
@@ -1074,7 +1118,7 @@ func TestLargeRestoredShortPositionIsSplitAndExitOrdersAreCapped(t *testing.T) {
 	}
 }
 
-func TestExistingShortPositionIsNotAdoptedByDefault(t *testing.T) {
+func TestExistingShortPositionIsRestoredAtStartup(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -1100,10 +1144,15 @@ func TestExistingShortPositionIsNotAdoptedByDefault(t *testing.T) {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
+	foundExit := false
 	for _, order := range executor.orders {
 		if order.Side == "BUY" && order.ReduceOnly {
-			t.Fatalf("manual short base must not be adopted into reduce-only exits by default: %+v", order)
+			foundExit = true
+			break
 		}
+	}
+	if !foundExit {
+		t.Fatalf("expected startup short position to be restored into reduce-only BUY exit, orders=%+v", executor.orders)
 	}
 }
 
@@ -1356,7 +1405,7 @@ func TestPriceGridShiftDoesNotChurnOnSubIntervalAnchoredTicks(t *testing.T) {
 	}
 }
 
-func TestPriceGridShiftUsesFullIntervalHysteresisBeforeRebalancing(t *testing.T) {
+func TestPriceGridShiftFollowsNearestGridBeforeRebalancing(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -1385,25 +1434,23 @@ func TestPriceGridShiftUsesFullIntervalHysteresisBeforeRebalancing(t *testing.T)
 
 	cancelCount := len(executor.canceled)
 	orderCount := len(executor.orders)
-	for _, price := range []float64{2273.70, 2274.70, 2274.83, 2273.81, 2274.92, 2273.90} {
-		if err := spm.AdjustOrdersWithRebalance(price, true); err != nil {
-			t.Fatalf("boundary AdjustOrders(%.2f) error = %v", price, err)
-		}
+	if err := spm.AdjustOrdersWithRebalance(2274.83, true); err != nil {
+		t.Fatalf("same-grid AdjustOrders() error = %v", err)
 	}
 	if len(executor.canceled) != cancelCount {
-		t.Fatalf("expected half-grid boundary noise not to cancel far entries, got before=%d after=%d canceled=%v",
+		t.Fatalf("expected same nearest grid not to cancel far entries, got before=%d after=%d canceled=%v",
 			cancelCount, len(executor.canceled), executor.canceled)
 	}
 	if len(executor.orders) != orderCount {
-		t.Fatalf("expected half-grid boundary noise not to repost entries, got before=%d after=%d",
+		t.Fatalf("expected same nearest grid not to repost entries, got before=%d after=%d",
 			orderCount, len(executor.orders))
 	}
 
-	if err := spm.AdjustOrdersWithRebalance(2275.42, true); err != nil {
-		t.Fatalf("full interval AdjustOrders() error = %v", err)
+	if err := spm.AdjustOrdersWithRebalance(2274.92, true); err != nil {
+		t.Fatalf("nearest-grid shift AdjustOrders() error = %v", err)
 	}
 	if len(executor.canceled) == cancelCount {
-		t.Fatalf("expected full interval move to rebalance stale entries")
+		t.Fatalf("expected nearest-grid shift to rebalance stale entries")
 	}
 }
 

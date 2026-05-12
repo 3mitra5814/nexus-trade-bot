@@ -180,11 +180,10 @@ nexus-trade-bot 可帮助您从干净的 Web 控制台运行网格策略：
 | --- | --- | --- |
 | `symbol` | 交易对 | 从 BTC 或 ETH 等高流动性交易对开始。 |
 | `app.market_type` | `futures` 或 `spot` | 默认为 `futures`。现货实盘交易通过专用适配器支持 Binance、Bitget、Bybit、OKX、Gate 和 Hyperliquid。 |
-| `direction` | `long`、`short` 或 `neutral` | 做多网格需要为回撤预留保证金。做空网格不应误接管无关的手动空头底仓，除非你明确启用该行为。 |
+| `direction` | `long`、`short` 或 `neutral` | 做多网格需要为回撤预留保证金。启动时已有交易所仓位会恢复为机器人库存。 |
 | `price_interval` | 网格层之间的价格距离 | 间隔越小，交易越多，手续费也越多。 |
 | `order_quantity` | 每笔订单使用的金额 | 金额越大，成交量和回撤都会放大。确认界面在你的交易所和市场类型下显示的是报价币金额还是基础币数量。 |
 | `min_order_value` | 最小订单名义价值 | 必须满足交易所最小下单要求。 |
-| `trading.adopt_existing_position` | 机器人是否应把交易所已有仓位接管为机器人库存 | 默认是 `false`，所以手动 Bitget 底仓不会被当作网格库存，也不会被网格退出单意外平掉。只有你明确想让机器人管理已有仓位时才开启。 |
 | `risk_control.enabled` | 市场异常保护 | 除非你非常清楚原因，否则保持开启。 |
 
 
@@ -264,7 +263,6 @@ scripts/nexus-trade-bot.sh stop
 - 您了解网格可以累积多少位置。
 - 您有一个单向市场计划。
 - 您的服务器防火墙仅在需要时才会公开 Web 端口。
-- 对于Bitget期货，先用小仓进行测试，确认机器人方向、仓位模式、`trading.adopt_existing_position`是否符合您的要求。
 
 
 ## 免责声明

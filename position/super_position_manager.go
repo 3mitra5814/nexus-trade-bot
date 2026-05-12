@@ -155,8 +155,6 @@ type SuperPositionManager struct {
 	anchorPrice float64
 	// 最后市场价格（用于打印状态）
 	lastMarketPrice atomic.Value // float64
-	// 当前挂单窗口中心价。小幅价格抖动不移动窗口，避免反复撤单重挂。
-	entryWindowCenter float64
 	// 价格精度（根据锚点价格检测得出的小数位数）
 	priceDecimals int
 	// 数量精度（从交易所获取）
@@ -400,14 +398,6 @@ func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 	// 🔥 修改：只恢复持仓槽位，不再主动下单
 	// 所有下单操作由 AdjustOrders 统一处理，避免时序问题
 	existing := spm.getExistingPositions()
-	if !spm.config.Trading.AdoptExistingPosition {
-		if existing.LongQty > 0 || existing.ShortQty > 0 {
-			logger.Warn("🛡️ [持仓恢复] 检测到交易所已有持仓 Long=%.8f Short=%.8f，但 adopt_existing_position=false，已视为手动底仓，不创建平仓槽位",
-				existing.LongQty, existing.ShortQty)
-		}
-		logger.Info("✅ [初始化] 槽位已创建，订单下达将由 AdjustOrders 统一处理")
-		return nil
-	}
 	if existing.LongQty > 0 {
 		logger.Info("🔄 [持仓恢复] 检测到现有多仓: %.4f，参考价: %s，开始初始化多头平仓槽位", existing.LongQty, formatPrice(existing.LongEntry, spm.priceDecimals))
 		spm.initializeSlotsFromPosition(existing.LongQty, BookSideLong, existing.LongEntry)
@@ -498,7 +488,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	buyWindowSize := spm.config.Trading.BuyWindowSize
 	sellWindowSize := spm.config.Trading.SellWindowSize
-	currentGridPrice := spm.entryWindowCenterPrice(currentPrice)
+	currentGridPrice := spm.findNearestGridPrice(currentPrice)
 	spm.pruneEmptyFarSlots(currentGridPrice, maxInt(buyWindowSize, sellWindowSize)*4+10)
 	spm.cleanupGhostOrderStates()
 
@@ -516,7 +506,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	for _, bookSide := range enabledBookSides {
 		desiredEntryPrices[bookSide] = make(map[float64]bool)
-		slotPrices := spm.calculateEntrySlotPrices(currentGridPrice, currentGridPrice, buyWindowSize, bookSide)
+		slotPrices := spm.calculateEntrySlotPrices(currentGridPrice, currentPrice, buyWindowSize, bookSide)
 		for _, price := range slotPrices {
 			desiredEntryPrices[bookSide][price] = true
 			desiredEntrySlots[bookSide] = append(desiredEntrySlots[bookSide], price)
@@ -1564,8 +1554,8 @@ func (spm *SuperPositionManager) pruneEmptyFarSlots(currentGridPrice float64, re
 }
 
 // findNearestGridPrice returns the nearest interval-aligned grid point.
-// Keeping the grid aligned to the startup anchor avoids cancel/repost churn from
-// tiny price ticks while still moving the window once price crosses an interval.
+// Keeping the grid aligned to the startup anchor matches the reference bot:
+// the window moves as soon as the latest price maps to a new nearest grid.
 func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) float64 {
 	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
 	priceInterval := spm.config.Trading.PriceInterval
@@ -1575,30 +1565,6 @@ func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) floa
 	intervals := math.Round((currentPrice - spm.anchorPrice) / priceInterval)
 	gridPrice := spm.anchorPrice + intervals*priceInterval
 	return roundPrice(gridPrice, spm.priceDecimals)
-}
-
-func (spm *SuperPositionManager) entryWindowCenterPrice(currentPrice float64) float64 {
-	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
-	targetGridPrice := spm.findNearestGridPrice(currentPrice)
-	priceInterval := spm.config.Trading.PriceInterval
-	if spm.entryWindowCenter <= 0 || priceInterval <= 0 {
-		spm.entryWindowCenter = targetGridPrice
-		return spm.entryWindowCenter
-	}
-	if math.Abs(currentPrice-spm.entryWindowCenter) >= priceInterval {
-		spm.entryWindowCenter = targetGridPrice
-	}
-	return spm.entryWindowCenter
-}
-
-func (spm *SuperPositionManager) entryWindowCenterSnapshot(currentPrice float64) float64 {
-	spm.mu.RLock()
-	center := spm.entryWindowCenter
-	spm.mu.RUnlock()
-	if center > 0 {
-		return center
-	}
-	return spm.findNearestGridPrice(currentPrice)
 }
 
 // calculateSlotPrices 计算槽位价格列表（统一的网格计算方法）
@@ -2092,17 +2058,8 @@ func (spm *SuperPositionManager) reconcilePositionSnapshot(positions []exchangeP
 }
 
 func (spm *SuperPositionManager) reconcileBookPositionSnapshot(bookSide string, localQty, remoteQty, entryPrice, tolerance float64) {
-	if spm.config.Trading.AdoptExistingPosition {
-		logger.Warn("⚠️ [对账修正-%s] 本地持仓 %.8f 与交易所 %.8f 不一致，按交易所快照修正", bookSide, localQty, remoteQty)
-		spm.resetFilledSlots(bookSide)
-		if remoteQty > 0 {
-			spm.initializeSlotsFromPosition(remoteQty, bookSide, entryPrice)
-		}
-		return
-	}
-
 	if localQty <= tolerance {
-		logger.Warn("🛡️ [对账-%s] 交易所持仓 %.8f 不是本机器人仓位，adopt_existing_position=false，已忽略以保护手动底仓", bookSide, remoteQty)
+		logger.Warn("⚠️ [对账-%s] 检测到交易所已有持仓 %.8f，但本地无槽位；仅启动初始化阶段接管已有持仓，运行中不自动追加平仓槽位", bookSide, remoteQty)
 		return
 	}
 	if remoteQty+tolerance < localQty {
@@ -2113,7 +2070,7 @@ func (spm *SuperPositionManager) reconcileBookPositionSnapshot(bookSide string, 
 		}
 		return
 	}
-	logger.Warn("🛡️ [对账-%s] 交易所持仓 %.8f 大于本地机器人持仓 %.8f，超出部分视为手动底仓，不创建额外平仓槽位", bookSide, remoteQty, localQty)
+	logger.Warn("⚠️ [对账-%s] 交易所持仓 %.8f 大于本地槽位持仓 %.8f，超出部分不会在运行中追加槽位；如需接管请重启机器人完成初始化恢复", bookSide, remoteQty, localQty)
 }
 
 func (spm *SuperPositionManager) localPositionTotals() (float64, float64) {
@@ -2643,8 +2600,7 @@ func (spm *SuperPositionManager) PrintPositions() {
 		return allSlots[i].Price > allSlots[j].Price
 	})
 
-	// 打印机器人实际使用的开仓窗口中心，避免半格附近的 nearest grid 误导排查。
-	currentGridPrice := spm.entryWindowCenterSnapshot(lastPrice)
+	currentGridPrice := spm.findNearestGridPrice(lastPrice)
 	logger.Info("当前网格价格: %s", formatPrice(currentGridPrice, spm.priceDecimals))
 
 	// 计算开仓窗口范围；多头在当前价下方，空头在当前价上方。

@@ -184,7 +184,6 @@ Use o modo neutro quando desejar o comportamento da grade no lado longo e no lad
 | `price_interval` | Distância entre níveis de grelha | Intervalo menor significa mais negociações e mais taxas. |
 | `order_quantity` | Montante utilizado por encomenda | Quantidade maior aumenta o giro e o rebaixamento. Confirme se a IU está mostrando o valor da cotação ou a quantidade base para sua bolsa e tipo de mercado. |
 | `min_order_value` | Pedido mínimo nocional | Deve satisfazer os mínimos de troca. |
-| `trading.adopt_existing_position` | Se o bot deve adotar uma posição de troca existente como inventário de bot | O padrão é `false` para que uma posição base manual do Bitget não seja tratada como inventário de grade e fechada acidentalmente por ordens de saída de grade. Ative somente quando desejar deliberadamente que o bot gerencie uma posição existente. |
 | `risk_control.enabled` | Proteção contra anomalias de mercado | Mantenha-o ativado, a menos que você saiba exatamente por que não. |
 
 ##Console Web
@@ -263,7 +262,6 @@ Verifique primeiro:
 - Você entende quanta posição a grade pode acumular.
 - Você tem um plano para mercados unidirecionais.
 - O firewall do servidor expõe a porta da web somente quando pretendido.
-- Para futuros Bitget, teste primeiro com tamanho pequeno e confirme se a direção do bot, modo de posição e `trading.adopt_existing_position` correspondem ao que você deseja.
 
 
 ## Isenção de responsabilidade

@@ -2,15 +2,25 @@ package safety
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"net/url"
 	"nexus-trade-bot/config"
 	"nexus-trade-bot/exchange"
 	"nexus-trade-bot/logger"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+const staleKlineThreshold = 2 * time.Minute
+
+type klineProvider interface {
+	GetHistoricalKlines(ctx context.Context, symbol string, interval string, limit int) ([]*exchange.Candle, error)
+}
 
 // SymbolData 单个币种的K线数据缓存
 type SymbolData struct {
@@ -24,10 +34,71 @@ func (s *SymbolData) snapshotCandles() []*exchange.Candle {
 	return append([]*exchange.Candle(nil), s.candles...)
 }
 
+func normalizeKlineCache(candles []*exchange.Candle, averageWindow int) []*exchange.Candle {
+	if len(candles) == 0 {
+		return candles
+	}
+
+	deduped := make([]*exchange.Candle, 0, len(candles))
+	seen := make(map[int64]struct{}, len(candles))
+	for i := len(candles) - 1; i >= 0; i-- {
+		c := candles[i]
+		if c == nil {
+			continue
+		}
+		if _, exists := seen[c.Timestamp]; exists {
+			continue
+		}
+		seen[c.Timestamp] = struct{}{}
+		deduped = append(deduped, c)
+	}
+	for i, j := 0, len(deduped)-1; i < j; i, j = i+1, j-1 {
+		deduped[i], deduped[j] = deduped[j], deduped[i]
+	}
+
+	maxCount := averageWindow + 2
+	if maxCount < 2 {
+		maxCount = 2
+	}
+	if len(deduped) > maxCount {
+		deduped = deduped[len(deduped)-maxCount:]
+	}
+	return deduped
+}
+
+func candleTime(c *exchange.Candle) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	if c.Timestamp > 10000000000 {
+		return time.Unix(c.Timestamp/1000, 0)
+	}
+	return time.Unix(c.Timestamp, 0)
+}
+
+func latestCandleAge(candles []*exchange.Candle, inRiskControl bool) (time.Duration, bool) {
+	for i := len(candles) - 1; i >= 0; i-- {
+		c := candles[i]
+		if c == nil {
+			continue
+		}
+		if inRiskControl && !c.IsClosed {
+			continue
+		}
+		t := candleTime(c)
+		if t.IsZero() {
+			continue
+		}
+		return time.Since(t), true
+	}
+	return 0, false
+}
+
 // RiskMonitor 主动安全风控监视器
 type RiskMonitor struct {
 	cfg           *config.Config
 	exchange      exchange.IExchange
+	backupKlines  klineProvider
 	symbolDataMap map[string]*SymbolData
 	mu            sync.RWMutex
 	triggered     bool
@@ -46,6 +117,7 @@ func NewRiskMonitor(cfg *config.Config, ex exchange.IExchange) *RiskMonitor {
 	return &RiskMonitor{
 		cfg:           cfg,
 		exchange:      ex,
+		backupKlines:  newBinancePublicKlineProvider(),
 		symbolDataMap: symbolDataMap,
 	}
 }
@@ -65,22 +137,22 @@ func (r *RiskMonitor) Start(ctx context.Context) {
 	// 预加载历史K线数据
 	logger.Info("📊 正在加载历史K线数据...")
 	for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
-		candles, err := r.exchange.GetHistoricalKlines(ctx, symbol, r.cfg.RiskControl.Interval, r.cfg.RiskControl.AverageWindow+1)
+		candles, source, err := r.fetchHistoricalKlines(ctx, symbol, r.cfg.RiskControl.AverageWindow+1)
 		if err != nil {
 			logger.Warn("⚠️ 加载 %s 历史K线失败: %v", symbol, err)
 			continue
 		}
 
 		if len(candles) > 0 {
-			r.mu.Lock()
+			r.mu.RLock()
 			symbolData, exists := r.symbolDataMap[symbol]
-			r.mu.Unlock()
+			r.mu.RUnlock()
 
 			if exists {
 				symbolData.mu.Lock()
-				symbolData.candles = candles
+				symbolData.candles = normalizeKlineCache(candles, r.cfg.RiskControl.AverageWindow)
 				symbolData.mu.Unlock()
-				logger.Info("✅ %s: 已加载 %d 根历史K线", symbol, len(candles))
+				logger.Info("✅ %s: 已通过%s加载 %d 根历史K线", symbol, source, len(candles))
 			}
 		}
 	}
@@ -94,7 +166,8 @@ func (r *RiskMonitor) Start(ctx context.Context) {
 		r.lastMsg = msg
 		r.mu.Unlock()
 		logger.Error("❌ %s", msg)
-		return
+	} else {
+		logger.Info("✅ 主交易所K线流已启动")
 	}
 
 	// 启动定期报告协程（每60秒）
@@ -174,6 +247,86 @@ func (r *RiskMonitor) onCandleUpdate(candle *exchange.Candle) {
 
 	// 实时检测（使用最新数据，包括未完结的K线）
 	r.checkMarket()
+}
+
+func (r *RiskMonitor) fetchHistoricalKlines(ctx context.Context, symbol string, limit int) ([]*exchange.Candle, string, error) {
+	if r.exchange != nil {
+		candles, err := r.exchange.GetHistoricalKlines(ctx, symbol, r.cfg.RiskControl.Interval, limit)
+		if err == nil && len(candles) > 0 {
+			return candles, "主交易所REST", nil
+		}
+		if err != nil {
+			logger.Warn("⚠️ [K线补数] 主交易所REST获取 %s 失败: %v", symbol, err)
+		}
+	}
+
+	if r.backupKlines == nil {
+		return nil, "", fmt.Errorf("主交易所REST无数据且未配置备用K线源")
+	}
+	candles, err := r.backupKlines.GetHistoricalKlines(ctx, symbol, r.cfg.RiskControl.Interval, limit)
+	if err != nil {
+		return nil, "", fmt.Errorf("备用Binance公共K线获取失败: %w", err)
+	}
+	if len(candles) == 0 {
+		return nil, "", fmt.Errorf("备用Binance公共K线返回空数据")
+	}
+	return candles, "Binance公共REST", nil
+}
+
+func (r *RiskMonitor) refreshStaleKlines(ctx context.Context, inRiskControl bool) bool {
+	refreshed := false
+	for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
+		r.mu.RLock()
+		symbolData, exists := r.symbolDataMap[symbol]
+		r.mu.RUnlock()
+		if !exists {
+			continue
+		}
+
+		candles := symbolData.snapshotCandles()
+		age, ok := latestCandleAge(candles, inRiskControl)
+		if ok && age <= staleKlineThreshold {
+			continue
+		}
+
+		reason := "无可用K线"
+		if ok {
+			reason = fmt.Sprintf("最新K线%.0f秒未更新", age.Seconds())
+		}
+		limit := r.cfg.RiskControl.AverageWindow + 2
+		newCandles, source, err := r.fetchHistoricalKlines(ctx, symbol, limit)
+		if err != nil {
+			logger.Warn("⚠️ [K线补数] %s %s，补数失败: %v", symbol, reason, err)
+			continue
+		}
+
+		symbolData.mu.Lock()
+		symbolData.candles = normalizeKlineCache(append(symbolData.candles, newCandles...), r.cfg.RiskControl.AverageWindow)
+		symbolData.mu.Unlock()
+		refreshed = true
+		logger.Info("✅ [K线补数] %s %s，已通过%s刷新 %d 根K线", symbol, reason, source, len(newCandles))
+	}
+
+	if refreshed {
+		r.checkMarket()
+	}
+	return refreshed
+}
+
+func (r *RiskMonitor) hasStaleKlines(inRiskControl bool) bool {
+	for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
+		r.mu.RLock()
+		symbolData, exists := r.symbolDataMap[symbol]
+		r.mu.RUnlock()
+		if !exists {
+			return true
+		}
+		age, ok := latestCandleAge(symbolData.snapshotCandles(), inRiskControl)
+		if !ok || age > staleKlineThreshold {
+			return true
+		}
+	}
+	return false
 }
 
 // checkMarket 执行市场检查（实时，无日志）
@@ -459,19 +612,43 @@ func (r *RiskMonitor) reportLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runProtected("风控状态报告", r.reportStatus)
+			runProtected("风控状态报告", func() {
+				r.reportStatus(ctx)
+			})
 		}
 	}
 }
 
 // reportStatus 报告状态
-func (r *RiskMonitor) reportStatus() {
+func (r *RiskMonitor) reportStatus(ctx context.Context) {
 	r.mu.RLock()
 	triggered := r.triggered
 	r.mu.RUnlock()
 
+	r.refreshStaleKlines(ctx, triggered)
+	r.mu.RLock()
+	triggered = r.triggered
+	r.mu.RUnlock()
+	staleData := r.hasStaleKlines(triggered)
+	if staleData {
+		r.mu.Lock()
+		r.triggered = true
+		r.lastMsg = "K线数据超过2分钟未更新，风控保持保护状态"
+		triggered = true
+		r.mu.Unlock()
+	} else {
+		r.checkMarket()
+		r.mu.RLock()
+		triggered = r.triggered
+		r.mu.RUnlock()
+	}
+
 	if triggered {
-		logger.Warn("⚠️ [风控监测] 当前市场交易出现异动,触发主动安全风控,停止交易!")
+		if staleData {
+			logger.Warn("⚠️ [风控监测] K线数据过期且补数失败，保持风控保护，停止交易!")
+		} else {
+			logger.Warn("⚠️ [风控监测] 当前市场交易出现异动,触发主动安全风控,停止交易!")
+		}
 	} else {
 		logger.Info("🛡️ [风控监测] 市场环境正常。")
 	}
@@ -558,7 +735,7 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 		volRatio := currentVol / avgVol
 
 		// 判断各项指标状态
-		priceAboveMA := currentPrice > avgPrice
+		priceRecovered := r.priceRecovered(currentPrice, avgPrice)
 		volNormal := currentVol < avgVol*r.cfg.RiskControl.VolumeMultiplier
 
 		// 根据是否在风控中，显示不同的状态信息
@@ -568,17 +745,7 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 		}
 
 		// 计算K线时间距离现在的时间差（帮助调试）
-		// 自动判断时间戳单位：毫秒(>10000000000) 或 秒
-		var klineTime time.Time
-		if currentCandle.Timestamp > 10000000000 {
-			// 毫秒时间戳（币安、Bitget）
-			klineTime = time.Unix(currentCandle.Timestamp/1000, 0)
-		} else {
-			// 秒级时间戳（Gate.io）
-			klineTime = time.Unix(currentCandle.Timestamp, 0)
-		}
-
-		klineAge := time.Since(klineTime)
+		klineAge := time.Since(candleTime(currentCandle))
 		klineAgeStr := fmt.Sprintf("%.0f秒前", klineAge.Seconds())
 		if klineAge > time.Minute {
 			klineAgeStr = fmt.Sprintf("%.0f分前", klineAge.Minutes())
@@ -587,16 +754,16 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 		var statusMsg string
 		if inRiskControl {
 			// 风控中，显示详细的异常/恢复状态
-			if priceAboveMA && volNormal {
-				statusMsg = fmt.Sprintf("正常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 现价在均价上方已恢复, 当前量=%.0f, 均量=%.0f (倍数×%.2f) 成交量已恢复",
-					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, currentVol, avgVol, volRatio)
+			if priceRecovered && volNormal {
+				statusMsg = fmt.Sprintf("正常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), %s, 当前量=%.0f, 均量=%.0f (倍数×%.2f) 成交量已恢复",
+					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, r.recoveryPriceDescription(), currentVol, avgVol, volRatio)
 			} else {
 				// 异常状态，说明未恢复的原因
 				var priceStatus, volStatus string
-				if priceAboveMA {
-					priceStatus = "现价在均价上方已恢复"
+				if priceRecovered {
+					priceStatus = r.recoveryPriceDescription()
 				} else {
-					priceStatus = "现价在均价下方未恢复"
+					priceStatus = r.unrecoveredPriceReason(currentPrice, avgPrice)
 				}
 				if volNormal {
 					volStatus = "成交量已恢复"
@@ -608,6 +775,7 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 			}
 		} else {
 			// 非风控状态，判断异常需要同时满足两个条件：价格低于均价 且 成交量超过配置倍数
+			priceAboveMA := currentPrice > avgPrice
 			isPriceBelow := !priceAboveMA
 			isVolHigh := !volNormal
 
@@ -625,7 +793,7 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 		logger.Info("  %s %s", symbol, statusMsg)
 
 		// 检查数据是否过期（超过2分钟）
-		if klineAge > 2*time.Minute {
+		if klineAge > staleKlineThreshold {
 			hasStaleData = true
 		}
 	}
@@ -640,5 +808,121 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 func (r *RiskMonitor) Stop() {
 	if r.exchange != nil {
 		r.exchange.StopKlineStream()
+	}
+}
+
+type binancePublicKlineProvider struct {
+	client *http.Client
+}
+
+func newBinancePublicKlineProvider() *binancePublicKlineProvider {
+	return &binancePublicKlineProvider{
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func (p *binancePublicKlineProvider) GetHistoricalKlines(ctx context.Context, symbol string, interval string, limit int) ([]*exchange.Candle, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	values := url.Values{}
+	values.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
+	values.Set("interval", interval)
+	values.Set("limit", strconv.Itoa(limit))
+
+	endpoints := []string{
+		"https://fapi.binance.com/fapi/v1/klines",
+		"https://api.binance.com/api/v3/klines",
+	}
+
+	var lastErr error
+	for _, endpoint := range endpoints {
+		candles, err := p.fetch(ctx, endpoint, values)
+		if err == nil && len(candles) > 0 {
+			return candles, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("Binance公共K线返回空数据")
+}
+
+func (p *binancePublicKlineProvider) fetch(ctx context.Context, endpoint string, values url.Values) ([]*exchange.Candle, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s HTTP %d", endpoint, resp.StatusCode)
+	}
+
+	var raw [][]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("解析Binance公共K线失败: %w", err)
+	}
+
+	symbol := strings.ToUpper(values.Get("symbol"))
+	candles := make([]*exchange.Candle, 0, len(raw))
+	for _, row := range raw {
+		if len(row) < 6 {
+			continue
+		}
+		timestamp, ok := parseKlineInt(row[0])
+		if !ok {
+			continue
+		}
+		open, okOpen := parseKlineFloat(row[1])
+		high, okHigh := parseKlineFloat(row[2])
+		low, okLow := parseKlineFloat(row[3])
+		closePrice, okClose := parseKlineFloat(row[4])
+		volume, okVol := parseKlineFloat(row[5])
+		if !okOpen || !okHigh || !okLow || !okClose || !okVol {
+			continue
+		}
+		candles = append(candles, &exchange.Candle{
+			Symbol:    symbol,
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     closePrice,
+			Volume:    volume,
+			Timestamp: timestamp,
+			IsClosed:  true,
+		})
+	}
+	return candles, nil
+}
+
+func parseKlineFloat(v interface{}) (float64, bool) {
+	switch x := v.(type) {
+	case string:
+		n, err := strconv.ParseFloat(x, 64)
+		return n, err == nil
+	case float64:
+		return x, true
+	default:
+		return 0, false
+	}
+}
+
+func parseKlineInt(v interface{}) (int64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int64(x), true
+	case string:
+		n, err := strconv.ParseInt(x, 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
 	}
 }

@@ -33,7 +33,6 @@ type Config struct {
 		MarginLockDurationSec int     `yaml:"margin_lock_duration_seconds" json:"margin_lock_duration_seconds"` // 保证金锁定时间（秒，默认10）
 		PositionSafetyCheck   int     `yaml:"position_safety_check" json:"position_safety_check"`               // 持仓安全性检查（默认100，最少能向下持有多少仓）
 		OrderTag              string  `yaml:"order_tag,omitempty" json:"order_tag,omitempty"`                   // Web 控制台机器人订单归属标签
-		AdoptExistingPosition bool    `yaml:"adopt_existing_position" json:"adopt_existing_position"`           // 是否接管启动/对账时交易所已有持仓；默认false，避免误平手动底仓
 		// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
 	} `yaml:"trading" json:"trading"`
 
