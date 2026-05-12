@@ -1159,7 +1159,8 @@ func (s *consoleServer) startRobot(id string) error {
 		go s.monitorAdoptedRobot(id, pid)
 		return nil
 	}
-	if pid, ok := findWorkerPIDForConfig(robot.ConfigPath); ok {
+	if pids := findWorkerPIDsForConfig(robot.ConfigPath); len(pids) > 0 {
+		pid := pids[0]
 		s.processes[id] = &robotProcess{
 			Status:        "running",
 			PID:           pid,
@@ -1436,6 +1437,7 @@ func (s *consoleServer) restartRobotForUpdate(id string) error {
 func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 	s.mu.Lock()
 	proc, ok := s.processes[id]
+	var extraPIDs []int
 	if !ok || proc == nil {
 		if pid, alive := s.runningPIDFromFile(id); alive {
 			proc = &robotProcess{
@@ -1448,7 +1450,10 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 			}
 			s.processes[id] = proc
 		} else if robot, exists := s.robots[id]; exists && robot != nil {
-			if pid, found := findWorkerPIDForConfig(robot.ConfigPath); found {
+			pids := findWorkerPIDsForConfig(robot.ConfigPath)
+			if len(pids) > 0 {
+				pid := pids[0]
+				extraPIDs = append(extraPIDs, pids[1:]...)
 				proc = &robotProcess{
 					Status:        "running",
 					PID:           pid,
@@ -1468,6 +1473,9 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 			return fmt.Errorf("机器人未运行")
 		}
 	}
+	if robot, exists := s.robots[id]; exists && robot != nil {
+		extraPIDs = appendMissingPIDs(extraPIDs, findWorkerPIDsForConfig(robot.ConfigPath), proc.PID)
+	}
 	proc.DesiredStatus = finalStatus
 	if proc.Status != "running" {
 		if pid, alive := s.runningPIDFromFile(id); alive {
@@ -1475,7 +1483,10 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 			proc.PID = pid
 			proc.ExitReason = "正在停止遗留 worker 进程"
 		} else if robot, exists := s.robots[id]; exists && robot != nil {
-			if pid, found := findWorkerPIDForConfig(robot.ConfigPath); found {
+			pids := findWorkerPIDsForConfig(robot.ConfigPath)
+			if len(pids) > 0 {
+				pid := pids[0]
+				extraPIDs = appendMissingPIDs(extraPIDs, pids[1:], pid)
 				proc.Status = "running"
 				proc.PID = pid
 				proc.ExitReason = "正在停止按配置路径发现的遗留 worker 进程"
@@ -1522,6 +1533,7 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 		return nil
 	}
 	s.mu.Unlock()
+	stopExtraWorkerPIDs(extraPIDs)
 	if err := signalProcessGroup(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
@@ -1597,12 +1609,16 @@ func (s *consoleServer) recoverRobotProcesses() {
 			if robot == nil {
 				continue
 			}
-			var found bool
-			pid, found = findWorkerPIDForConfig(robot.ConfigPath)
-			if !found {
+			pids := findWorkerPIDsForConfig(robot.ConfigPath)
+			if len(pids) == 0 {
 				continue
 			}
+			pid = pids[0]
 			_ = s.writeRobotPID(id, pid)
+			if len(pids) > 1 {
+				logger.Warn("⚠️ [进程接管] %s 发现 %d 个重复 worker，将保留首个并停止其余进程: %v", id, len(pids), pids[1:])
+				go stopExtraWorkerPIDs(pids[1:])
+			}
 		}
 		s.processes[id] = &robotProcess{
 			Status:        "running",
@@ -1668,10 +1684,10 @@ func signalProcessGroup(pid int, sig syscall.Signal) error {
 	return nil
 }
 
-func findWorkerPIDForConfig(configPath string) (int, bool) {
+func findWorkerPIDsForConfig(configPath string) []int {
 	configPath = strings.TrimSpace(configPath)
 	if configPath == "" {
-		return 0, false
+		return nil
 	}
 	absPath, err := filepath.Abs(configPath)
 	if err == nil {
@@ -1679,8 +1695,9 @@ func findWorkerPIDForConfig(configPath string) (int, bool) {
 	}
 	out, err := exec.Command("ps", "ax", "-o", "pid=,command=").Output()
 	if err != nil {
-		return 0, false
+		return nil
 	}
+	var pids []int
 	lines := strings.Split(string(out), "\n")
 	currentPID := os.Getpid()
 	for _, line := range lines {
@@ -1701,10 +1718,65 @@ func findWorkerPIDForConfig(configPath string) (int, bool) {
 			continue
 		}
 		if processAlive(pid) {
-			return pid, true
+			pids = append(pids, pid)
 		}
 	}
-	return 0, false
+	sort.Ints(pids)
+	return pids
+}
+
+func appendMissingPIDs(dst []int, src []int, exclude ...int) []int {
+	seen := make(map[int]struct{}, len(dst)+len(exclude))
+	for _, pid := range dst {
+		if pid > 0 {
+			seen[pid] = struct{}{}
+		}
+	}
+	for _, pid := range exclude {
+		if pid > 0 {
+			seen[pid] = struct{}{}
+		}
+	}
+	for _, pid := range src {
+		if pid <= 0 {
+			continue
+		}
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		dst = append(dst, pid)
+		seen[pid] = struct{}{}
+	}
+	return dst
+}
+
+func stopExtraWorkerPIDs(pids []int) {
+	pids = appendMissingPIDs(nil, pids)
+	if len(pids) == 0 {
+		return
+	}
+	for _, pid := range pids {
+		_ = signalProcessGroup(pid, syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		allStopped := true
+		for _, pid := range pids {
+			if processAlive(pid) {
+				allStopped = false
+				break
+			}
+		}
+		if allStopped {
+			return
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	for _, pid := range pids {
+		if processAlive(pid) {
+			_ = signalProcessGroup(pid, syscall.SIGKILL)
+		}
+	}
 }
 
 func (s *consoleServer) loadRobots() error {
