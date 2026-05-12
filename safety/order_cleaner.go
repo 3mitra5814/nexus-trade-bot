@@ -166,11 +166,11 @@ func (oc *OrderCleaner) CleanupOrders() {
 		batchSize = 10
 	}
 
-	// 🔥 核心策略：超过阈值才清理，不提前
-	// 清理时优先清理数量多的一方（买单或卖单）
-	if totalOrders > threshold {
+	// 🔥 核心策略：达到阈值就清理少量远端开仓单，给下一轮补单留出空间。
+	// 平仓单只计入阈值但不主动撤销，避免有仓位时失去保护。
+	if totalOrders >= threshold {
 		canceledCount := 0
-		cleanupBudget := totalOrders - threshold
+		cleanupBudget := totalOrders - threshold + 1
 		if cleanupBudget > batchSize {
 			cleanupBudget = batchSize
 		}

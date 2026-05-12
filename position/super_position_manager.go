@@ -423,7 +423,7 @@ func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 
 // AdjustOrders 调整订单（交易入口）
 func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
-	return spm.AdjustOrdersWithRebalance(currentPrice, true)
+	return spm.AdjustOrdersWithRebalance(currentPrice, false)
 }
 
 func (spm *SuperPositionManager) AdjustOrdersWithRebalance(currentPrice float64, allowWindowRebalance bool) error {

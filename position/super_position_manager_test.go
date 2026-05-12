@@ -1270,7 +1270,7 @@ func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries
 	}
 }
 
-func TestDirectionalPriceGridShiftRebalancesFarEntries(t *testing.T) {
+func TestDirectionalPriceGridShiftBackfillsWithoutCancelingEntries(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -1278,7 +1278,7 @@ func TestDirectionalPriceGridShiftRebalancesFarEntries(t *testing.T) {
 	cfg.Trading.OrderQuantity = 30
 	cfg.Trading.BuyWindowSize = 3
 	cfg.Trading.SellWindowSize = 3
-	cfg.Trading.OrderCleanupThreshold = 3
+	cfg.Trading.OrderCleanupThreshold = 6
 	cfg.Trading.CleanupBatchSize = 10
 
 	executor := &captureExecutor{}
@@ -1289,11 +1289,11 @@ func TestDirectionalPriceGridShiftRebalancesFarEntries(t *testing.T) {
 	if err := spm.AdjustOrders(100); err != nil {
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
-	if err := spm.AdjustOrdersWithRebalance(95, true); err != nil {
+	if err := spm.AdjustOrders(95); err != nil {
 		t.Fatalf("price shift AdjustOrders() error = %v", err)
 	}
-	if len(executor.canceled) == 0 {
-		t.Fatalf("expected far short entries to be canceled on price-grid shift")
+	if len(executor.canceled) != 0 {
+		t.Fatalf("price-grid shift should backfill like opensqt and leave cleanup to order cleaner, got cancels=%v", executor.canceled)
 	}
 
 	has96 := false
