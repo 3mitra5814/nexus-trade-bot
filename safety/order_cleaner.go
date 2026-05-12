@@ -166,10 +166,14 @@ func (oc *OrderCleaner) CleanupOrders() {
 		batchSize = 10
 	}
 
-	// 🔥 核心策略：达到阈值才清理，不提前
+	// 🔥 核心策略：超过阈值才清理，不提前
 	// 清理时优先清理数量多的一方（买单或卖单）
-	if totalOrders >= threshold {
+	if totalOrders > threshold {
 		canceledCount := 0
+		cleanupBudget := totalOrders - threshold
+		if cleanupBudget > batchSize {
+			cleanupBudget = batchSize
+		}
 
 		logger.Info("🧹 [订单清理] 当前订单数: %d (多头开仓单: %d, 空头开仓单: %d), 阈值: %d, 批次大小: %d",
 			totalOrders, len(longEntryOrders), len(shortEntryOrders), threshold, batchSize)
@@ -178,14 +182,14 @@ func (oc *OrderCleaner) CleanupOrders() {
 		shortOrdersToCancel := 0
 
 		if len(longEntryOrders) > len(shortEntryOrders) {
-			longOrdersToCancel = batchSize
+			longOrdersToCancel = cleanupBudget
 			logger.Info("📊 [清理策略] 多头开仓单较多，清理 %d 个多头开仓单", longOrdersToCancel)
 		} else if len(shortEntryOrders) > len(longEntryOrders) {
-			shortOrdersToCancel = batchSize
+			shortOrdersToCancel = cleanupBudget
 			logger.Info("📊 [清理策略] 空头开仓单较多，清理 %d 个空头开仓单", shortOrdersToCancel)
 		} else {
-			longOrdersToCancel = batchSize / 2
-			shortOrdersToCancel = batchSize - longOrdersToCancel
+			longOrdersToCancel = cleanupBudget / 2
+			shortOrdersToCancel = cleanupBudget - longOrdersToCancel
 			logger.Info("📊 [清理策略] 多空开仓单数量相等，平均清理 (多头: %d, 空头: %d)", longOrdersToCancel, shortOrdersToCancel)
 		}
 

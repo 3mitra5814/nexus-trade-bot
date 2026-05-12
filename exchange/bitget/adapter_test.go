@@ -67,3 +67,27 @@ func TestParseBitgetBatchCancelFailuresAcceptsEmptyFailureList(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
+
+func TestBitgetHedgeReduceOnlyKeepsCloseSide(t *testing.T) {
+	tests := []struct {
+		name      string
+		side      Side
+		reduce    bool
+		wantSide  string
+		wantTrade string
+	}{
+		{name: "open long", side: SideBuy, wantSide: "buy", wantTrade: "open"},
+		{name: "open short", side: SideSell, wantSide: "sell", wantTrade: "open"},
+		{name: "close long", side: SideSell, reduce: true, wantSide: "sell", wantTrade: "close"},
+		{name: "close short", side: SideBuy, reduce: true, wantSide: "buy", wantTrade: "close"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotSide, gotTrade := bitgetOrderSideAndTradeSide("hedge_mode", tt.side, tt.reduce)
+			if gotSide != tt.wantSide || gotTrade != tt.wantTrade {
+				t.Fatalf("got side=%s tradeSide=%s, want side=%s tradeSide=%s",
+					gotSide, gotTrade, tt.wantSide, tt.wantTrade)
+			}
+		})
+	}
+}

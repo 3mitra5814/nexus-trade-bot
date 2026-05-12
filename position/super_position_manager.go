@@ -1591,17 +1591,10 @@ func (spm *SuperPositionManager) pruneEmptyFarSlots(currentGridPrice float64, re
 	}
 }
 
-// findNearestGridPrice 找到最近的网格价格
-// 根据当前价格动态计算最近的网格对齐价格
+// findNearestGridPrice 返回当前实时价格本身。
+// 网格必须始终围绕最新价格铺开，不能继续沿用启动锚点，否则价格漂移后中间会出现断层。
 func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) float64 {
-	// 计算当前价格相对于锚点的偏移量
-	offset := currentPrice - spm.anchorPrice
-	// 计算离当前价格最近的网格间隔数（四舍五入）
-	intervals := math.Round(offset / spm.config.Trading.PriceInterval)
-	// 计算最近的网格价格
-	gridPrice := spm.anchorPrice + intervals*spm.config.Trading.PriceInterval
-	// 使用检测到的价格精度进行舍入
-	return roundPrice(gridPrice, spm.priceDecimals)
+	return roundPrice(currentPrice, spm.priceDecimals)
 }
 
 // calculateSlotPrices 计算槽位价格列表（统一的网格计算方法）
@@ -1645,12 +1638,12 @@ func (spm *SuperPositionManager) calculateEntrySlotPrices(gridPrice, currentPric
 	}
 	direction := spm.entrySlotDirection(bookSide)
 	maxAttempts := count*4 + 20
-	for i := 0; len(prices) < count && i < maxAttempts; i++ {
-		price := gridPrice
+	for i := 1; len(prices) < count && i <= maxAttempts; i++ {
+		price := currentPrice
 		if direction == "down" {
-			price = gridPrice - float64(i)*priceInterval
+			price = currentPrice - float64(i)*priceInterval
 		} else {
-			price = gridPrice + float64(i)*priceInterval
+			price = currentPrice + float64(i)*priceInterval
 		}
 		price = roundPrice(price, spm.priceDecimals)
 		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
@@ -1686,12 +1679,12 @@ func (spm *SuperPositionManager) calculateExitSlotPrices(gridPrice, currentPrice
 		direction = "down"
 	}
 	maxAttempts := count*4 + 20
-	for i := 0; len(prices) < count && i < maxAttempts; i++ {
-		price := gridPrice
+	for i := 1; len(prices) < count && i <= maxAttempts; i++ {
+		price := currentPrice
 		if direction == "down" {
-			price = gridPrice - float64(i)*priceInterval
+			price = currentPrice - float64(i)*priceInterval
 		} else {
-			price = gridPrice + float64(i)*priceInterval
+			price = currentPrice + float64(i)*priceInterval
 		}
 		price = roundPrice(price, spm.priceDecimals)
 		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
@@ -1815,22 +1808,18 @@ func (spm *SuperPositionManager) makerSafeExitPrice(targetPrice, currentPrice fl
 
 func (spm *SuperPositionManager) firstGridAbove(currentPrice, safetyBuffer float64) float64 {
 	priceInterval := spm.config.Trading.PriceInterval
-	intervals := math.Floor((currentPrice-spm.anchorPrice)/priceInterval) + 1
-	price := roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+	price := roundPrice(currentPrice+priceInterval, spm.priceDecimals)
 	for price <= currentPrice+safetyBuffer {
-		intervals++
-		price = roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+		price = roundPrice(price+priceInterval, spm.priceDecimals)
 	}
 	return price
 }
 
 func (spm *SuperPositionManager) firstGridBelow(currentPrice, safetyBuffer float64) float64 {
 	priceInterval := spm.config.Trading.PriceInterval
-	intervals := math.Ceil((currentPrice-spm.anchorPrice)/priceInterval) - 1
-	price := roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+	price := roundPrice(currentPrice-priceInterval, spm.priceDecimals)
 	for price >= currentPrice-safetyBuffer {
-		intervals--
-		price = roundPrice(spm.anchorPrice+intervals*priceInterval, spm.priceDecimals)
+		price = roundPrice(price-priceInterval, spm.priceDecimals)
 	}
 	return price
 }

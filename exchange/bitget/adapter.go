@@ -311,28 +311,13 @@ func (b *BitgetAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Ord
 // placeOrderViaREST 通过 REST API 下单
 func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest) (*Order, error) {
 	// 确定 side 和 tradeSide
-	side := strings.ToLower(string(req.Side))
-	var tradeSide string
+	side, tradeSide := bitgetOrderSideAndTradeSide(b.posMode, req.Side, req.ReduceOnly)
 
 	// 🔥 Bitget 双向持仓的特殊逻辑：
 	// 开多：side=buy, tradeSide=open
-	// 平多：side=buy, tradeSide=close （注意！平多也是 buy）
+	// 平多：side=sell, tradeSide=close
 	// 开空：side=sell, tradeSide=open
-	// 平空：side=sell, tradeSide=close
-	if b.posMode == "hedge_mode" {
-		if req.ReduceOnly {
-			// 平仓：保持 side 方向不变，只改 tradeSide
-			// 如果是 SELL（卖出），实际上是要平多仓，需要改为 buy
-			if req.Side == SideSell {
-				side = "buy" // 平多仓必须用 buy
-			} else {
-				side = "sell" // 平空仓必须用 sell
-			}
-			tradeSide = "close"
-		} else {
-			tradeSide = "open"
-		}
-	}
+	// 平空：side=buy, tradeSide=close
 
 	// 🔥 使用合约信息中的精度格式化数量和价格
 	quantityStr := fmt.Sprintf("%.*f", b.volumePlace, req.Quantity)
@@ -426,6 +411,17 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 
 	// 注意：不在这里打印日志，由executor统一打印避免重复
 	return order, nil
+}
+
+func bitgetOrderSideAndTradeSide(posMode string, side Side, reduceOnly bool) (string, string) {
+	apiSide := strings.ToLower(string(side))
+	if posMode != "hedge_mode" {
+		return apiSide, ""
+	}
+	if reduceOnly {
+		return apiSide, "close"
+	}
+	return apiSide, "open"
 }
 
 // BatchPlaceOrders 批量下单

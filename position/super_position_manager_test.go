@@ -515,12 +515,12 @@ func TestDirectionalFuturesStillPlacesFiveOrdersOnBothSides(t *testing.T) {
 			if err := spm.Initialize(2308, "2308.00"); err != nil {
 				t.Fatalf("Initialize() error = %v", err)
 			}
-			if err := spm.AdjustOrders(2308); err != nil {
+			if err := spm.AdjustOrders(2308.50); err != nil {
 				t.Fatalf("AdjustOrders() error = %v", err)
 			}
 
-			buys := map[float64]bool{2307: false, 2306: false, 2305: false, 2304: false, 2303: false}
-			sells := map[float64]bool{2309: false, 2310: false, 2311: false, 2312: false, 2313: false}
+			buys := map[float64]bool{2307.50: false, 2306.50: false, 2305.50: false, 2304.50: false, 2303.50: false}
+			sells := map[float64]bool{2309.50: false, 2310.50: false, 2311.50: false, 2312.50: false, 2313.50: false}
 			for _, order := range executor.orders {
 				if order.ReduceOnly {
 					continue
@@ -570,12 +570,12 @@ func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
 	if err := spm.AdjustOrders(2308); err != nil {
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
-	if err := spm.AdjustOrders(2309); err != nil {
+	if err := spm.AdjustOrders(2309.25); err != nil {
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
 
-	wantBuys := map[float64]bool{2308: false, 2307: false, 2306: false, 2305: false, 2304: false}
-	wantSells := map[float64]bool{2310: false, 2311: false, 2312: false, 2313: false, 2314: false}
+	wantBuys := map[float64]bool{2308.25: false, 2307.25: false, 2306.25: false, 2305.25: false, 2304.25: false}
+	wantSells := map[float64]bool{2310.25: false, 2311.25: false, 2312.25: false, 2313.25: false, 2314.25: false}
 	for _, order := range executor.orders {
 		if order.ReduceOnly {
 			continue
@@ -641,7 +641,7 @@ func TestAdjustOrdersBackfillsGhostSellSlots(t *testing.T) {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
-	wantSells := map[float64]bool{2286.19: false, 2287.19: false, 2288.19: false, 2289.19: false, 2290.19: false}
+	wantSells := map[float64]bool{2286.79: false, 2287.79: false, 2288.79: false, 2289.79: false, 2290.79: false}
 	for _, order := range executor.orders {
 		if order.ReduceOnly || order.Side != "SELL" {
 			continue
@@ -654,6 +654,51 @@ func TestAdjustOrdersBackfillsGhostSellSlots(t *testing.T) {
 		if !seen {
 			t.Fatalf("expected ghost SELL slot to be refilled at %.2f, orders=%v", price, executor.orders)
 		}
+	}
+}
+
+func TestRealtimeGridUsesLatestPriceWithoutAnchorGap(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2282.22, "2282.22"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2282.86); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	var bestBuy, bestSell float64
+	for _, order := range executor.orders {
+		if order.ReduceOnly {
+			continue
+		}
+		switch order.Side {
+		case "BUY":
+			if bestBuy == 0 || order.Price > bestBuy {
+				bestBuy = order.Price
+			}
+		case "SELL":
+			if bestSell == 0 || order.Price < bestSell {
+				bestSell = order.Price
+			}
+		}
+	}
+	if bestBuy != 2281.86 || bestSell != 2283.86 {
+		t.Fatalf("expected closest orders to hug latest price at BUY 2281.86 / SELL 2283.86, got BUY %.2f SELL %.2f orders=%v",
+			bestBuy, bestSell, executor.orders)
+	}
+	if bestSell-bestBuy != 2 {
+		t.Fatalf("expected first BUY/SELL gap to be exactly 2 intervals, got %.2f", bestSell-bestBuy)
 	}
 }
 
@@ -676,7 +721,7 @@ func TestAdjustOrdersBackfillsEntryWindowAfterSkippingMarketableGrid(t *testing.
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
-	want := map[float64]bool{99: false, 98: false, 97: false}
+	want := map[float64]bool{98.95: false, 97.95: false, 96.95: false}
 	for _, order := range executor.orders {
 		if order.Side == "BUY" && !order.ReduceOnly {
 			if _, ok := want[order.Price]; ok {

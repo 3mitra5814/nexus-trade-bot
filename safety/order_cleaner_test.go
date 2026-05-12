@@ -81,3 +81,44 @@ func TestCleanupOrdersDoesNotCancelExitOrders(t *testing.T) {
 		t.Fatalf("expected only the long entry order to be canceled, got %v", executor.canceled)
 	}
 }
+
+func TestCleanupOrdersDoesNotCancelWhenAtThreshold(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	slots := make([]cleanerSlot, 0, 10)
+	for i := 0; i < 5; i++ {
+		slots = append(slots, cleanerSlot{Price: 100 - float64(i), BookSide: "LONG", OrderID: int64(i + 1), OrderSide: "BUY", OrderStatus: "PLACED"})
+	}
+	for i := 0; i < 5; i++ {
+		slots = append(slots, cleanerSlot{Price: 101 + float64(i), BookSide: "SHORT", OrderID: int64(i + 6), OrderSide: "SELL", OrderStatus: "PLACED"})
+	}
+	pm := &fakeCleanerPM{slots: slots}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	if len(executor.canceled) != 0 {
+		t.Fatalf("expected no cleanup when total orders equal threshold, got %v", executor.canceled)
+	}
+}
+
+func TestCleanupOrdersCancelsOnlyOrdersAboveThreshold(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	slots := make([]cleanerSlot, 0, 12)
+	for i := 0; i < 12; i++ {
+		slots = append(slots, cleanerSlot{Price: 100 - float64(i), BookSide: "LONG", OrderID: int64(i + 1), OrderSide: "BUY", OrderStatus: "PLACED"})
+	}
+	pm := &fakeCleanerPM{slots: slots}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	if len(executor.canceled) != 2 {
+		t.Fatalf("expected to cancel only the 2 orders above threshold, got %v", executor.canceled)
+	}
+}
