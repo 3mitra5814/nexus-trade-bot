@@ -451,8 +451,8 @@ func runTrader(configPath string) {
 					scheduleAdjust("risk-recovered")
 				}
 
-				// 实时调整订单，不打印价格变化日志（避免日志过多）
-				scheduleAdjust("price")
+				// 价格流只负责风控状态切换。挂单窗口由初始化、成交/撤单订单更新、
+				// 以及风控恢复触发，避免每个价格 tick 都撤单重挂。
 			})
 		}
 	}()

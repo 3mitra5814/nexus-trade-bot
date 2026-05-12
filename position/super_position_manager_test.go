@@ -702,6 +702,42 @@ func TestRealtimeGridUsesLatestPriceWithoutAnchorGap(t *testing.T) {
 	}
 }
 
+func TestAdjustOrdersDoesNotRebalanceOnSubIntervalPriceNoise(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2292.61, "2292.61"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2292.61); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	initialOrderCount := len(executor.orders)
+	if initialOrderCount != 10 {
+		t.Fatalf("expected initial 10 orders, got %d", initialOrderCount)
+	}
+
+	if err := spm.AdjustOrders(2292.84); err != nil {
+		t.Fatalf("second AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("expected no rebalance cancel on sub-interval price noise, got %v", executor.canceled)
+	}
+	if len(executor.orders) != initialOrderCount {
+		t.Fatalf("expected no replacement orders on sub-interval price noise, got %d orders", len(executor.orders))
+	}
+}
+
 func TestAdjustOrdersBackfillsEntryWindowAfterSkippingMarketableGrid(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"

@@ -155,6 +155,8 @@ type SuperPositionManager struct {
 	anchorPrice float64
 	// 最后市场价格（用于打印状态）
 	lastMarketPrice atomic.Value // float64
+	// 当前挂单窗口中心价。小幅价格抖动不移动窗口，避免反复撤单重挂。
+	entryWindowCenter float64
 	// 价格精度（根据锚点价格检测得出的小数位数）
 	priceDecimals int
 	// 数量精度（从交易所获取）
@@ -488,7 +490,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	buyWindowSize := spm.config.Trading.BuyWindowSize
 	sellWindowSize := spm.config.Trading.SellWindowSize
-	currentGridPrice := spm.findNearestGridPrice(currentPrice)
+	currentGridPrice := spm.entryWindowCenterPrice(currentPrice)
 	spm.pruneEmptyFarSlots(currentGridPrice, maxInt(buyWindowSize, sellWindowSize)*4+10)
 	spm.cleanupGhostOrderStates()
 
@@ -508,13 +510,13 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	for _, bookSide := range enabledBookSides {
 		desiredEntryPrices[bookSide] = make(map[float64]bool)
-		slotPrices := spm.calculateEntrySlotPrices(currentGridPrice, currentPrice, buyWindowSize, bookSide)
+		slotPrices := spm.calculateEntrySlotPrices(currentGridPrice, currentGridPrice, buyWindowSize, bookSide)
 		for _, price := range slotPrices {
 			desiredEntryPrices[bookSide][price] = true
 			desiredEntrySlots[bookSide] = append(desiredEntrySlots[bookSide], price)
 		}
 		desiredExitPrices[bookSide] = make(map[float64]bool)
-		exitPrices := spm.calculateExitSlotPrices(currentGridPrice, currentPrice, sellWindowSize, bookSide)
+		exitPrices := spm.calculateExitSlotPrices(currentGridPrice, currentGridPrice, sellWindowSize, bookSide)
 		for _, price := range exitPrices {
 			desiredExitPrices[bookSide][price] = true
 			desiredExitSlots[bookSide] = append(desiredExitSlots[bookSide], price)
@@ -1595,6 +1597,19 @@ func (spm *SuperPositionManager) pruneEmptyFarSlots(currentGridPrice float64, re
 // 网格必须始终围绕最新价格铺开，不能继续沿用启动锚点，否则价格漂移后中间会出现断层。
 func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) float64 {
 	return roundPrice(currentPrice, spm.priceDecimals)
+}
+
+func (spm *SuperPositionManager) entryWindowCenterPrice(currentPrice float64) float64 {
+	currentPrice = spm.findNearestGridPrice(currentPrice)
+	priceInterval := spm.config.Trading.PriceInterval
+	if spm.entryWindowCenter <= 0 || priceInterval <= 0 {
+		spm.entryWindowCenter = currentPrice
+		return spm.entryWindowCenter
+	}
+	if math.Abs(currentPrice-spm.entryWindowCenter) >= priceInterval {
+		spm.entryWindowCenter = currentPrice
+	}
+	return spm.entryWindowCenter
 }
 
 // calculateSlotPrices 计算槽位价格列表（统一的网格计算方法）
