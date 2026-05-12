@@ -613,7 +613,7 @@ func TestDirectionalFuturesPlacesOnlyDirectionalEntryOrders(t *testing.T) {
 	}
 }
 
-func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
+func TestDirectionalEntryWindowBackfillsLatestPriceWithoutRebalance(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -633,7 +633,7 @@ func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
 	if err := spm.AdjustOrders(2308); err != nil {
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
-	if err := spm.AdjustOrders(2309.25); err != nil {
+	if err := spm.AdjustOrdersWithRebalance(2309.25, false); err != nil {
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
 
@@ -1244,7 +1244,7 @@ func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
 
-	if err := spm.AdjustOrders(110); err != nil {
+	if err := spm.AdjustOrdersWithRebalance(110, false); err != nil {
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
 	if len(executor.canceled) != 0 {
@@ -1267,6 +1267,51 @@ func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries
 	if !has109 || !has108 {
 		t.Fatalf("expected current entry window to be refilled at 109 and 108, got has109=%v has108=%v orders=%v",
 			has109, has108, executor.orders)
+	}
+}
+
+func TestDirectionalPriceGridShiftRebalancesFarEntries(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 3
+	cfg.Trading.CleanupBatchSize = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	if err := spm.AdjustOrdersWithRebalance(95, true); err != nil {
+		t.Fatalf("price shift AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) == 0 {
+		t.Fatalf("expected far short entries to be canceled on price-grid shift")
+	}
+
+	has96 := false
+	has97 := false
+	for _, order := range executor.orders {
+		if order.Side != "SELL" || order.ReduceOnly {
+			continue
+		}
+		switch order.Price {
+		case 96:
+			has96 = true
+		case 97:
+			has97 = true
+		}
+	}
+	if !has96 || !has97 {
+		t.Fatalf("expected current short entry window to be refilled at 96 and 97, got has96=%v has97=%v orders=%v",
+			has96, has97, executor.orders)
 	}
 }
 

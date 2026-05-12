@@ -423,12 +423,16 @@ func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 
 // AdjustOrders 调整订单（交易入口）
 func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
+	return spm.AdjustOrdersWithRebalance(currentPrice, true)
+}
+
+func (spm *SuperPositionManager) AdjustOrdersWithRebalance(currentPrice float64, allowWindowRebalance bool) error {
 	if !spm.beginAdjust() {
 		logger.Info("⏸️ [停止下单] 交易已进入停止状态，跳过订单调整")
 		return nil
 	}
 	defer spm.endAdjust()
-	return spm.adjustOrders(currentPrice, true)
+	return spm.adjustOrders(currentPrice, allowWindowRebalance)
 }
 
 func (spm *SuperPositionManager) HaltTrading() {
@@ -519,7 +523,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		}
 	}
 
-	if allowWindowRebalance && spm.tradingDirection() == "neutral" {
+	if allowWindowRebalance {
 		if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
 			spm.mu.Unlock()
 			return err

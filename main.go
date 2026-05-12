@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -242,15 +243,19 @@ func runTrader(configPath string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	adjustRequests := make(chan string, 1)
+	type adjustRequest struct {
+		reason               string
+		allowWindowRebalance bool
+	}
+	adjustRequests := make(chan adjustRequest, 1)
 	var acceptingAdjust atomic.Bool
 	acceptingAdjust.Store(true)
-	scheduleAdjust := func(reason string) {
+	scheduleAdjust := func(reason string, allowWindowRebalance bool) {
 		if !acceptingAdjust.Load() {
 			return
 		}
 		select {
-		case adjustRequests <- reason:
+		case adjustRequests <- adjustRequest{reason: reason, allowWindowRebalance: allowWindowRebalance}:
 		default:
 		}
 	}
@@ -260,7 +265,7 @@ func runTrader(configPath string) {
 			select {
 			case <-ctx.Done():
 				return
-			case reason := <-adjustRequests:
+			case req := <-adjustRequests:
 				runProtected("订单调整", func() {
 					if !acceptingAdjust.Load() {
 						return
@@ -272,8 +277,8 @@ func runTrader(configPath string) {
 					if latestPrice <= 0 {
 						return
 					}
-					logger.Debug("🔄 [调价触发] reason=%s, price=%.*f", reason, priceDecimals, latestPrice)
-					if err := superPositionManager.AdjustOrders(latestPrice); err != nil {
+					logger.Debug("🔄 [调价触发] reason=%s, rebalance=%v, price=%.*f", req.reason, req.allowWindowRebalance, priceDecimals, latestPrice)
+					if err := superPositionManager.AdjustOrdersWithRebalance(latestPrice, req.allowWindowRebalance); err != nil {
 						logger.Error("❌ 调整订单失败: %v", err)
 					}
 				})
@@ -350,7 +355,7 @@ func runTrader(configPath string) {
 		logger.Debug("🔍 [main.go] 收到订单更新回调: ID=%d, ClientOID=%s, Price=%.2f, Status=%s",
 			posUpdate.OrderID, posUpdate.ClientOrderID, posUpdate.Price, posUpdate.Status)
 		if superPositionManager.OnOrderUpdate(posUpdate) {
-			scheduleAdjust("order_update")
+			scheduleAdjust("order_update", false)
 		}
 		statsUpdate := tradestats.Update{
 			Symbol:        posUpdate.Symbol,
@@ -397,8 +402,9 @@ func runTrader(configPath string) {
 	// 启动风控监控后再做首次订单调整；如果风控流启动失败，会先进入保护状态。
 	riskMonitor.Start(ctx)
 	if !riskMonitor.IsTriggered() {
-		scheduleAdjust("initial")
+		scheduleAdjust("initial", true)
 	}
+	lastGridAdjustPrice := currentPrice
 
 	// 启动持仓对账（使用独立的 Reconciler）
 	reconciler.Start(ctx)
@@ -427,8 +433,9 @@ func runTrader(configPath string) {
 		defer recoverAndLog("价格驱动调单")
 		priceCh := priceMonitor.Subscribe()
 		var lastTriggered bool // 记录上一次的风控状态，用于检测状态切换
+		priceInterval := cfg.Trading.PriceInterval
 
-		for range priceCh {
+		for priceEvent := range priceCh {
 			runProtected("价格驱动调单事件", func() {
 				// === 风控检查：触发时撤销所有开仓单并暂停交易 ===
 				isTriggered := riskMonitor.IsTriggered()
@@ -448,11 +455,16 @@ func runTrader(configPath string) {
 				if lastTriggered {
 					logger.Info("✅ [风控解除] 市场恢复正常，恢复自动交易")
 					lastTriggered = false
-					scheduleAdjust("risk-recovered")
+					lastGridAdjustPrice = priceEvent.NewPrice
+					scheduleAdjust("risk-recovered", true)
+					return
 				}
 
-				// 价格流只负责风控状态切换。挂单窗口由初始化、成交/撤单订单更新、
-				// 以及风控恢复触发，避免每个价格 tick 都撤单重挂。
+				// 价格流只在跨过完整网格间隔时触发补单，避免每个价格 tick 都撤单重挂。
+				if priceInterval > 0 && priceEvent.NewPrice > 0 && math.Abs(priceEvent.NewPrice-lastGridAdjustPrice) >= priceInterval {
+					lastGridAdjustPrice = priceEvent.NewPrice
+					scheduleAdjust("price-grid-shift", true)
+				}
 			})
 		}
 	}()
