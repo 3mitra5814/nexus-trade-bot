@@ -588,10 +588,10 @@ func TestDirectionalFuturesPlacesOnlyDirectionalEntryOrders(t *testing.T) {
 			}
 
 			wantSide := "BUY"
-			wantPrices := map[float64]bool{2307.50: false, 2306.50: false, 2305.50: false, 2304.50: false, 2303.50: false}
+			wantPrices := map[float64]bool{2308.00: false, 2307.00: false, 2306.00: false, 2305.00: false, 2304.00: false}
 			if direction == "short" {
 				wantSide = "SELL"
-				wantPrices = map[float64]bool{2309.50: false, 2310.50: false, 2311.50: false, 2312.50: false, 2313.50: false}
+				wantPrices = map[float64]bool{2310.00: false, 2311.00: false, 2312.00: false, 2313.00: false, 2314.00: false}
 			}
 			for _, order := range executor.orders {
 				if order.ReduceOnly {
@@ -637,7 +637,7 @@ func TestDirectionalEntryWindowBackfillsLatestPriceWithoutRebalance(t *testing.T
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
 
-	wantSells := map[float64]bool{2310.25: false, 2311.25: false, 2312.25: false, 2313.25: false, 2314.25: false}
+	wantSells := map[float64]bool{2309.00: false, 2310.00: false, 2311.00: false, 2312.00: false, 2313.00: false, 2314.00: false}
 	for _, order := range executor.orders {
 		if order.ReduceOnly {
 			continue
@@ -696,7 +696,7 @@ func TestAdjustOrdersBackfillsGhostSellSlots(t *testing.T) {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
-	wantSells := map[float64]bool{2286.79: false, 2287.79: false, 2288.79: false, 2289.79: false, 2290.79: false}
+	wantSells := map[float64]bool{2287.19: false, 2288.19: false, 2289.19: false, 2290.19: false, 2291.19: false}
 	for _, order := range executor.orders {
 		if order.ReduceOnly || order.Side != "SELL" {
 			continue
@@ -748,8 +748,8 @@ func TestRealtimeGridUsesLatestPriceWithoutAnchorGap(t *testing.T) {
 			}
 		}
 	}
-	if bestBuy != 2281.86 || bestSell != 2283.86 {
-		t.Fatalf("expected closest orders to hug latest price at BUY 2281.86 / SELL 2283.86, got BUY %.2f SELL %.2f orders=%v",
+	if bestBuy != 2282.22 || bestSell != 2284.22 {
+		t.Fatalf("expected closest orders to stay on anchor-aligned grid at BUY 2282.22 / SELL 2284.22, got BUY %.2f SELL %.2f orders=%v",
 			bestBuy, bestSell, executor.orders)
 	}
 	if bestSell-bestBuy != 2 {
@@ -812,7 +812,7 @@ func TestAdjustOrdersBackfillsEntryWindowAfterSkippingMarketableGrid(t *testing.
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
-	want := map[float64]bool{98.95: false, 97.95: false, 96.95: false}
+	want := map[float64]bool{99.00: false, 98.00: false, 97.00: false}
 	for _, order := range executor.orders {
 		if order.Side == "BUY" && !order.ReduceOnly {
 			if _, ok := want[order.Price]; ok {
@@ -1309,6 +1309,50 @@ func TestDirectionalPriceGridShiftRebalancesEntryWindow(t *testing.T) {
 		if !seen {
 			t.Fatalf("expected current short entry window to include %.2f, orders=%v", price, executor.orders)
 		}
+	}
+}
+
+func TestPriceGridShiftDoesNotChurnOnSubIntervalAnchoredTicks(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2266.32, "2266.32"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2266.32); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	if err := spm.AdjustOrdersWithRebalance(2265.30, true); err != nil {
+		t.Fatalf("first grid shift AdjustOrders() error = %v", err)
+	}
+	firstCancelCount := len(executor.canceled)
+	firstOrderCount := len(executor.orders)
+	if firstCancelCount == 0 {
+		t.Fatalf("expected full interval price shift to rebalance stale entry orders")
+	}
+
+	for _, price := range []float64{2265.55, 2265.44, 2265.37, 2265.24} {
+		if err := spm.AdjustOrdersWithRebalance(price, true); err != nil {
+			t.Fatalf("sub-interval AdjustOrders(%.2f) error = %v", price, err)
+		}
+	}
+	if len(executor.canceled) != firstCancelCount {
+		t.Fatalf("expected anchored sub-interval ticks not to trigger more cancels, got before=%d after=%d canceled=%v",
+			firstCancelCount, len(executor.canceled), executor.canceled)
+	}
+	if len(executor.orders) != firstOrderCount {
+		t.Fatalf("expected anchored sub-interval ticks not to repost entries, got before=%d after=%d",
+			firstOrderCount, len(executor.orders))
 	}
 }
 

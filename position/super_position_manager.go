@@ -624,6 +624,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	}
 
 	exitOrdersToCreate := 0
+	skippedDuplicateExitKeys := make(map[string]struct{})
 	for i := 0; i < len(exitCandidates) && exitOrdersToCreate < allowedNewExitOrders; i++ {
 		candidate := exitCandidates[i]
 		exitSide := spm.exitOrderSide(candidate.BookSide)
@@ -649,8 +650,11 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		if _, exists := plannedOrderKeys[placementKey]; exists {
 			slot.SlotStatus = SlotStatusFree
 			slot.mu.Unlock()
-			logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
-				candidate.BookSide, exitSide, formatPrice(candidate.ExitPrice, spm.priceDecimals))
+			if _, logged := skippedDuplicateExitKeys[placementKey]; !logged {
+				logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
+					candidate.BookSide, exitSide, formatPrice(candidate.ExitPrice, spm.priceDecimals))
+				skippedDuplicateExitKeys[placementKey] = struct{}{}
+			}
 			continue
 		}
 		plannedOrderKeys[placementKey] = struct{}{}
@@ -1559,10 +1563,18 @@ func (spm *SuperPositionManager) pruneEmptyFarSlots(currentGridPrice float64, re
 	}
 }
 
-// findNearestGridPrice 返回当前实时价格本身。
-// 网格必须始终围绕最新价格铺开，不能继续沿用启动锚点，否则价格漂移后中间会出现断层。
+// findNearestGridPrice returns the nearest interval-aligned grid point.
+// Keeping the grid aligned to the startup anchor avoids cancel/repost churn from
+// tiny price ticks while still moving the window once price crosses an interval.
 func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) float64 {
-	return roundPrice(currentPrice, spm.priceDecimals)
+	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
+	priceInterval := spm.config.Trading.PriceInterval
+	if priceInterval <= 0 || spm.anchorPrice <= 0 {
+		return currentPrice
+	}
+	intervals := math.Round((currentPrice - spm.anchorPrice) / priceInterval)
+	gridPrice := spm.anchorPrice + intervals*priceInterval
+	return roundPrice(gridPrice, spm.priceDecimals)
 }
 
 func (spm *SuperPositionManager) entryWindowCenterPrice(currentPrice float64) float64 {
@@ -1620,11 +1632,11 @@ func (spm *SuperPositionManager) calculateEntrySlotPrices(gridPrice, currentPric
 	direction := spm.entrySlotDirection(bookSide)
 	maxAttempts := count*4 + 20
 	for i := 1; len(prices) < count && i <= maxAttempts; i++ {
-		price := currentPrice
+		price := gridPrice
 		if direction == "down" {
-			price = currentPrice - float64(i)*priceInterval
+			price = gridPrice - float64(i)*priceInterval
 		} else {
-			price = currentPrice + float64(i)*priceInterval
+			price = gridPrice + float64(i)*priceInterval
 		}
 		price = roundPrice(price, spm.priceDecimals)
 		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
