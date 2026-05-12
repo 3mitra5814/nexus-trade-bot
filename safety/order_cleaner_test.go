@@ -99,8 +99,8 @@ func TestCleanupOrdersCancelsOneEntryWhenAtThreshold(t *testing.T) {
 
 	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
 
-	if len(executor.canceled) != 1 {
-		t.Fatalf("expected one entry cleanup when total orders reach threshold, got %v", executor.canceled)
+	if len(executor.canceled) != 0 {
+		t.Fatalf("expected no cleanup when total orders only reach threshold, got %v", executor.canceled)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestCleanupOrdersCancelsOnlyOrdersAboveThreshold(t *testing.T) {
 
 	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
 
-	if len(executor.canceled) != 3 {
-		t.Fatalf("expected to cancel the 2 orders above threshold plus one spare slot, got %v", executor.canceled)
+	if len(executor.canceled) != 2 {
+		t.Fatalf("expected to cancel only the orders above threshold, got %v", executor.canceled)
 	}
 }
