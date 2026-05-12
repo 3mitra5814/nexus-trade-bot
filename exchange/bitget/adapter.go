@@ -509,10 +509,10 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 			continue
 		}
 
-		// 构造订单ID字符串列表
-		orderIDStrs := make([]string, len(batch))
+		// Bitget v2 批量撤单需要对象列表，而不是纯字符串数组。
+		orderIDList := make([]map[string]string, len(batch))
 		for j, id := range batch {
-			orderIDStrs[j] = fmt.Sprintf("%d", id)
+			orderIDList[j] = map[string]string{"orderId": fmt.Sprintf("%d", id)}
 		}
 
 		// 🔥 确保所有必需参数都存在
@@ -520,7 +520,7 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 			"symbol":      b.symbol,      // 必需
 			"productType": b.productType, // 必需：USDT-FUTURES
 			"marginCoin":  b.marginCoin,  // 必需：USDT
-			"orderIdList": orderIDStrs,   // 必需：订单ID列表
+			"orderIdList": orderIDList,   // 必需：订单ID列表
 		}
 
 		_, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/batch-cancel-orders", body)

@@ -38,6 +38,7 @@ type consoleServer struct {
 	accountsPath  string
 	robotsPath    string
 	robotsDir     string
+	priceBasePath string
 	sessions      map[string]bool
 	loginFailures map[string]loginFailure
 	balanceCache  map[string]accountBalanceCache
@@ -47,6 +48,7 @@ type consoleServer struct {
 	processes     map[string]*robotProcess
 	baseConfig    *config.Config
 	baseRawYAML   []byte
+	priceBaseMu   sync.Mutex
 	mu            sync.RWMutex
 }
 
@@ -142,6 +144,7 @@ type robotMetric struct {
 	AvailableBalance float64 `json:"available_balance"`
 	MarginBalance    float64 `json:"margin_balance"`
 	CurrentPrice     float64 `json:"current_price"`
+	PriceChangePct   float64 `json:"price_change_pct"`
 	LongPosition     float64 `json:"long_position"`
 	ShortPosition    float64 `json:"short_position"`
 	NetPosition      float64 `json:"net_position"`
@@ -204,6 +207,16 @@ type recentTradesResponse struct {
 type robotLogsResponse struct {
 	Logs string `json:"logs"`
 	Path string `json:"path,omitempty"`
+}
+
+type priceBaselineStore struct {
+	Items map[string]priceBaselineRecord `json:"items"`
+}
+
+type priceBaselineRecord struct {
+	Date      string    `json:"date"`
+	Baseline  float64   `json:"baseline"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type dashboardSummary struct {
@@ -295,6 +308,7 @@ func newConsoleServer(configPath string) (*consoleServer, error) {
 		accountsPath:  filepath.Join(rootDir, "web_console_accounts.json"),
 		robotsPath:    filepath.Join(rootDir, "web_console_robots.json"),
 		robotsDir:     filepath.Join(rootDir, "web_console_robots"),
+		priceBasePath: filepath.Join(rootDir, "web_console_price_baselines.json"),
 		sessions:      make(map[string]bool),
 		loginFailures: make(map[string]loginFailure),
 		balanceCache:  make(map[string]accountBalanceCache),
@@ -892,6 +906,7 @@ func (s *consoleServer) recentRobotTrades(id string, limit int) ([]tradestats.Tr
 	}
 	configPath := robot.ConfigPath
 	symbol := robot.Config.Trading.Symbol
+	cfg := cloneConfig(robot.Config)
 	s.mu.RUnlock()
 
 	snap, err := tradestats.LoadWithLogFallback(tradestats.PathForConfig(configPath), robotLogPath(configPath), 0)
@@ -902,11 +917,38 @@ func (s *consoleServer) recentRobotTrades(id string, limit int) ([]tradestats.Tr
 	if len(trades) > limit {
 		trades = trades[len(trades)-limit:]
 	}
+	if currentPosition, ok := liveNetPosition(cfg, symbol, 5*time.Second); ok {
+		after := currentPosition
+		for i := len(trades) - 1; i >= 0; i-- {
+			trades[i].PositionAfter = after
+			after -= trades[i].PositionDelta
+		}
+	}
 	out := make([]tradestats.TradeRecord, 0, len(trades))
 	for i := len(trades) - 1; i >= 0; i-- {
 		out = append(out, trades[i])
 	}
 	return out, nil
+}
+
+func liveNetPosition(cfg *config.Config, symbol string, timeout time.Duration) (float64, bool) {
+	ex, err := exchange.NewExchange(cfg)
+	if err != nil {
+		return 0, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	positions, err := ex.GetPositions(ctx, symbol)
+	if err != nil {
+		return 0, false
+	}
+	var net float64
+	for _, pos := range positions {
+		if pos != nil {
+			net += pos.Size
+		}
+	}
+	return net, true
 }
 
 func (s *consoleServer) robotLogs(id string, maxBytes int) (string, string, error) {
@@ -2318,6 +2360,7 @@ func (s *consoleServer) fetchRobotMetric(robot *robotDefinition) robotMetric {
 	currentPrice, priceErr := ex.GetLatestPrice(ctx, robot.Config.Trading.Symbol)
 	if currentPrice > 0 {
 		statsMetric = mergeStatsMetric(statsMetric, robotStatsMetric(robot.ConfigPath, currentPrice))
+		statsMetric.PriceChangePct = s.priceChangePct(robot, currentPrice)
 	}
 	openOrders, err := ex.GetOpenOrders(ctx, robot.Config.Trading.Symbol)
 	if err != nil && statsMetric.Error == "" {
@@ -2350,6 +2393,46 @@ func (s *consoleServer) fetchRobotMetric(robot *robotDefinition) robotMetric {
 	statsMetric.QuoteAsset = ex.GetQuoteAsset()
 	statsMetric.PriceError = friendlyErrorString(priceErr)
 	return statsMetric
+}
+
+func (s *consoleServer) priceChangePct(robot *robotDefinition, currentPrice float64) float64 {
+	if robot == nil || robot.Config == nil || currentPrice <= 0 {
+		return 0
+	}
+	date := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02")
+	key := robot.ID + "|" + strings.ToUpper(strings.TrimSpace(robot.Config.Trading.Symbol))
+
+	s.priceBaseMu.Lock()
+	defer s.priceBaseMu.Unlock()
+
+	store := priceBaselineStore{Items: make(map[string]priceBaselineRecord)}
+	if data, err := os.ReadFile(s.priceBasePath); err == nil && len(data) > 0 {
+		_ = json.Unmarshal(data, &store)
+	}
+	if store.Items == nil {
+		store.Items = make(map[string]priceBaselineRecord)
+	}
+	record := store.Items[key]
+	if record.Date != date || record.Baseline <= 0 {
+		record = priceBaselineRecord{Date: date, Baseline: currentPrice, UpdatedAt: time.Now()}
+		store.Items[key] = record
+		s.savePriceBaselineStore(store)
+		return 0
+	}
+	record.UpdatedAt = time.Now()
+	store.Items[key] = record
+	s.savePriceBaselineStore(store)
+	return (currentPrice - record.Baseline) / record.Baseline * 100
+}
+
+func (s *consoleServer) savePriceBaselineStore(store priceBaselineStore) {
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(s.priceBasePath, data, 0600); err == nil {
+		_ = os.Chmod(s.priceBasePath, 0600)
+	}
 }
 
 func robotStatsMetric(configPath string, markPrice float64) robotMetric {

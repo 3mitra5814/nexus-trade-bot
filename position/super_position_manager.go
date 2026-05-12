@@ -480,6 +480,13 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			spm.mu.Unlock()
 			return spm.adjustOrders(currentPrice, false)
 		}
+		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, sellWindowSize); err != nil {
+			spm.mu.Unlock()
+			return err
+		} else if rebalanced {
+			spm.mu.Unlock()
+			return spm.adjustOrders(currentPrice, false)
+		}
 	}
 
 	var ordersToPlace []*OrderRequest
@@ -887,6 +894,69 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 	return true, nil
 }
 
+func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrders int) (bool, error) {
+	if maxActiveExitOrders <= 0 {
+		return false, nil
+	}
+	var exits []activeOrderCandidate
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
+			return true
+		}
+		if slot.OrderStatus != OrderStatusPlaced && slot.OrderStatus != OrderStatusConfirmed && slot.OrderStatus != OrderStatusPartiallyFilled {
+			return true
+		}
+		if slot.OrderID == 0 || slot.PositionQty <= 0 {
+			return true
+		}
+		exits = append(exits, activeOrderCandidate{
+			SlotPrice:     slot.Price,
+			BookSide:      slot.BookSide,
+			OrderID:       slot.OrderID,
+			ClientOID:     slot.ClientOID,
+			DistanceToMid: math.Abs(slot.Price - currentPrice),
+		})
+		return true
+	})
+	if len(exits) <= maxActiveExitOrders {
+		return false, nil
+	}
+	sort.Slice(exits, func(i, j int) bool {
+		if exits[i].DistanceToMid == exits[j].DistanceToMid {
+			return exits[i].OrderID > exits[j].OrderID
+		}
+		return exits[i].DistanceToMid > exits[j].DistanceToMid
+	})
+	toCancel := exits[:len(exits)-maxActiveExitOrders]
+	batchSize := spm.config.Trading.CleanupBatchSize
+	if batchSize <= 0 {
+		batchSize = 10
+	}
+	if len(toCancel) > batchSize {
+		toCancel = toCancel[:batchSize]
+	}
+	orderIDs := make([]int64, 0, len(toCancel))
+	for _, candidate := range toCancel {
+		orderIDs = append(orderIDs, candidate.OrderID)
+	}
+	logger.Info("🧭 [平仓自检] 平仓挂单超过窗口，撤销 %d 个远端平仓单，保留最近 %d 个", len(orderIDs), maxActiveExitOrders)
+
+	spm.mu.Unlock()
+	err := spm.executor.BatchCancelOrders(orderIDs)
+	spm.mu.Lock()
+	if err != nil {
+		logger.Warn("⚠️ [平仓自检] 撤销超额平仓单失败: %v", err)
+		return false, nil
+	}
+	for _, candidate := range toCancel {
+		spm.UpdateSlotOrderStatusIfCurrent(candidate.SlotPrice, candidate.BookSide, OrderStatusCanceled, candidate.OrderID, candidate.ClientOID)
+	}
+	return true, nil
+}
+
 // OnOrderUpdate 订单更新回调（异步订单同步流）
 func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 	// 🔥 重构：完全依赖 ClientOrderID 解析
@@ -903,6 +973,12 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 	slot.BookSide = bookSide
 	status := normalizeOrderUpdateStatus(update.Status)
 	isTerminalStatus := status == "FILLED" || status == "CANCELED" || status == "EXPIRED" || status == "REJECTED"
+	if isTerminalStatus && !spm.orderUpdateMatchesCurrentSlot(slot, update) {
+		spm.rememberOrderFillProgress(update.ClientOrderID, update.ExecutedQty, true)
+		logger.Debug("⏳ [订单更新被忽略] 旧订单终态不匹配当前槽位: slot=%s, currentOrderID=%d, currentClientOID=%s, updateOrderID=%d, updateClientOID=%s, status=%s",
+			formatPrice(price, spm.priceDecimals), slot.OrderID, slot.ClientOID, update.OrderID, update.ClientOrderID, status)
+		return false
+	}
 	if spm.isStaleAfterTerminalOrderUpdate(update.ClientOrderID, update.ExecutedQty, status) {
 		logger.Debug("⏳ [订单更新被忽略] 已处理终态后的延迟推送: slot=%s, clientOID=%s, status=%s, executed=%.8f",
 			formatPrice(price, spm.priceDecimals), update.ClientOrderID, status, update.ExecutedQty)
@@ -1137,6 +1213,20 @@ func (spm *SuperPositionManager) orderUpdateDeltaQty(clientOrderID string, execu
 	}
 	spm.rememberOrderFillProgress(clientOrderID, executedQty, terminal)
 	return deltaQty
+}
+
+func (spm *SuperPositionManager) orderUpdateMatchesCurrentSlot(slot *InventorySlot, update OrderUpdate) bool {
+	clientOID := strings.TrimSpace(update.ClientOrderID)
+	if slot.ClientOID != "" && clientOID != "" {
+		return slot.ClientOID == clientOID
+	}
+	if slot.OrderID != 0 && update.OrderID != 0 {
+		return slot.OrderID == update.OrderID
+	}
+	if slot.OrderID == 0 && slot.ClientOID == "" {
+		return true
+	}
+	return false
 }
 
 func (spm *SuperPositionManager) rememberOrderFillProgress(clientOrderID string, executedQty float64, terminal bool) {
@@ -1472,6 +1562,14 @@ type staleEntryCandidate struct {
 	OrderID   int64
 	ClientOID string
 	Distance  float64
+}
+
+type activeOrderCandidate struct {
+	SlotPrice     float64
+	BookSide      string
+	OrderID       int64
+	ClientOID     string
+	DistanceToMid float64
 }
 
 // IterateSlots 遍历所有槽位（封装 sync.Map.Range）
@@ -1820,6 +1918,30 @@ func (spm *SuperPositionManager) UpdateSlotOrderStatus(price float64, bookSide, 
 		slot.OrderFilledQty = 0
 	}
 	slot.mu.Unlock()
+}
+
+func (spm *SuperPositionManager) UpdateSlotOrderStatusIfCurrent(price float64, bookSide, status string, orderID int64, clientOID string) {
+	slot := spm.getOrCreateSlot(price, bookSide)
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if slot.OrderID != 0 && orderID != 0 && slot.OrderID != orderID {
+		return
+	}
+	if slot.ClientOID != "" && clientOID != "" && slot.ClientOID != clientOID {
+		return
+	}
+	slot.OrderStatus = status
+	if status == OrderStatusCancelRequested {
+		slot.SlotStatus = SlotStatusLocked
+		return
+	}
+	if status == OrderStatusCanceled || status == OrderStatusNotPlaced {
+		slot.SlotStatus = SlotStatusFree
+		slot.OrderID = 0
+		slot.ClientOID = ""
+		slot.OrderSide = ""
+		slot.OrderFilledQty = 0
+	}
 }
 
 // CancelEntryOrders 撤销所有开仓单（风控触发时使用）
