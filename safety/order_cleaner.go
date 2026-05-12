@@ -32,6 +32,7 @@ type IOrderCleanerPositionManager interface {
 	IterateSlots(fn func(price float64, slot interface{}) bool)
 	// 更新槽位状态
 	UpdateSlotOrderStatus(price float64, bookSide, status string)
+	UpdateSlotOrderStatusIfCurrent(price float64, bookSide, status string, orderID int64, clientOID string)
 }
 
 // OrderCleaner 订单清理器
@@ -84,14 +85,16 @@ func (oc *OrderCleaner) CleanupOrders() {
 	// 统计当前订单数
 	totalOrders := 0
 	var longEntryOrders []struct {
-		Price    float64
-		BookSide string
-		OrderID  int64
+		Price     float64
+		BookSide  string
+		OrderID   int64
+		ClientOID string
 	}
 	var shortEntryOrders []struct {
-		Price    float64
-		BookSide string
-		OrderID  int64
+		Price     float64
+		BookSide  string
+		OrderID   int64
+		ClientOID string
 	}
 
 	oc.pm.IterateSlots(func(price float64, slotRaw interface{}) bool {
@@ -119,6 +122,7 @@ func (oc *OrderCleaner) CleanupOrders() {
 		}
 
 		orderID := getInt64Field("OrderID")
+		clientOID := getStringField("ClientOID")
 		orderSide := getStringField("OrderSide")
 		orderStatus := getStringField("OrderStatus")
 		bookSide := getStringField("BookSide")
@@ -135,16 +139,18 @@ func (oc *OrderCleaner) CleanupOrders() {
 			isEntry := (bookSide == "SHORT" && orderSide == "SELL") || (bookSide != "SHORT" && orderSide == "BUY")
 			if isEntry && bookSide == "SHORT" {
 				shortEntryOrders = append(shortEntryOrders, struct {
-					Price    float64
-					BookSide string
-					OrderID  int64
-				}{Price: price, BookSide: bookSide, OrderID: orderID})
+					Price     float64
+					BookSide  string
+					OrderID   int64
+					ClientOID string
+				}{Price: price, BookSide: bookSide, OrderID: orderID, ClientOID: clientOID})
 			} else if isEntry {
 				longEntryOrders = append(longEntryOrders, struct {
-					Price    float64
-					BookSide string
-					OrderID  int64
-				}{Price: price, BookSide: bookSide, OrderID: orderID})
+					Price     float64
+					BookSide  string
+					OrderID   int64
+					ClientOID string
+				}{Price: price, BookSide: bookSide, OrderID: orderID, ClientOID: clientOID})
 			}
 		}
 		return true
@@ -197,15 +203,19 @@ func (oc *OrderCleaner) CleanupOrders() {
 			if cancelCount > 0 {
 				orderIDs := make([]int64, 0, cancelCount)
 				targets := make([]struct {
-					price    float64
-					bookSide string
+					price     float64
+					bookSide  string
+					orderID   int64
+					clientOID string
 				}, 0, cancelCount)
 				for i := 0; i < cancelCount; i++ {
 					orderIDs = append(orderIDs, longEntryOrders[i].OrderID)
 					targets = append(targets, struct {
-						price    float64
-						bookSide string
-					}{price: longEntryOrders[i].Price, bookSide: longEntryOrders[i].BookSide})
+						price     float64
+						bookSide  string
+						orderID   int64
+						clientOID string
+					}{price: longEntryOrders[i].Price, bookSide: longEntryOrders[i].BookSide, orderID: longEntryOrders[i].OrderID, clientOID: longEntryOrders[i].ClientOID})
 				}
 
 				logger.Info("🧹 [订单清理-多头开仓] 多头开仓单数: %d, 取消价格最低的 %d 个 (%.2f ~ %.2f)",
@@ -218,11 +228,11 @@ func (oc *OrderCleaner) CleanupOrders() {
 					// 更新槽位状态为已申请撤单
 					for i, target := range targets {
 						if !verified {
-							oc.pm.UpdateSlotOrderStatus(target.price, target.bookSide, OrderStatusCancelRequested)
+							oc.pm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, OrderStatusCancelRequested, target.orderID, target.clientOID)
 						} else if _, stillOpen := remainingOpen[orderIDs[i]]; stillOpen {
-							oc.pm.UpdateSlotOrderStatus(target.price, target.bookSide, OrderStatusCancelRequested)
+							oc.pm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, OrderStatusCancelRequested, target.orderID, target.clientOID)
 						} else {
-							oc.pm.UpdateSlotOrderStatus(target.price, target.bookSide, "CANCELED")
+							oc.pm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, "CANCELED", target.orderID, target.clientOID)
 						}
 					}
 					canceledCount += cancelCount
@@ -244,15 +254,19 @@ func (oc *OrderCleaner) CleanupOrders() {
 			if cancelCount > 0 {
 				orderIDs := make([]int64, 0, cancelCount)
 				targets := make([]struct {
-					price    float64
-					bookSide string
+					price     float64
+					bookSide  string
+					orderID   int64
+					clientOID string
 				}, 0, cancelCount)
 				for i := 0; i < cancelCount; i++ {
 					orderIDs = append(orderIDs, shortEntryOrders[i].OrderID)
 					targets = append(targets, struct {
-						price    float64
-						bookSide string
-					}{price: shortEntryOrders[i].Price, bookSide: shortEntryOrders[i].BookSide})
+						price     float64
+						bookSide  string
+						orderID   int64
+						clientOID string
+					}{price: shortEntryOrders[i].Price, bookSide: shortEntryOrders[i].BookSide, orderID: shortEntryOrders[i].OrderID, clientOID: shortEntryOrders[i].ClientOID})
 				}
 
 				logger.Info("🧹 [订单清理-空头开仓] 空头开仓单数: %d, 取消价格最高的 %d 个 (%.2f ~ %.2f)",
@@ -265,11 +279,11 @@ func (oc *OrderCleaner) CleanupOrders() {
 					// 更新槽位状态为已申请撤单
 					for i, target := range targets {
 						if !verified {
-							oc.pm.UpdateSlotOrderStatus(target.price, target.bookSide, OrderStatusCancelRequested)
+							oc.pm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, OrderStatusCancelRequested, target.orderID, target.clientOID)
 						} else if _, stillOpen := remainingOpen[orderIDs[i]]; stillOpen {
-							oc.pm.UpdateSlotOrderStatus(target.price, target.bookSide, OrderStatusCancelRequested)
+							oc.pm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, OrderStatusCancelRequested, target.orderID, target.clientOID)
 						} else {
-							oc.pm.UpdateSlotOrderStatus(target.price, target.bookSide, "CANCELED")
+							oc.pm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, "CANCELED", target.orderID, target.clientOID)
 						}
 					}
 					canceledCount += cancelCount

@@ -3028,8 +3028,7 @@ func (s *consoleServer) checkAndApplyGitHubUpdate() {
 		s.markAutoUpdateError("检查本地改动失败: " + err.Error())
 		return
 	} else if strings.TrimSpace(dirty) != "" {
-		s.markAutoUpdateError("检测到服务器本地代码有未提交改动，已跳过自动更新以避免覆盖")
-		return
+		logger.Warn("⚠️ [自动更新] 检测到服务器本地代码有未提交改动，将以 GitHub 最新版本为准并保留运行配置")
 	}
 	s.applyGitHubUpdate(rootDir, current, remote)
 }
@@ -3092,6 +3091,12 @@ func (s *consoleServer) applyGitHubUpdate(rootDir, current, remote string) {
 	}
 
 	runningIDs := s.runningRobotIDs()
+	backupDir, err := backupRuntimeFiles(rootDir, s.runtimePreservePaths())
+	if err != nil {
+		s.markAutoUpdateError("备份运行配置失败，已保留当前版本: " + err.Error())
+		return
+	}
+	defer os.RemoveAll(backupDir)
 	s.setAutoUpdateState(func(st *autoUpdateState) {
 		st.Message = fmt.Sprintf("验证通过，正在应用更新并重启 %d 个机器人", len(runningIDs))
 	})
@@ -3099,8 +3104,14 @@ func (s *consoleServer) applyGitHubUpdate(rootDir, current, remote string) {
 		s.markAutoUpdateError("切换到新版本失败: " + err.Error())
 		return
 	}
-	if err := runGit(rootDir, "clean", "-fd", "-e", "config.yaml", "-e", "config.yaml.auth.json", "-e", "web_console_accounts.json", "-e", "web_console_robots.json", "-e", "web_console_robots/", "-e", "logs/", "-e", "nexus-trade-bot.pid", "-e", "web_console_price_baselines.json"); err != nil {
+	if err := runGit(rootDir, "clean", "-fd"); err != nil {
 		s.markAutoUpdateError("清理旧文件失败: " + err.Error())
+		_ = runGit(rootDir, "reset", "--hard", current)
+		_ = restoreRuntimeFiles(rootDir, backupDir)
+		return
+	}
+	if err := restoreRuntimeFiles(rootDir, backupDir); err != nil {
+		s.markAutoUpdateError("恢复运行配置失败: " + err.Error())
 		_ = runGit(rootDir, "reset", "--hard", current)
 		return
 	}
@@ -3112,6 +3123,7 @@ func (s *consoleServer) applyGitHubUpdate(rootDir, current, remote string) {
 	if err := installVerifiedBinary(tmpBin, binPath); err != nil {
 		s.markAutoUpdateError("替换程序失败: " + err.Error())
 		_ = runGit(rootDir, "reset", "--hard", current)
+		_ = restoreRuntimeFiles(rootDir, backupDir)
 		return
 	}
 	for _, id := range runningIDs {
@@ -3143,6 +3155,33 @@ func (s *consoleServer) runningRobotIDs() []string {
 	return ids
 }
 
+func (s *consoleServer) runtimePreservePaths() []string {
+	rootDir := filepath.Dir(s.configPath)
+	paths := []string{
+		s.configPath,
+		s.authPath,
+		s.accountsPath,
+		s.robotsPath,
+		s.robotsDir,
+		s.priceBasePath,
+		filepath.Join(rootDir, "logs"),
+		filepath.Join(rootDir, "nexus-trade-bot.pid"),
+	}
+	s.mu.RLock()
+	for _, robot := range s.robots {
+		if robot == nil {
+			continue
+		}
+		if strings.TrimSpace(robot.ConfigPath) != "" {
+			paths = append(paths, robot.ConfigPath)
+			paths = append(paths, robot.ConfigPath+".stats.json")
+			paths = append(paths, robotLogPath(robot.ConfigPath))
+		}
+	}
+	s.mu.RUnlock()
+	return paths
+}
+
 func gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -3166,6 +3205,118 @@ func runCommand(dir, name string, args ...string) error {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+func backupRuntimeFiles(rootDir string, paths []string) (string, error) {
+	backupDir, err := os.MkdirTemp("", "nexus-trade-bot-runtime-*")
+	if err != nil {
+		return "", err
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			os.RemoveAll(backupDir)
+			return "", err
+		}
+		rel, err := filepath.Rel(rootDir, absPath)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		if _, exists := seen[rel]; exists {
+			continue
+		}
+		seen[rel] = struct{}{}
+		if _, err := os.Stat(absPath); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			os.RemoveAll(backupDir)
+			return "", err
+		}
+		if err := copyPath(absPath, filepath.Join(backupDir, rel)); err != nil {
+			os.RemoveAll(backupDir)
+			return "", err
+		}
+	}
+	return backupDir, nil
+}
+
+func restoreRuntimeFiles(rootDir, backupDir string) error {
+	if strings.TrimSpace(backupDir) == "" {
+		return nil
+	}
+	return filepath.WalkDir(backupDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == backupDir {
+			return nil
+		}
+		rel, err := filepath.Rel(backupDir, path)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(rootDir, rel)
+		if d.IsDir() {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			return os.MkdirAll(dst, info.Mode().Perm())
+		}
+		return copyFile(path, dst)
+	})
+}
+
+func copyPath(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return copyDir(src, dst)
+	}
+	return copyFile(src, dst)
+}
+
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		return copyFile(path, target)
+	})
+}
+
+func copyFile(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, info.Mode().Perm())
 }
 
 func copyGitWorktree(rootDir, tmpDir, commit string) error {

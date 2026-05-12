@@ -817,6 +817,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			}
 		}
 
+		var conflictOrderIDs []int64
 		for _, ord := range placedOrders {
 			// 解析 ClientOrderID
 			price, side, bookSide, valid := spm.parseClientOrderID(ord.ClientOrderID)
@@ -849,8 +850,11 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 				if slot.OrderID != 0 && slot.OrderID != ord.OrderID {
 					if slot.ClientOID != "" && slot.ClientOID != ord.ClientOrderID {
 						// 真正的冲突：槽位已被其他订单占用
-						logger.Warn("⚠️ [OrderID冲突] 槽位 %.2f: 下单返回OrderID=%d (ClientOID=%s)，但槽位已被OrderID=%d (ClientOID=%s)占用",
+						logger.Warn("⚠️ [OrderID冲突] 槽位 %.2f: 下单返回OrderID=%d (ClientOID=%s)，但槽位已被OrderID=%d (ClientOID=%s)占用，将立即撤销新单避免同价双挂",
 							price, ord.OrderID, ord.ClientOrderID, slot.OrderID, slot.ClientOID)
+						conflictOrderIDs = append(conflictOrderIDs, ord.OrderID)
+						slot.mu.Unlock()
+						continue
 					} else {
 						// WebSocket推送先到达，这是正常现象
 						logger.Debug("📝 [覆盖OrderID] 槽位 %.2f: WebSocket已设置OrderID=%d，现用下单返回的OrderID=%d (ClientOID: %s)",
@@ -878,6 +882,13 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			}
 
 			slot.mu.Unlock()
+		}
+		if len(conflictOrderIDs) > 0 {
+			if err := spm.executor.BatchCancelOrders(conflictOrderIDs); err != nil {
+				logger.Error("❌ [重复订单保护] 撤销冲突新单失败: %v (orderIDs=%v)", err, conflictOrderIDs)
+			} else {
+				logger.Warn("🧹 [重复订单保护] 已撤销 %d 张同价冲突新单: %v", len(conflictOrderIDs), conflictOrderIDs)
+			}
 		}
 	}
 
@@ -976,7 +987,7 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 		return false, nil
 	}
 	for _, candidate := range candidates {
-		spm.UpdateSlotOrderStatus(candidate.SlotPrice, candidate.BookSide, OrderStatusCanceled)
+		spm.UpdateSlotOrderStatusIfCurrent(candidate.SlotPrice, candidate.BookSide, OrderStatusCanceled, candidate.OrderID, candidate.ClientOID)
 	}
 	return true, nil
 }
@@ -1790,6 +1801,7 @@ type SlotData struct {
 	PositionQty    float64
 	BookSide       string
 	OrderID        int64
+	ClientOID      string
 	OrderSide      string
 	OrderStatus    string
 	OrderCreatedAt time.Time
@@ -1851,6 +1863,7 @@ func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot interf
 			PositionStatus: slot.PositionStatus,
 			PositionQty:    slot.PositionQty,
 			OrderID:        slot.OrderID,
+			ClientOID:      slot.ClientOID,
 			OrderSide:      slot.OrderSide,
 			OrderStatus:    slot.OrderStatus,
 			OrderCreatedAt: slot.OrderCreatedAt,

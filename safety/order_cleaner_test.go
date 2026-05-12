@@ -19,9 +19,11 @@ type cleanerSlot struct {
 type fakeCleanerPM struct {
 	slots   []cleanerSlot
 	updates []struct {
-		price    float64
-		bookSide string
-		status   string
+		price     float64
+		bookSide  string
+		status    string
+		orderID   int64
+		clientOID string
 	}
 }
 
@@ -35,10 +37,22 @@ func (pm *fakeCleanerPM) IterateSlots(fn func(price float64, slot interface{}) b
 
 func (pm *fakeCleanerPM) UpdateSlotOrderStatus(price float64, bookSide, status string) {
 	pm.updates = append(pm.updates, struct {
-		price    float64
-		bookSide string
-		status   string
+		price     float64
+		bookSide  string
+		status    string
+		orderID   int64
+		clientOID string
 	}{price: price, bookSide: bookSide, status: status})
+}
+
+func (pm *fakeCleanerPM) UpdateSlotOrderStatusIfCurrent(price float64, bookSide, status string, orderID int64, clientOID string) {
+	pm.updates = append(pm.updates, struct {
+		price     float64
+		bookSide  string
+		status    string
+		orderID   int64
+		clientOID string
+	}{price: price, bookSide: bookSide, status: status, orderID: orderID, clientOID: clientOID})
 }
 
 type fakeCancelExecutor struct {

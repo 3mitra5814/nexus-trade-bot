@@ -125,6 +125,11 @@ type captureExecutor struct {
 	blankOID bool
 }
 
+type hookExecutor struct {
+	captureExecutor
+	beforeReturn func(req *OrderRequest, orderID int64)
+}
+
 func (e *captureExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	orders, _ := e.BatchPlaceOrders([]*OrderRequest{req})
 	if len(orders) == 0 {
@@ -148,6 +153,31 @@ func (e *captureExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bo
 		placed = append(placed, &Order{
 			OrderID:       e.nextID,
 			ClientOrderID: clientOID,
+			Symbol:        req.Symbol,
+			Side:          req.Side,
+			Price:         req.Price,
+			Quantity:      req.Quantity,
+			Status:        OrderStatusPlaced,
+			CreatedAt:     time.Now(),
+		})
+	}
+	return placed, false
+}
+
+func (e *hookExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	placed := make([]*Order, 0, len(orders))
+	for _, req := range orders {
+		e.nextID++
+		copied := *req
+		e.orders = append(e.orders, &copied)
+		if e.beforeReturn != nil {
+			e.beforeReturn(req, e.nextID)
+		}
+		placed = append(placed, &Order{
+			OrderID:       e.nextID,
+			ClientOrderID: req.ClientOrderID,
 			Symbol:        req.Symbol,
 			Side:          req.Side,
 			Price:         req.Price,
@@ -971,6 +1001,61 @@ func TestAdjustOrdersDoesNotDuplicateWhenExchangeReturnsBlankClientOID(t *testin
 			t.Fatalf("expected slot %v locked with request clientOID, got oid=%q status=%s want oid=%q",
 				req.Price, gotOID, gotStatus, req.ClientOrderID)
 		}
+	}
+}
+
+func TestAdjustOrdersCancelsConflictingSamePriceOrder(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 1
+	cfg.Trading.SellWindowSize = 1
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &hookExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	oldOID := int64(111)
+	oldClientOID := "old-client-oid"
+	executor.beforeReturn = func(req *OrderRequest, orderID int64) {
+		price, _, bookSide, valid := spm.parseClientOrderID(req.ClientOrderID)
+		if !valid {
+			t.Fatalf("invalid clientOID generated: %s", req.ClientOrderID)
+		}
+		slot := spm.getOrCreateSlot(price, bookSide)
+		slot.mu.Lock()
+		slot.BookSide = bookSide
+		slot.PositionStatus = PositionStatusEmpty
+		slot.OrderID = oldOID
+		slot.ClientOID = oldClientOID
+		slot.OrderSide = req.Side
+		slot.OrderStatus = OrderStatusConfirmed
+		slot.OrderPrice = req.Price
+		slot.SlotStatus = SlotStatusLocked
+		slot.mu.Unlock()
+	}
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) != 1 {
+		t.Fatalf("expected conflicting new order to be canceled, got %v", executor.canceled)
+	}
+	if executor.canceled[0] == oldOID {
+		t.Fatalf("must cancel the new conflicting order, not the original tracked order")
+	}
+
+	slot := spm.getOrCreateSlot(101, BookSideShort)
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.OrderID != oldOID || slot.ClientOID != oldClientOID {
+		t.Fatalf("slot was overwritten by conflicting order: orderID=%d clientOID=%q",
+			slot.OrderID, slot.ClientOID)
 	}
 }
 
