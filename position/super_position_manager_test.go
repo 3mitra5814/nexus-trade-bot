@@ -606,6 +606,57 @@ func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
 	}
 }
 
+func TestAdjustOrdersBackfillsGhostSellSlots(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2286.19, "2286.19"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	for _, price := range []float64{2287.19, 2288.19, 2289.19, 2290.19, 2291.19} {
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		slot.BookSide = BookSideShort
+		slot.PositionStatus = PositionStatusEmpty
+		slot.SlotStatus = SlotStatusFree
+		slot.OrderStatus = OrderStatusPlaced
+		slot.OrderSide = "SELL"
+		slot.OrderPrice = price
+		slot.OrderID = 0
+		slot.ClientOID = ""
+		slot.mu.Unlock()
+	}
+
+	if err := spm.AdjustOrders(2285.79); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	wantSells := map[float64]bool{2286.19: false, 2287.19: false, 2288.19: false, 2289.19: false, 2290.19: false}
+	for _, order := range executor.orders {
+		if order.ReduceOnly || order.Side != "SELL" {
+			continue
+		}
+		if _, ok := wantSells[order.Price]; ok {
+			wantSells[order.Price] = true
+		}
+	}
+	for price, seen := range wantSells {
+		if !seen {
+			t.Fatalf("expected ghost SELL slot to be refilled at %.2f, orders=%v", price, executor.orders)
+		}
+	}
+}
+
 func TestAdjustOrdersBackfillsEntryWindowAfterSkippingMarketableGrid(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"

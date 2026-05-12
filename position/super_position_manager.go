@@ -490,6 +490,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	sellWindowSize := spm.config.Trading.SellWindowSize
 	currentGridPrice := spm.findNearestGridPrice(currentPrice)
 	spm.pruneEmptyFarSlots(currentGridPrice, maxInt(buyWindowSize, sellWindowSize)*4+10)
+	spm.cleanupGhostOrderStates()
 
 	// 计算允许创建的订单数量上限。实时网格按买侧/卖侧各自封顶：
 	// 下方 BUY 合计最多 buyWindowSize，上方 SELL 合计最多 sellWindowSize。
@@ -550,8 +551,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
 		slot.mu.RLock()
-		if slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed ||
-			slot.OrderStatus == OrderStatusPartiallyFilled || slot.SlotStatus == SlotStatusPending {
+		if spm.slotHasActiveOrder(slot) {
 			currentOrderCount++
 			if slot.OrderSide == "BUY" {
 				currentBuyOrderCount++
@@ -722,8 +722,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 				slot.mu.Unlock()
 				continue
 			}
-			hasActiveOrder := slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed || slot.OrderStatus == OrderStatusPartiallyFilled
-			if hasActiveOrder || slot.OrderID != 0 || slot.ClientOID != "" {
+			if spm.slotHasActiveOrder(slot) || slot.OrderID != 0 || slot.ClientOID != "" {
 				slot.mu.Unlock()
 				continue
 			}
@@ -913,8 +912,7 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 			slot := spm.getOrCreateSlot(price, bookSide)
 			slot.mu.Lock()
 			slot.BookSide = bookSide
-			hasActiveOrder := slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed || slot.OrderStatus == OrderStatusPartiallyFilled
-			if slot.SlotStatus == SlotStatusFree && slot.PositionStatus == PositionStatusEmpty && !hasActiveOrder && slot.OrderID == 0 && slot.ClientOID == "" {
+			if slot.SlotStatus == SlotStatusFree && slot.PositionStatus == PositionStatusEmpty && !spm.slotHasActiveOrder(slot) && slot.OrderID == 0 && slot.ClientOID == "" {
 				missingByBook[bookSide]++
 			}
 			slot.mu.Unlock()
@@ -928,7 +926,7 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 		if !spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
 			return true
 		}
-		if slot.OrderStatus != OrderStatusPlaced && slot.OrderStatus != OrderStatusConfirmed {
+		if !spm.slotHasActiveOrder(slot) {
 			return true
 		}
 		if slot.OrderID == 0 || slot.PositionStatus != PositionStatusEmpty {
@@ -1012,7 +1010,7 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 		if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
 			return true
 		}
-		if slot.OrderStatus != OrderStatusPlaced && slot.OrderStatus != OrderStatusConfirmed && slot.OrderStatus != OrderStatusPartiallyFilled {
+		if !spm.slotHasActiveOrder(slot) {
 			return true
 		}
 		if slot.OrderID == 0 || slot.PositionQty <= 0 {
@@ -1373,7 +1371,7 @@ func (spm *SuperPositionManager) activeOrderPlacementKey(slot *InventorySlot) (s
 	if slot == nil {
 		return "", false
 	}
-	if !isActiveOrderStatus(slot.OrderStatus) && slot.SlotStatus != SlotStatusPending {
+	if !spm.slotHasActiveOrder(slot) {
 		return "", false
 	}
 	if slot.OrderSide == "" || slot.BookSide == "" {
@@ -1384,6 +1382,45 @@ func (spm *SuperPositionManager) activeOrderPlacementKey(slot *InventorySlot) (s
 		price = slot.Price
 	}
 	return spm.orderPlacementKey(slot.OrderSide, slot.BookSide, price), true
+}
+
+func (spm *SuperPositionManager) slotHasActiveOrder(slot *InventorySlot) bool {
+	if slot == nil {
+		return false
+	}
+	if slot.SlotStatus == SlotStatusPending {
+		return strings.TrimSpace(slot.ClientOID) != ""
+	}
+	if !isActiveOrderStatus(slot.OrderStatus) {
+		return false
+	}
+	return slot.OrderID != 0 || strings.TrimSpace(slot.ClientOID) != ""
+}
+
+func (spm *SuperPositionManager) cleanupGhostOrderStates() {
+	var cleaned int
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.Lock()
+		if slot.SlotStatus == SlotStatusFree &&
+			slot.OrderID == 0 &&
+			strings.TrimSpace(slot.ClientOID) == "" &&
+			slot.OrderFilledQty == 0 &&
+			isActiveOrderStatus(slot.OrderStatus) {
+			logger.Warn("🧹 [槽位修复] 清理幽灵订单状态: price=%s book=%s side=%s status=%s",
+				formatPrice(slot.Price, spm.priceDecimals), slot.BookSide, slot.OrderSide, slot.OrderStatus)
+			slot.OrderStatus = OrderStatusNotPlaced
+			slot.OrderSide = ""
+			slot.OrderPrice = 0
+			slot.OrderCreatedAt = time.Time{}
+			cleaned++
+		}
+		slot.mu.Unlock()
+		return true
+	})
+	if cleaned > 0 {
+		logger.Warn("🧹 [槽位修复] 已清理 %d 个幽灵订单状态，允许立即补单", cleaned)
+	}
 }
 
 func (spm *SuperPositionManager) orderPlacementKey(side, bookSide string, orderPrice float64) string {
@@ -1541,7 +1578,7 @@ func (spm *SuperPositionManager) pruneEmptyFarSlots(currentGridPrice float64, re
 			slot.ClientOID == "" &&
 			slot.OrderFilledQty == 0 &&
 			slot.SlotStatus == SlotStatusFree &&
-			!isActiveOrderStatus(slot.OrderStatus)
+			!spm.slotHasActiveOrder(slot)
 		slot.mu.RUnlock()
 		if canDelete {
 			spm.slots.Delete(key)
@@ -1813,6 +1850,7 @@ type SlotData struct {
 	OrderSide      string
 	OrderStatus    string
 	OrderCreatedAt time.Time
+	SlotStatus     string
 }
 
 type exchangeOrderSnapshot struct {
@@ -1876,6 +1914,7 @@ func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot interf
 			OrderStatus:    slot.OrderStatus,
 			OrderCreatedAt: slot.OrderCreatedAt,
 			BookSide:       slot.BookSide,
+			SlotStatus:     slot.SlotStatus,
 		}
 
 		// 返回槽位数据
@@ -1928,7 +1967,7 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		slot := value.(*InventorySlot)
 		slot.mu.Lock()
 		defer slot.mu.Unlock()
-		if !isActiveOrderStatus(slot.OrderStatus) || slot.OrderID == 0 {
+		if !spm.slotHasActiveOrder(slot) || slot.OrderID == 0 {
 			return true
 		}
 		_, hasID := openOrderIDs[slot.OrderID]
@@ -2112,7 +2151,7 @@ func (spm *SuperPositionManager) resetFilledSlots(bookSide string) {
 		if slot.BookSide != bookSide || slot.PositionStatus != PositionStatusFilled {
 			return true
 		}
-		if isActiveOrderStatus(slot.OrderStatus) && slot.OrderID != 0 {
+		if spm.slotHasActiveOrder(slot) && slot.OrderID != 0 {
 			return true
 		}
 		slot.PositionStatus = PositionStatusEmpty
@@ -2547,7 +2586,7 @@ func (spm *SuperPositionManager) PrintPositions() {
 			positionDesc := fmt.Sprintf("%s持仓: %.4f %s", pos.BookSide, pos.Qty, baseCurrency)
 
 			orderInfo := ""
-			if pos.OrderStatus != OrderStatusNotPlaced && pos.OrderStatus != "" {
+			if spm.slotHasActiveOrder(&InventorySlot{OrderID: pos.OrderID, OrderSide: pos.OrderSide, OrderStatus: pos.OrderStatus, SlotStatus: pos.SlotStatus}) {
 				orderInfo = fmt.Sprintf(", 订单: %s/%s (ID:%d)", pos.OrderSide, pos.OrderStatus, pos.OrderID)
 			}
 
@@ -2651,11 +2690,9 @@ func (spm *SuperPositionManager) PrintPositions() {
 			}
 
 			orderInfo := ""
-			if slot.OrderStatus != OrderStatusNotPlaced && slot.OrderStatus != "" {
+			if spm.slotHasActiveOrder(&InventorySlot{OrderID: slot.OrderID, ClientOID: slot.ClientOID, OrderStatus: slot.OrderStatus, SlotStatus: slot.SlotStatus}) {
 				orderInfo = fmt.Sprintf(", 订单: %s/%s (ID:%d)", slot.OrderSide, slot.OrderStatus, slot.OrderID)
-				if spm.isEntryOrder(slot.OrderSide, slot.BookSide) && (slot.OrderStatus == OrderStatusPlaced ||
-					slot.OrderStatus == OrderStatusConfirmed ||
-					slot.OrderStatus == OrderStatusPartiallyFilled) {
+				if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
 					entryOrderCount++
 				}
 			}

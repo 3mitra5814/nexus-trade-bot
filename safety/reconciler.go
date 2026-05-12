@@ -182,29 +182,43 @@ func (r *Reconciler) Reconcile() error {
 			return 0.0
 		}
 
+		getInt64Field := func(name string) int64 {
+			field := v.FieldByName(name)
+			if field.IsValid() && field.CanInt() {
+				return field.Int()
+			}
+			return 0
+		}
+
 		positionStatus := getStringField("PositionStatus")
 		positionQty := getFloat64Field("PositionQty")
 		bookSide := getStringField("BookSide")
 		orderSide := getStringField("OrderSide")
 		orderStatus := getStringField("OrderStatus")
+		orderID := getInt64Field("OrderID")
+		clientOID := getStringField("ClientOID")
+		slotStatus := getStringField("SlotStatus")
+		hasActiveOrder := (orderID != 0 || clientOID != "") &&
+			(orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
+				orderStatus == OrderStatusPartiallyFilled || orderStatus == OrderStatusCancelRequested)
+		if slotStatus == "PENDING" {
+			hasActiveOrder = clientOID != ""
+		}
 
 		if positionStatus == PositionStatusFilled {
 			localFilledPosition += positionQty
 			isExitOrder := (bookSide == "SHORT" && orderSide == "BUY") || (bookSide != "SHORT" && orderSide == "SELL")
-			if isExitOrder && (orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
-				orderStatus == OrderStatusPartiallyFilled || orderStatus == OrderStatusCancelRequested) {
+			if isExitOrder && hasActiveOrder {
 				localPendingExitQty += positionQty
 				activeExitOrders++
 			}
 		}
 
 		isEntryOrder := (bookSide == "SHORT" && orderSide == "SELL") || (bookSide != "SHORT" && orderSide == "BUY")
-		if isEntryOrder && (orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
-			orderStatus == OrderStatusPartiallyFilled) {
+		if isEntryOrder && hasActiveOrder {
 			activeEntryOrders++
 		}
-		if orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed ||
-			orderStatus == OrderStatusPartiallyFilled || orderStatus == OrderStatusCancelRequested {
+		if hasActiveOrder {
 			switch orderSide {
 			case "BUY":
 				activeBuyOrders++
