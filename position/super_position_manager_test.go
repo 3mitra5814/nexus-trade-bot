@@ -497,7 +497,75 @@ func TestNeutralAdjustOrdersCreatesEntryQuotaPerBook(t *testing.T) {
 	}
 }
 
-func TestDirectionalFuturesStillPlacesFiveOrdersOnBothSides(t *testing.T) {
+func TestDirectionalInventoryGridPlacesExitOnlyAfterEntryFill(t *testing.T) {
+	tests := []struct {
+		direction string
+		bookSide  string
+		entrySide string
+		exitSide  string
+		entry     float64
+		exit      float64
+		current   float64
+	}{
+		{direction: "long", bookSide: BookSideLong, entrySide: "BUY", exitSide: "SELL", entry: 99, exit: 100, current: 99},
+		{direction: "short", bookSide: BookSideShort, entrySide: "SELL", exitSide: "BUY", entry: 101, exit: 100, current: 101},
+	}
+	for _, tt := range tests {
+		t.Run(tt.direction, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.App.MarketType = "futures"
+			cfg.Trading.Symbol = "ETHUSDT"
+			cfg.Trading.Direction = tt.direction
+			cfg.Trading.PriceInterval = 1
+			cfg.Trading.OrderQuantity = 30
+			cfg.Trading.BuyWindowSize = 2
+			cfg.Trading.SellWindowSize = 2
+			cfg.Trading.OrderCleanupThreshold = 10
+
+			executor := &captureExecutor{}
+			spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+			if err := spm.Initialize(100, "100.00"); err != nil {
+				t.Fatalf("Initialize() error = %v", err)
+			}
+			if err := spm.AdjustOrders(100); err != nil {
+				t.Fatalf("AdjustOrders() error = %v", err)
+			}
+			var entryReq *OrderRequest
+			for _, order := range executor.orders {
+				if order.Side != tt.entrySide || order.ReduceOnly {
+					t.Fatalf("before fill expected only %s entries, got %+v", tt.entrySide, order)
+				}
+				if order.Price == tt.entry && entryReq == nil {
+					entryReq = order
+				}
+			}
+			if entryReq == nil {
+				t.Fatalf("expected entry order at %.2f, orders=%v", tt.entry, executor.orders)
+			}
+
+			spm.OnOrderUpdate(OrderUpdate{OrderID: 99, ClientOrderID: entryReq.ClientOrderID, Status: "NEW", Side: tt.entrySide})
+			spm.OnOrderUpdate(OrderUpdate{OrderID: 99, ClientOrderID: entryReq.ClientOrderID, Status: "FILLED", ExecutedQty: entryReq.Quantity, Side: tt.entrySide})
+			if err := spm.AdjustOrders(tt.current); err != nil {
+				t.Fatalf("post-fill AdjustOrders() error = %v", err)
+			}
+
+			var exitSeen bool
+			for _, order := range executor.orders {
+				if order.Side == tt.exitSide && order.ReduceOnly && order.Price == tt.exit {
+					exitSeen = true
+				}
+				if order.Side == tt.exitSide && !order.ReduceOnly {
+					t.Fatalf("directional mode should not place opposite entry order: %+v", order)
+				}
+			}
+			if !exitSeen {
+				t.Fatalf("expected reduce-only %s exit at %.2f after %s fill, orders=%v", tt.exitSide, tt.exit, tt.entrySide, executor.orders)
+			}
+		})
+	}
+}
+
+func TestDirectionalFuturesPlacesOnlyDirectionalEntryOrders(t *testing.T) {
 	for _, direction := range []string{"long", "short"} {
 		t.Run(direction, func(t *testing.T) {
 			cfg := &config.Config{}
@@ -519,31 +587,26 @@ func TestDirectionalFuturesStillPlacesFiveOrdersOnBothSides(t *testing.T) {
 				t.Fatalf("AdjustOrders() error = %v", err)
 			}
 
-			buys := map[float64]bool{2307.50: false, 2306.50: false, 2305.50: false, 2304.50: false, 2303.50: false}
-			sells := map[float64]bool{2309.50: false, 2310.50: false, 2311.50: false, 2312.50: false, 2313.50: false}
+			wantSide := "BUY"
+			wantPrices := map[float64]bool{2307.50: false, 2306.50: false, 2305.50: false, 2304.50: false, 2303.50: false}
+			if direction == "short" {
+				wantSide = "SELL"
+				wantPrices = map[float64]bool{2309.50: false, 2310.50: false, 2311.50: false, 2312.50: false, 2313.50: false}
+			}
 			for _, order := range executor.orders {
 				if order.ReduceOnly {
 					continue
 				}
-				switch order.Side {
-				case "BUY":
-					if _, ok := buys[order.Price]; ok {
-						buys[order.Price] = true
-					}
-				case "SELL":
-					if _, ok := sells[order.Price]; ok {
-						sells[order.Price] = true
-					}
+				if order.Side != wantSide {
+					t.Fatalf("%s should not place opposite entry order: %+v", direction, order)
+				}
+				if _, ok := wantPrices[order.Price]; ok {
+					wantPrices[order.Price] = true
 				}
 			}
-			for price, seen := range buys {
+			for price, seen := range wantPrices {
 				if !seen {
-					t.Fatalf("%s expected BUY at %.2f, orders=%v", direction, price, executor.orders)
-				}
-			}
-			for price, seen := range sells {
-				if !seen {
-					t.Fatalf("%s expected SELL at %.2f, orders=%v", direction, price, executor.orders)
+					t.Fatalf("%s expected %s at %.2f, orders=%v", direction, wantSide, price, executor.orders)
 				}
 			}
 		})
@@ -574,16 +637,13 @@ func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
 
-	wantBuys := map[float64]bool{2308.25: false, 2307.25: false, 2306.25: false, 2305.25: false, 2304.25: false}
 	wantSells := map[float64]bool{2310.25: false, 2311.25: false, 2312.25: false, 2313.25: false, 2314.25: false}
 	for _, order := range executor.orders {
 		if order.ReduceOnly {
 			continue
 		}
 		if order.Side == "BUY" {
-			if _, ok := wantBuys[order.Price]; ok {
-				wantBuys[order.Price] = true
-			}
+			t.Fatalf("short mode should not place BUY entry orders: %+v", order)
 		}
 		if order.Side == "SELL" {
 			if _, ok := wantSells[order.Price]; ok {
@@ -591,18 +651,13 @@ func TestFuturesEntryWindowFollowsLatestPriceOnBothSides(t *testing.T) {
 			}
 		}
 	}
-	for price, seen := range wantBuys {
-		if !seen {
-			t.Fatalf("expected moved BUY window to include %.2f, orders=%v", price, executor.orders)
-		}
-	}
 	for price, seen := range wantSells {
 		if !seen {
 			t.Fatalf("expected moved SELL window to include %.2f, orders=%v", price, executor.orders)
 		}
 	}
-	if len(executor.canceled) == 0 {
-		t.Fatalf("expected stale orders to be canceled when price window moves")
+	if len(executor.canceled) != 0 {
+		t.Fatalf("directional inventory grid should not cancel stale entries on window move, got %v", executor.canceled)
 	}
 }
 
@@ -610,7 +665,7 @@ func TestAdjustOrdersBackfillsGhostSellSlots(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"
 	cfg.Trading.Symbol = "ETHUSDT"
-	cfg.Trading.Direction = "long"
+	cfg.Trading.Direction = "neutral"
 	cfg.Trading.PriceInterval = 1
 	cfg.Trading.OrderQuantity = 30
 	cfg.Trading.BuyWindowSize = 5
@@ -661,7 +716,7 @@ func TestRealtimeGridUsesLatestPriceWithoutAnchorGap(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"
 	cfg.Trading.Symbol = "ETHUSDT"
-	cfg.Trading.Direction = "long"
+	cfg.Trading.Direction = "neutral"
 	cfg.Trading.PriceInterval = 1
 	cfg.Trading.OrderQuantity = 30
 	cfg.Trading.BuyWindowSize = 5
@@ -723,8 +778,8 @@ func TestAdjustOrdersDoesNotRebalanceOnSubIntervalPriceNoise(t *testing.T) {
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
 	initialOrderCount := len(executor.orders)
-	if initialOrderCount != 10 {
-		t.Fatalf("expected initial 10 orders, got %d", initialOrderCount)
+	if initialOrderCount != 5 {
+		t.Fatalf("expected initial 5 directional entry orders, got %d", initialOrderCount)
 	}
 
 	if err := spm.AdjustOrders(2292.84); err != nil {
@@ -1169,7 +1224,7 @@ func TestAdjustOrdersPlacesExitEvenWhenEntryThresholdIsFull(t *testing.T) {
 	}
 }
 
-func TestAdjustOrdersRebalancesStaleEntriesToFillCurrentWindow(t *testing.T) {
+func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "long"
@@ -1192,8 +1247,8 @@ func TestAdjustOrdersRebalancesStaleEntriesToFillCurrentWindow(t *testing.T) {
 	if err := spm.AdjustOrders(110); err != nil {
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
-	if len(executor.canceled) == 0 {
-		t.Fatalf("expected stale entry orders to be canceled to free window capacity")
+	if len(executor.canceled) != 0 {
+		t.Fatalf("directional inventory grid should keep old entry orders until fill/cleanup, got %v", executor.canceled)
 	}
 
 	has109 := false
