@@ -1156,6 +1156,54 @@ func TestExistingShortPositionIsRestoredAtStartup(t *testing.T) {
 	}
 }
 
+func TestRestoredShortPositionUsesAnchorAlignedGrid(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+
+	executor := &captureExecutor{}
+	exchange := seededExchange{positions: []*PositionInfo{{
+		Symbol:     "ETHUSDT",
+		Size:       -1.19,
+		EntryPrice: 2282.66,
+		MarkPrice:  2282.60,
+	}}}
+	spm := NewSuperPositionManager(cfg, executor, exchange, 2, 2)
+	if err := spm.Initialize(2282.60, "2282.60"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2282.60); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	if _, ok := spm.slots.Load(spm.slotKey(2282.66, BookSideShort)); ok {
+		t.Fatalf("restored short slot should align to anchor grid, not exchange entry price 2282.66")
+	}
+	if _, ok := spm.slots.Load(spm.slotKey(2282.60, BookSideShort)); !ok {
+		t.Fatalf("expected restored short slot at anchor-aligned grid 2282.60")
+	}
+
+	gotExitPrices := make(map[float64]bool)
+	for _, order := range executor.orders {
+		if order.Side != "BUY" || !order.ReduceOnly {
+			continue
+		}
+		gotExitPrices[order.Price] = true
+	}
+	for _, price := range []float64{2281.60, 2280.60, 2279.60} {
+		if !gotExitPrices[price] {
+			t.Fatalf("expected restored short exits to spread across aligned grid prices, missing %.2f got=%v orders=%+v",
+				price, gotExitPrices, executor.orders)
+		}
+	}
+}
+
 func TestPositionSnapshotDoesNotAdoptUnmanagedGrowthByDefault(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"

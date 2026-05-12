@@ -2408,14 +2408,11 @@ func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float
 	if totalPosition <= 0 {
 		return
 	}
-	referencePrice := roundPrice(firstPositiveFloat(entryPrice, spm.anchorPrice), spm.priceDecimals)
+	referencePrice := spm.findNearestGridPrice(firstPositiveFloat(spm.anchorPrice, entryPrice))
 	if referencePrice <= 0 {
 		return
 	}
 	direction := "down"
-	if bookSide == BookSideShort {
-		direction = "up"
-	}
 
 	remaining := roundQuantity(totalPosition, spm.quantityDecimals)
 	allocatedQty := 0.0
