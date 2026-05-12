@@ -80,6 +80,12 @@ body.light .pending{color:#1d4ed8}
 .robot-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:14px}
 .stat{padding:14px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(70,100,150,.18);min-width:0}
 .price-stat .v,.position-stat .v{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:22px;letter-spacing:0}
+.update-card{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(70,100,150,.18);color:var(--muted);font-size:13px}
+.update-card strong{color:var(--text)}
+.update-card.ok strong{color:var(--green)}
+.update-card.err strong{color:var(--red)}
+.update-card.busy strong{color:#bfdbfe}
+body.light .update-card{background:#f8fafc;border-color:#e4eaf2}
 body.light .stat,body.light .tag,body.light .item,body.light .empty,body.light .exchange-pill{background:#f8fafc;border-color:#e4eaf2}
 .tags{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
 .tag{padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);font-size:12px}
@@ -226,14 +232,17 @@ I18N.en['field.adoptPosition']='Adopt existing position';
 I18N.en['field.adoptPositionHelp']='Off by default, protecting manual base positions from bot exits.';
 I18N.en['metric.position']='Live position';
 I18N.en['trades.position']='Position change';
+I18N.en['update.title']='Auto update';
 I18N['zh-CN']['field.adoptPosition']='接管已有持仓';
 I18N['zh-CN']['field.adoptPositionHelp']='默认关闭，保护手动底仓不被机器人平掉。';
 I18N['zh-CN']['metric.position']='实时持仓';
 I18N['zh-CN']['trades.position']='仓位变动';
+I18N['zh-CN']['update.title']='自动更新';
 I18N['zh-TW']['field.adoptPosition']='接管既有持倉';
 I18N['zh-TW']['field.adoptPositionHelp']='預設關閉，保護手動底倉不被機器人平掉。';
 I18N['zh-TW']['metric.position']='即時持倉';
 I18N['zh-TW']['trades.position']='倉位變動';
+I18N['zh-TW']['update.title']='自動更新';
 ['ru','ko','ja','es','vi','hi','pt','ar','zh-TW'].forEach(lang=>I18N[lang]=Object.assign({},I18N.en,I18N[lang]));
 let currentLang='en';
 const byId=id=>document.getElementById(id),qsa=s=>Array.from(document.querySelectorAll(s));
@@ -307,7 +316,9 @@ function robotElement(id){return Array.from(byId('robotGrid').children).find(el=
 function setRobotStatus(id,status){const r=robotById(id);if(!r)return;r.status=status;if(status==='running'){r.started_at=new Date().toISOString();r.last_error='';r.exit_reason=''}renderDashboard()}
 function setRobotPending(id,action){if(action)robotActionPending.set(id,action);else robotActionPending.delete(id);renderRobotCard(id)}
 function renderAccountBalances(list){const root=byId('accountBalances');const items=list||[];if(!items.length){setAnimatedText('accountBalances',t('empty.noApi'));return}const totals={};let ok=0;items.forEach(a=>{if(a.error)return;const quote=a.quote_asset||'USDT';totals[quote]=(totals[quote]||0)+(Number(a.balance)||0);ok++});if(!ok){root.innerHTML='<span class="balance-error">'+t('error.balance')+'</span>';animatedTextCache.set('accountBalances',t('error.balance'));return}setAnimatedText('accountBalances',Object.keys(totals).sort().map(q=>fmt(totals[q])+' '+q).join(' + '))}
-function renderDashboard(){const s=dashboard.summary;setAnimatedText('sumRobots',s.robot_count);renderAccountBalances(dashboard.accounts);setAnimatedText('sumTodayRealized',signedUsd(s.today_realized_pnl));setAnimatedText('sumTotalRealized',signedUsd(s.total_realized_pnl));setAnimatedText('sumTodayVolume',usd(s.today_volume));setAnimatedText('sumTotalVolume',usd(s.total_volume));const running=s.running_count>0;byId('globalStatus').className='status '+(running?'running':'stopped');byId('globalStatusText').textContent=running?t('status.runningCount',{count:s.running_count}):t('status.noneRunning');const grid=byId('robotGrid');const seen=new Set();show('robotsEmpty',dashboard.robots.length===0);dashboard.robots.forEach(r=>{seen.add(String(r.id));const html=robotCard(r),old=robotElement(r.id);if(!old){grid.insertAdjacentHTML('beforeend',html)}else if(robotHTMLCache.get(r.id)!==html){old.outerHTML=html}robotHTMLCache.set(r.id,html)});Array.from(grid.children).forEach(el=>{if(!seen.has(el.dataset.robotId)){robotHTMLCache.delete(el.dataset.robotId);el.remove()}});fitNumbers(byId('console'))}
+function updateStatusHTML(u){u=u||{};let cls=u.error?'err':(u.updating||u.checking?'busy':'ok');let text=u.error||u.message||'--';let meta=[];if(u.current_commit)meta.push('local '+u.current_commit);if(u.remote_commit&&u.remote_commit!==u.current_commit)meta.push('github '+u.remote_commit);return'<div class="update-card '+cls+'"><div><strong>'+esc(t('update.title'))+'</strong><span> · '+esc(text)+'</span></div><span>'+esc(meta.join(' / '))+'</span></div>'}
+function renderUpdateStatus(){const metrics=document.querySelector('.metrics');if(!metrics)return;let el=byId('updateStatus');const html=updateStatusHTML(dashboard?dashboard.update:null);if(!el){metrics.insertAdjacentHTML('beforeend','<div id="updateStatus">'+html+'</div>')}else{el.innerHTML=html}}
+function renderDashboard(){const s=dashboard.summary;setAnimatedText('sumRobots',s.robot_count);renderAccountBalances(dashboard.accounts);setAnimatedText('sumTodayRealized',signedUsd(s.today_realized_pnl));setAnimatedText('sumTotalRealized',signedUsd(s.total_realized_pnl));setAnimatedText('sumTodayVolume',usd(s.today_volume));setAnimatedText('sumTotalVolume',usd(s.total_volume));renderUpdateStatus();const running=s.running_count>0;byId('globalStatus').className='status '+(running?'running':'stopped');byId('globalStatusText').textContent=running?t('status.runningCount',{count:s.running_count}):t('status.noneRunning');const grid=byId('robotGrid');const seen=new Set();show('robotsEmpty',dashboard.robots.length===0);dashboard.robots.forEach(r=>{seen.add(String(r.id));const html=robotCard(r),old=robotElement(r.id);if(!old){grid.insertAdjacentHTML('beforeend',html)}else if(robotHTMLCache.get(r.id)!==html){old.outerHTML=html}robotHTMLCache.set(r.id,html)});Array.from(grid.children).forEach(el=>{if(!seen.has(el.dataset.robotId)){robotHTMLCache.delete(el.dataset.robotId);el.remove()}});fitNumbers(byId('console'))}
 function renderRobotCard(id){const r=robotById(id),grid=byId('robotGrid');if(!r||!grid)return;const html=robotCard(r),old=robotElement(id);if(!old){grid.insertAdjacentHTML('beforeend',html)}else if(robotHTMLCache.get(id)!==html){old.outerHTML=html}robotHTMLCache.set(id,html);fitNumbers(grid)}
 function pendingText(action){return action==='start'?t('status.starting'):action==='pause'?t('status.stopping'):action==='delete'?t('status.deleting'):''}
 function actionButton(cls,attr,id,label,loading,disabled){return'<button class="'+cls+(loading?' loading':'')+'" '+attr+'="'+esc(id)+'" '+(loading||disabled?'disabled aria-busy="'+(loading?'true':'false')+'"':'')+'><span class="btn-content">'+(loading?'<span class="spinner"></span>':'')+'<span>'+label+'</span></span></button>'}

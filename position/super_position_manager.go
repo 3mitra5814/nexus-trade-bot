@@ -183,7 +183,11 @@ type SuperPositionManager struct {
 	// 初始化标志
 	isInitialized atomic.Bool
 
-	mu sync.RWMutex // 全局锁（用于关键操作）
+	haltMu        sync.Mutex
+	haltCond      *sync.Cond
+	tradingHalted bool
+	activeAdjusts int
+	mu            sync.RWMutex // 全局锁（用于关键操作）
 }
 
 // NewSuperPositionManager 创建超级仓位管理器
@@ -207,6 +211,7 @@ func NewSuperPositionManager(cfg *config.Config, executor OrderExecutorInterface
 	spm.totalRealizedPNL.Store(0.0)
 	spm.lastReconcileTime.Store(time.Now())
 	spm.lastMarketPrice.Store(0.0)
+	spm.haltCond = sync.NewCond(&spm.haltMu)
 	return spm
 }
 
@@ -411,7 +416,41 @@ func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 
 // AdjustOrders 调整订单（交易入口）
 func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
+	if !spm.beginAdjust() {
+		logger.Info("⏸️ [停止下单] 交易已进入停止状态，跳过订单调整")
+		return nil
+	}
+	defer spm.endAdjust()
 	return spm.adjustOrders(currentPrice, true)
+}
+
+func (spm *SuperPositionManager) HaltTrading() {
+	spm.haltMu.Lock()
+	spm.tradingHalted = true
+	for spm.activeAdjusts > 0 {
+		spm.haltCond.Wait()
+	}
+	spm.haltMu.Unlock()
+}
+
+func (spm *SuperPositionManager) beginAdjust() bool {
+	spm.haltMu.Lock()
+	defer spm.haltMu.Unlock()
+	if spm.tradingHalted {
+		return false
+	}
+	spm.activeAdjusts++
+	return true
+}
+
+func (spm *SuperPositionManager) endAdjust() {
+	spm.haltMu.Lock()
+	spm.activeAdjusts--
+	if spm.activeAdjusts <= 0 {
+		spm.activeAdjusts = 0
+		spm.haltCond.Broadcast()
+	}
+	spm.haltMu.Unlock()
 }
 
 func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowRebalance bool) error {
@@ -490,6 +529,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	}
 
 	var ordersToPlace []*OrderRequest
+	plannedOrderKeys := make(map[string]struct{})
 
 	// 统计当前所有订单数量（分别统计买单和卖单）
 	var currentOrderCount int
@@ -502,7 +542,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		slot := value.(*InventorySlot)
 		slot.mu.RLock()
 		if slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed ||
-			slot.OrderStatus == OrderStatusPartiallyFilled {
+			slot.OrderStatus == OrderStatusPartiallyFilled || slot.SlotStatus == SlotStatusPending {
 			currentOrderCount++
 			if slot.OrderSide == "BUY" {
 				currentBuyOrderCount++
@@ -515,6 +555,9 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			} else {
 				currentExitOrderCount++
 			}
+		}
+		if key, ok := spm.activeOrderPlacementKey(slot); ok {
+			plannedOrderKeys[key] = struct{}{}
 		}
 		slot.mu.RUnlock()
 		return true
@@ -593,9 +636,23 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		}
 		slot.SlotStatus = SlotStatusPending
 		usePostOnly := true
-		slot.mu.Unlock()
 		exitSide := spm.exitOrderSide(candidate.BookSide)
 		clientOID := spm.generateClientOrderID(candidate.SlotPrice, exitSide, candidate.BookSide)
+		placementKey := spm.orderPlacementKey(exitSide, candidate.BookSide, candidate.ExitPrice)
+		if _, exists := plannedOrderKeys[placementKey]; exists {
+			slot.SlotStatus = SlotStatusFree
+			slot.mu.Unlock()
+			logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
+				candidate.BookSide, exitSide, formatPrice(candidate.ExitPrice, spm.priceDecimals))
+			continue
+		}
+		plannedOrderKeys[placementKey] = struct{}{}
+		slot.ClientOID = clientOID
+		slot.OrderSide = exitSide
+		slot.OrderPrice = candidate.ExitPrice
+		slot.OrderStatus = OrderStatusPlaced
+		slot.OrderCreatedAt = time.Now()
+		slot.mu.Unlock()
 		ordersToPlace = append(ordersToPlace, &OrderRequest{Symbol: spm.config.Trading.Symbol, Side: exitSide, Price: candidate.ExitPrice, Quantity: candidate.Quantity, PriceDecimals: spm.priceDecimals, ReduceOnly: true, PostOnly: usePostOnly, ClientOrderID: clientOID})
 		exitOrdersToCreate++
 	}
@@ -665,7 +722,20 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 				continue
 			}
 			clientOID := spm.generateClientOrderID(price, entrySide, bookSide)
+			placementKey := spm.orderPlacementKey(entrySide, bookSide, price)
+			if _, exists := plannedOrderKeys[placementKey]; exists {
+				slot.mu.Unlock()
+				logger.Warn("⚠️ [跳过重复开仓单] %s %s %s 已存在活跃/待提交订单",
+					bookSide, entrySide, formatPrice(price, spm.priceDecimals))
+				continue
+			}
+			plannedOrderKeys[placementKey] = struct{}{}
 			slot.SlotStatus = SlotStatusPending
+			slot.ClientOID = clientOID
+			slot.OrderSide = entrySide
+			slot.OrderPrice = price
+			slot.OrderStatus = OrderStatusPlaced
+			slot.OrderCreatedAt = time.Now()
 			usePostOnly := true
 			slot.mu.Unlock()
 
@@ -693,6 +763,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	if len(ordersToPlace) > 0 {
 		logger.Info("🔄 [实时调整] 需要新增: %d 个订单", len(ordersToPlace))
 		placedOrders, marginError := spm.executor.BatchPlaceOrders(ordersToPlace)
+		spm.attachMissingClientOrderIDs(ordersToPlace, placedOrders)
 
 		if marginError {
 			logger.Warn("⚠️ [保证金不足] 检测到保证金不足错误，暂停下单 %d 秒", int(spm.marginLockDuration.Seconds()))
@@ -722,6 +793,14 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 					slot.BookSide = bookSide
 					if slot.SlotStatus == SlotStatusPending {
 						slot.SlotStatus = SlotStatusFree
+						if slot.ClientOID == req.ClientOrderID {
+							slot.OrderStatus = OrderStatusNotPlaced
+							slot.OrderID = 0
+							slot.ClientOID = ""
+							slot.OrderSide = ""
+							slot.OrderPrice = 0
+							slot.OrderFilledQty = 0
+						}
 						logger.Debug("🔓 [释放槽位] 订单提交失败，释放槽位 %s 的锁 (ClientOID: %s)",
 							formatPrice(price, spm.priceDecimals), req.ClientOrderID)
 					}
@@ -1227,6 +1306,88 @@ func (spm *SuperPositionManager) orderUpdateMatchesCurrentSlot(slot *InventorySl
 		return true
 	}
 	return false
+}
+
+func (spm *SuperPositionManager) activeOrderPlacementKey(slot *InventorySlot) (string, bool) {
+	if slot == nil {
+		return "", false
+	}
+	if !isActiveOrderStatus(slot.OrderStatus) && slot.SlotStatus != SlotStatusPending {
+		return "", false
+	}
+	if slot.OrderSide == "" || slot.BookSide == "" {
+		return "", false
+	}
+	price := slot.OrderPrice
+	if price <= 0 {
+		price = slot.Price
+	}
+	return spm.orderPlacementKey(slot.OrderSide, slot.BookSide, price), true
+}
+
+func (spm *SuperPositionManager) orderPlacementKey(side, bookSide string, orderPrice float64) string {
+	return fmt.Sprintf("%s:%s:%s", bookSide, strings.ToUpper(strings.TrimSpace(side)), formatPrice(roundPrice(orderPrice, spm.priceDecimals), spm.priceDecimals))
+}
+
+func (spm *SuperPositionManager) attachMissingClientOrderIDs(requests []*OrderRequest, placed []*Order) {
+	if len(requests) == 0 || len(placed) == 0 {
+		return
+	}
+	unused := make(map[int]struct{}, len(requests))
+	for i := range requests {
+		unused[i] = struct{}{}
+	}
+	for _, ord := range placed {
+		if ord == nil || strings.TrimSpace(ord.ClientOrderID) == "" {
+			continue
+		}
+		for i, req := range requests {
+			if _, ok := unused[i]; !ok {
+				continue
+			}
+			if req.ClientOrderID == ord.ClientOrderID {
+				delete(unused, i)
+				break
+			}
+		}
+	}
+	for _, ord := range placed {
+		if ord == nil || strings.TrimSpace(ord.ClientOrderID) != "" {
+			continue
+		}
+		for i, req := range requests {
+			if _, ok := unused[i]; !ok {
+				continue
+			}
+			if !sameOrderRequestAndPlaced(req, ord, spm.priceDecimals) {
+				continue
+			}
+			ord.ClientOrderID = req.ClientOrderID
+			delete(unused, i)
+			logger.Warn("⚠️ [下单回填] 交易所返回缺少 ClientOID，已按请求回填: orderID=%d clientOID=%s",
+				ord.OrderID, ord.ClientOrderID)
+			break
+		}
+	}
+}
+
+func sameOrderRequestAndPlaced(req *OrderRequest, ord *Order, priceDecimals int) bool {
+	if req == nil || ord == nil {
+		return false
+	}
+	if !strings.EqualFold(req.Side, ord.Side) {
+		return false
+	}
+	if roundPrice(req.Price, priceDecimals) != roundPrice(ord.Price, priceDecimals) {
+		return false
+	}
+	if math.Abs(req.Quantity-ord.Quantity) > 1e-12 {
+		return false
+	}
+	if req.Symbol != "" && ord.Symbol != "" && !sameTradingSymbol(req.Symbol, ord.Symbol) {
+		return false
+	}
+	return true
 }
 
 func (spm *SuperPositionManager) rememberOrderFillProgress(clientOrderID string, executedQty float64, terminal bool) {

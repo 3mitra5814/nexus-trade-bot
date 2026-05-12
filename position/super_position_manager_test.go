@@ -122,6 +122,7 @@ type captureExecutor struct {
 	orders   []*OrderRequest
 	canceled []int64
 	nextID   int64
+	blankOID bool
 }
 
 func (e *captureExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
@@ -140,9 +141,13 @@ func (e *captureExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bo
 		e.nextID++
 		copied := *req
 		e.orders = append(e.orders, &copied)
+		clientOID := req.ClientOrderID
+		if e.blankOID {
+			clientOID = ""
+		}
 		placed = append(placed, &Order{
 			OrderID:       e.nextID,
-			ClientOrderID: req.ClientOrderID,
+			ClientOrderID: clientOID,
 			Symbol:        req.Symbol,
 			Side:          req.Side,
 			Price:         req.Price,
@@ -924,6 +929,48 @@ func TestAdjustOrdersRebalancesStaleEntriesToFillCurrentWindow(t *testing.T) {
 	if !has109 || !has108 {
 		t.Fatalf("expected current entry window to be refilled at 109 and 108, got has109=%v has108=%v orders=%v",
 			has109, has108, executor.orders)
+	}
+}
+
+func TestAdjustOrdersDoesNotDuplicateWhenExchangeReturnsBlankClientOID(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 2
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{blankOID: true}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	firstCount := len(executor.orders)
+	if firstCount == 0 {
+		t.Fatalf("expected first adjust to place orders")
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("second AdjustOrders() error = %v", err)
+	}
+	if len(executor.orders) != firstCount {
+		t.Fatalf("expected second adjust not to duplicate blank-clientOID orders, first=%d total=%d",
+			firstCount, len(executor.orders))
+	}
+	for _, req := range executor.orders {
+		slot := spm.getOrCreateSlot(req.Price, BookSideLong)
+		slot.mu.RLock()
+		gotOID := slot.ClientOID
+		gotStatus := slot.SlotStatus
+		slot.mu.RUnlock()
+		if gotOID != req.ClientOrderID || gotStatus != SlotStatusLocked {
+			t.Fatalf("expected slot %v locked with request clientOID, got oid=%q status=%s want oid=%q",
+				req.Price, gotOID, gotStatus, req.ClientOrderID)
+		}
 	}
 }
 

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,7 +21,6 @@ import (
 	"nexus-trade-bot/position"
 	"nexus-trade-bot/safety"
 	"nexus-trade-bot/tradestats"
-	"nexus-trade-bot/utils"
 )
 
 // Version 版本号
@@ -242,7 +243,12 @@ func runTrader(configPath string) {
 	defer cancel()
 
 	adjustRequests := make(chan string, 1)
+	var acceptingAdjust atomic.Bool
+	acceptingAdjust.Store(true)
 	scheduleAdjust := func(reason string) {
+		if !acceptingAdjust.Load() {
+			return
+		}
 		select {
 		case adjustRequests <- reason:
 		default:
@@ -256,6 +262,9 @@ func runTrader(configPath string) {
 				return
 			case reason := <-adjustRequests:
 				runProtected("订单调整", func() {
+					if !acceptingAdjust.Load() {
+						return
+					}
 					if riskMonitor.IsTriggered() {
 						return
 					}
@@ -380,6 +389,9 @@ func runTrader(configPath string) {
 	if err := superPositionManager.Initialize(currentPrice, currentPriceStr); err != nil {
 		logger.Fatalf("❌ 初始化超级仓位管理器失败: %v", err)
 	}
+	if err := reconciler.Reconcile(); err != nil {
+		logger.Fatalf("❌ 启动前交易所对账失败，已停止自动下单以避免重复挂单: %v", err)
+	}
 	superPositionManager.PrintPositions()
 
 	// 启动风控监控后再做首次订单调整；如果风控流启动失败，会先进入保护状态。
@@ -469,23 +481,28 @@ func runTrader(configPath string) {
 
 	// 14. 等待退出信号
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
+	sig := <-sigChan
+	skipCancelOnExit := sig == syscall.SIGUSR1
 
 	logger.Info("🛑 收到退出信号，开始优雅关闭...")
+	acceptingAdjust.Store(false)
+	superPositionManager.HaltTrading()
 	persistTradeTotals()
 
 	// 🔥 第一优先级：立即撤销所有订单（最重要！）
 	// 使用独立的超时 context，确保撤单请求能发送成功
-	if cfg.System.CancelOnExit {
+	if cfg.System.CancelOnExit && !skipCancelOnExit {
 		logger.Info("🔄 正在撤销所有订单（最高优先级）...")
-		cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := cancelOwnedOrders(cancelCtx, ex, cfg); err != nil {
+		cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := cancelSymbolOpenOrdersUntilClear(cancelCtx, ex, cfg.Trading.Symbol); err != nil {
 			logger.Error("❌ 撤销订单失败: %v", err)
 		} else {
-			logger.Info("✅ 所有订单已成功撤销")
+			logger.Info("✅ 当前交易对挂单已全部清空")
 		}
 		cancelTimeout()
+	} else if skipCancelOnExit {
+		logger.Info("♻️ 热更新重启：保留当前挂单，由新进程接管")
 	}
 
 	// 🔥 第二优先级：停止所有协程（取消 context）
@@ -527,31 +544,42 @@ func appRootDir() string {
 	return "."
 }
 
-func cancelOwnedOrders(ctx context.Context, ex exchange.IExchange, cfg *config.Config) error {
-	orderTag := utils.NormalizeOrderTag(cfg.Trading.OrderTag)
-	if orderTag == "" {
-		return ex.CancelAllOrders(ctx, cfg.Trading.Symbol)
+func cancelSymbolOpenOrdersUntilClear(ctx context.Context, ex exchange.IExchange, symbol string) error {
+	const maxAttempts = 8
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		openOrders, err := ex.GetOpenOrders(ctx, symbol)
+		if err != nil {
+			return fmt.Errorf("查询挂单失败: %w", err)
+		}
+		orderIDs := make([]int64, 0, len(openOrders))
+		for _, order := range openOrders {
+			if order != nil && order.OrderID != 0 {
+				orderIDs = append(orderIDs, order.OrderID)
+			}
+		}
+		if len(orderIDs) == 0 {
+			logger.Info("✅ [%s] 交易对 %s 挂单复查为 0", ex.GetName(), symbol)
+			return nil
+		}
+		logger.Warn("🧹 [%s] 清空交易对挂单: symbol=%s attempt=%d/%d count=%d",
+			ex.GetName(), symbol, attempt, maxAttempts, len(orderIDs))
+		if err := ex.BatchCancelOrders(ctx, symbol, orderIDs); err != nil {
+			return fmt.Errorf("批量撤销挂单失败: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+		}
 	}
-	openOrders, err := ex.GetOpenOrders(ctx, cfg.Trading.Symbol)
+	openOrders, err := ex.GetOpenOrders(ctx, symbol)
 	if err != nil {
-		return err
+		return fmt.Errorf("最终复查挂单失败: %w", err)
 	}
-	orderIDs := make([]int64, 0, len(openOrders))
-	for _, order := range openOrders {
-		if order == nil || order.OrderID == 0 {
-			continue
-		}
-		clientOrderID := utils.RemoveBrokerPrefix(ex.GetName(), order.ClientOrderID)
-		tag, ok := utils.OrderIDTag(clientOrderID)
-		if ok && (tag == orderTag || tag == "") {
-			orderIDs = append(orderIDs, order.OrderID)
-		}
+	if len(openOrders) > 0 {
+		return fmt.Errorf("交易对 %s 仍有 %d 个挂单未清空", symbol, len(openOrders))
 	}
-	if len(orderIDs) == 0 {
-		logger.Info("ℹ️ 未发现归属标签 %s 的挂单，跳过撤单", orderTag)
-		return nil
-	}
-	return ex.BatchCancelOrders(ctx, cfg.Trading.Symbol, orderIDs)
+	return nil
 }
 
 // positionExchangeAdapter 适配器，将 exchange.IExchange 转换为 position.IExchange
