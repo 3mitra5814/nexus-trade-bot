@@ -6,7 +6,13 @@ export PAGER=cat
 export LESS=FRX
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="${NEXUS_UPLOAD_PROJECT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+if [[ -n "${NEXUS_UPLOAD_PROJECT_DIR:-}" ]]; then
+  PROJECT_DIR="$NEXUS_UPLOAD_PROJECT_DIR"
+elif [[ -f "${SCRIPT_DIR}/go.mod" && -d "${SCRIPT_DIR}/.git" ]]; then
+  PROJECT_DIR="$SCRIPT_DIR"
+else
+  PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 GITHUB_USER="${NEXUS_TRADE_BOT_GITHUB_USER:-haohaoi34}"
 REMOTE_URL="${NEXUS_TRADE_BOT_GITHUB_URL:-https://github.com/haohaoi34/nexus-trade-bot.git}"
 REMOTE_WEB_URL="${REMOTE_URL%.git}"
