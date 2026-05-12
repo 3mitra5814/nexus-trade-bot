@@ -1356,6 +1356,57 @@ func TestPriceGridShiftDoesNotChurnOnSubIntervalAnchoredTicks(t *testing.T) {
 	}
 }
 
+func TestPriceGridShiftUsesFullIntervalHysteresisBeforeRebalancing(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2273.41, "2273.41"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2273.41); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	if err := spm.AdjustOrdersWithRebalance(2274.70, true); err != nil {
+		t.Fatalf("full interval AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) == 0 {
+		t.Fatalf("expected move from 2273.41 to 2274.41 to rebalance old window")
+	}
+
+	cancelCount := len(executor.canceled)
+	orderCount := len(executor.orders)
+	for _, price := range []float64{2273.70, 2274.70, 2274.83, 2273.81, 2274.92, 2273.90} {
+		if err := spm.AdjustOrdersWithRebalance(price, true); err != nil {
+			t.Fatalf("boundary AdjustOrders(%.2f) error = %v", price, err)
+		}
+	}
+	if len(executor.canceled) != cancelCount {
+		t.Fatalf("expected half-grid boundary noise not to cancel far entries, got before=%d after=%d canceled=%v",
+			cancelCount, len(executor.canceled), executor.canceled)
+	}
+	if len(executor.orders) != orderCount {
+		t.Fatalf("expected half-grid boundary noise not to repost entries, got before=%d after=%d",
+			orderCount, len(executor.orders))
+	}
+
+	if err := spm.AdjustOrdersWithRebalance(2275.42, true); err != nil {
+		t.Fatalf("full interval AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) == cancelCount {
+		t.Fatalf("expected full interval move to rebalance stale entries")
+	}
+}
+
 func TestAdjustOrdersDoesNotDuplicateWhenExchangeReturnsBlankClientOID(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"

@@ -1578,16 +1578,27 @@ func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) floa
 }
 
 func (spm *SuperPositionManager) entryWindowCenterPrice(currentPrice float64) float64 {
-	currentPrice = spm.findNearestGridPrice(currentPrice)
+	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
+	targetGridPrice := spm.findNearestGridPrice(currentPrice)
 	priceInterval := spm.config.Trading.PriceInterval
 	if spm.entryWindowCenter <= 0 || priceInterval <= 0 {
-		spm.entryWindowCenter = currentPrice
+		spm.entryWindowCenter = targetGridPrice
 		return spm.entryWindowCenter
 	}
 	if math.Abs(currentPrice-spm.entryWindowCenter) >= priceInterval {
-		spm.entryWindowCenter = currentPrice
+		spm.entryWindowCenter = targetGridPrice
 	}
 	return spm.entryWindowCenter
+}
+
+func (spm *SuperPositionManager) entryWindowCenterSnapshot(currentPrice float64) float64 {
+	spm.mu.RLock()
+	center := spm.entryWindowCenter
+	spm.mu.RUnlock()
+	if center > 0 {
+		return center
+	}
+	return spm.findNearestGridPrice(currentPrice)
 }
 
 // calculateSlotPrices 计算槽位价格列表（统一的网格计算方法）
@@ -2632,8 +2643,8 @@ func (spm *SuperPositionManager) PrintPositions() {
 		return allSlots[i].Price > allSlots[j].Price
 	})
 
-	// 找到最接近当前价格的网格价格
-	currentGridPrice := spm.findNearestGridPrice(lastPrice)
+	// 打印机器人实际使用的开仓窗口中心，避免半格附近的 nearest grid 误导排查。
+	currentGridPrice := spm.entryWindowCenterSnapshot(lastPrice)
 	logger.Info("当前网格价格: %s", formatPrice(currentGridPrice, spm.priceDecimals))
 
 	// 计算开仓窗口范围；多头在当前价下方，空头在当前价上方。
