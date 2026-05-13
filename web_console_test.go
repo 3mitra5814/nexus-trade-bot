@@ -67,6 +67,20 @@ func TestMergeExistingSecretsPreservesMaskedValues(t *testing.T) {
 	}
 }
 
+func TestNormalizeAccountExchangeConfigDefaultsFeeRate(t *testing.T) {
+	cfg := normalizeAccountExchangeConfig(config.ExchangeConfig{
+		APIKey:    " api ",
+		SecretKey: " secret ",
+	})
+
+	if cfg.APIKey != "api" || cfg.SecretKey != "secret" {
+		t.Fatalf("expected secrets to be trimmed, got %#v", cfg)
+	}
+	if cfg.FeeRate != config.DefaultFeeRate {
+		t.Fatalf("expected default fee rate %.8f, got %.8f", config.DefaultFeeRate, cfg.FeeRate)
+	}
+}
+
 func TestMergeStatsMetricKeepsLocalPNLAndPrice(t *testing.T) {
 	base := robotMetric{
 		CurrentPrice:     1.23,
@@ -310,6 +324,9 @@ func TestApplyAccountConfigToRobotRefreshesSecrets(t *testing.T) {
 	got := robot.Config.Exchanges["okx"]
 	if got.APIKey != account.Config.APIKey || got.SecretKey != account.Config.SecretKey || got.Passphrase != account.Config.Passphrase {
 		t.Fatalf("expected robot config to use latest account secrets, got %#v", got)
+	}
+	if got.FeeRate != account.Config.FeeRate {
+		t.Fatalf("expected robot config to use account fee rate, got %.8f want %.8f", got.FeeRate, account.Config.FeeRate)
 	}
 }
 

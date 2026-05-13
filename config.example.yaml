@@ -9,7 +9,7 @@ exchanges:
   # Binance API 配置
     api_key: "YOUR_API_KEY"
     secret_key: "YOUR_API_SECRET"
-    fee_rate: 0.0000  # USDT 合约手续费率 0.02%
+    fee_rate: 0.0002  # USDT 合约手续费率 0.02%
   
   bitget:
   #BITGET 用我链接开户每笔交易最高 70% 手续费返现 邀请码【4n9z】开户链接：https://partner.hdmune.cn/bg/3DLRKF

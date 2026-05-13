@@ -1910,6 +1910,9 @@ func (s *consoleServer) loadAccounts() error {
 		return err
 	}
 	for _, account := range accounts {
+		if account != nil {
+			account.Config = normalizeAccountExchangeConfig(account.Config)
+		}
 		s.accounts[account.ID] = account
 	}
 	return nil
@@ -2069,7 +2072,7 @@ func (s *consoleServer) createAccount(payload accountPayload) (*accountProfile, 
 	if strings.TrimSpace(payload.Exchange) == "" {
 		return nil, fmt.Errorf("交易所不能为空")
 	}
-	payload.Config = trimExchangeConfig(payload.Config)
+	payload.Config = normalizeAccountExchangeConfig(payload.Config)
 	if strings.TrimSpace(payload.Config.APIKey) == "" || strings.TrimSpace(payload.Config.SecretKey) == "" {
 		return nil, fmt.Errorf("API Key 和 Secret Key 不能为空")
 	}
@@ -2105,7 +2108,7 @@ func (s *consoleServer) updateAccount(id string, payload accountPayload) (*accou
 	if !exists {
 		return nil, fmt.Errorf("账户不存在")
 	}
-	payload.Config = mergeExistingSecrets(payload.Config, existing.Config, payload.Exchange == existing.Exchange)
+	payload.Config = normalizeAccountExchangeConfig(mergeExistingSecrets(payload.Config, existing.Config, payload.Exchange == existing.Exchange))
 	if strings.TrimSpace(payload.Config.APIKey) == "" || strings.TrimSpace(payload.Config.SecretKey) == "" {
 		return nil, fmt.Errorf("API Key 和 Secret Key 不能为空")
 	}
@@ -2160,8 +2163,16 @@ func applyAccountConfigToRobot(robot *robotDefinition, account *accountProfile) 
 	if robot.Config.Exchanges == nil {
 		robot.Config.Exchanges = make(map[string]config.ExchangeConfig)
 	}
-	robot.Config.Exchanges[account.Exchange] = account.Config
+	robot.Config.Exchanges[account.Exchange] = normalizeAccountExchangeConfig(account.Config)
 	return nil
+}
+
+func normalizeAccountExchangeConfig(cfg config.ExchangeConfig) config.ExchangeConfig {
+	cfg = trimExchangeConfig(cfg)
+	if cfg.FeeRate == 0 {
+		cfg.FeeRate = config.DefaultFeeRate
+	}
+	return cfg
 }
 
 func trimExchangeConfig(cfg config.ExchangeConfig) config.ExchangeConfig {
@@ -2552,6 +2563,7 @@ func fallbackSymbols() []string {
 
 func accountConfig(exchangeName string, exchangeConfig config.ExchangeConfig, symbol string, marketType string) *config.Config {
 	cfg := &config.Config{}
+	exchangeConfig = normalizeAccountExchangeConfig(exchangeConfig)
 	cfg.App.CurrentExchange = exchangeName
 	cfg.App.MarketType = normalizeMarketTypeParam(marketType)
 	cfg.Exchanges = map[string]config.ExchangeConfig{

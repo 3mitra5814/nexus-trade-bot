@@ -310,6 +310,9 @@ func (spm *SuperPositionManager) currentFeeRate() float64 {
 	if exchangeCfg.FeeRate < 0 {
 		return 0
 	}
+	if exchangeCfg.FeeRate == 0 {
+		return config.DefaultFeeRate
+	}
 	return exchangeCfg.FeeRate
 }
 

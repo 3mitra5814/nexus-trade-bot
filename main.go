@@ -137,7 +137,9 @@ func runTrader(configPath string) {
 	// 获取当前交易所的手续费率
 	exchangeCfg := cfg.Exchanges[cfg.App.CurrentExchange]
 	feeRate := exchangeCfg.FeeRate
-	// 注意：支持0费率，不需要特殊处理
+	if feeRate == 0 {
+		feeRate = config.DefaultFeeRate
+	}
 
 	// 执行持仓安全性检查（使用独立的 safety 包）
 	if err := safety.CheckAccountSafety(

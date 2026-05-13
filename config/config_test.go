@@ -49,3 +49,17 @@ func TestValidateNormalizesDirectionCase(t *testing.T) {
 		t.Fatalf("expected normalized direction long, got %q", cfg.Trading.Direction)
 	}
 }
+
+func TestValidateDefaultsExchangeFeeRate(t *testing.T) {
+	cfg := validConfig()
+	exchangeCfg := cfg.Exchanges["binance"]
+	exchangeCfg.FeeRate = 0
+	cfg.Exchanges["binance"] = exchangeCfg
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if cfg.Exchanges["binance"].FeeRate != DefaultFeeRate {
+		t.Fatalf("expected default fee rate %.8f, got %.8f", DefaultFeeRate, cfg.Exchanges["binance"].FeeRate)
+	}
+}

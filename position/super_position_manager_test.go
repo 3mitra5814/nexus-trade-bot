@@ -1742,7 +1742,7 @@ func TestApplyExchangeSnapshotAppliesMissedOpenExitFill(t *testing.T) {
 	if got := spm.GetTotalSellQty(); got != 0.2 {
 		t.Fatalf("expected total sell qty 0.2, got %.8f", got)
 	}
-	assertFloatNear(t, spm.GetRealizedPNL(), 0.2)
+	assertFloatNear(t, spm.GetRealizedPNL(), gridRealizedPNL(99, 100, 0.2, BookSideLong, config.DefaultFeeRate))
 }
 
 func TestApplyExchangeSnapshotClearsGoneStaleOrder(t *testing.T) {

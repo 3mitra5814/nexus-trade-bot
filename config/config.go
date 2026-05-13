@@ -8,6 +8,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultFeeRate = 0.0002 // 0.02%
+
 // Config 做市商系统配置
 type Config struct {
 	// 应用配置
@@ -152,6 +154,12 @@ func (c *Config) Validate() error {
 	// 验证手续费率配置
 	if exchangeCfg.FeeRate < 0 {
 		return fmt.Errorf("交易所 %s 的手续费率不能为负数", c.App.CurrentExchange)
+	}
+	for name, exchangeCfg := range c.Exchanges {
+		if exchangeCfg.FeeRate == 0 {
+			exchangeCfg.FeeRate = DefaultFeeRate
+			c.Exchanges[name] = exchangeCfg
+		}
 	}
 
 	if c.Trading.Symbol == "" {
