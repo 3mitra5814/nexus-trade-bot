@@ -503,6 +503,8 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	enabledBookSides := spm.enabledBookSides()
 	desiredEntryPrices := make(map[string]map[float64]bool, len(enabledBookSides))
 	desiredEntrySlots := make(map[string][]float64, len(enabledBookSides))
+	desiredExitPrices := make(map[string]map[float64]bool, len(enabledBookSides))
+	maxExitOrdersBySide := make(map[string]int, 2)
 
 	for _, bookSide := range enabledBookSides {
 		desiredEntryPrices[bookSide] = make(map[float64]bool)
@@ -511,9 +513,26 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			desiredEntryPrices[bookSide][price] = true
 			desiredEntrySlots[bookSide] = append(desiredEntrySlots[bookSide], price)
 		}
+
+		exitWindowSize := sellWindowSize
+		if spm.exitOrderSide(bookSide) == "BUY" {
+			exitWindowSize = buyWindowSize
+		}
+		desiredExitPrices[bookSide] = make(map[float64]bool)
+		for _, price := range spm.calculateExitSlotPrices(currentGridPrice, currentPrice, exitWindowSize, bookSide) {
+			desiredExitPrices[bookSide][price] = true
+		}
+		maxExitOrdersBySide[spm.exitOrderSide(bookSide)] += exitWindowSize
 	}
 
 	if allowWindowRebalance {
+		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, maxExitOrdersBySide, desiredExitPrices, nil); err != nil {
+			spm.mu.Unlock()
+			return err
+		} else if rebalanced {
+			spm.mu.Unlock()
+			return spm.adjustOrders(currentPrice, false)
+		}
 		if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
 			spm.mu.Unlock()
 			return err
@@ -571,11 +590,12 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	}
 
 	type exitCandidate struct {
-		SlotPrice     float64
-		ExitPrice     float64
-		Quantity      float64
-		DistanceToMid float64
-		BookSide      string
+		SlotPrice         float64
+		ExitPrice         float64
+		Quantity          float64
+		DistanceToMid     float64
+		ExitDistanceToMid float64
+		BookSide          string
 	}
 	var exitCandidates []exitCandidate
 	spm.slots.Range(func(key, value interface{}) bool {
@@ -594,11 +614,47 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		orderValue := exitPrice * exitQty
 		minValue := spm.minOrderValue()
 		if orderValue >= minValue {
-			exitCandidates = append(exitCandidates, exitCandidate{SlotPrice: slotPrice, ExitPrice: exitPrice, Quantity: exitQty, DistanceToMid: math.Abs(slotPrice - currentPrice), BookSide: slot.BookSide})
+			exitCandidates = append(exitCandidates, exitCandidate{
+				SlotPrice:         slotPrice,
+				ExitPrice:         exitPrice,
+				Quantity:          exitQty,
+				DistanceToMid:     math.Abs(slotPrice - currentPrice),
+				ExitDistanceToMid: math.Abs(exitPrice - currentPrice),
+				BookSide:          slot.BookSide,
+			})
 		}
 		return true
 	})
-	sort.Slice(exitCandidates, func(i, j int) bool { return exitCandidates[i].DistanceToMid < exitCandidates[j].DistanceToMid })
+	sort.Slice(exitCandidates, func(i, j int) bool {
+		if exitCandidates[i].ExitDistanceToMid == exitCandidates[j].ExitDistanceToMid {
+			return exitCandidates[i].DistanceToMid < exitCandidates[j].DistanceToMid
+		}
+		return exitCandidates[i].ExitDistanceToMid < exitCandidates[j].ExitDistanceToMid
+	})
+
+	exitPressure := make(map[string]exitRebalancePressure)
+	for _, candidate := range exitCandidates {
+		exitSide := spm.exitOrderSide(candidate.BookSide)
+		sideBlocked := (exitSide == "BUY" && remainingBuySlots <= 0) || (exitSide == "SELL" && remainingSellSlots <= 0)
+		if !sideBlocked {
+			continue
+		}
+		pressure := exitPressure[exitSide]
+		if pressure.Count == 0 || candidate.ExitDistanceToMid < pressure.ClosestDistance {
+			pressure.ClosestDistance = candidate.ExitDistanceToMid
+		}
+		pressure.Count++
+		exitPressure[exitSide] = pressure
+	}
+	if len(exitPressure) > 0 {
+		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, maxExitOrdersBySide, desiredExitPrices, exitPressure); err != nil {
+			spm.mu.Unlock()
+			return err
+		} else if rebalanced {
+			spm.mu.Unlock()
+			return spm.adjustOrders(currentPrice, false)
+		}
+	}
 
 	allowedNewExitOrders := remainingBuySlots + remainingSellSlots
 	if allowedNewExitOrders < 0 {
@@ -960,11 +1016,11 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 	return true, nil
 }
 
-func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrders int, desiredExitPrices map[string]map[float64]bool) (bool, error) {
-	if maxActiveExitOrders <= 0 {
+func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrdersBySide map[string]int, desiredExitPrices map[string]map[float64]bool, pressure map[string]exitRebalancePressure) (bool, error) {
+	if len(maxActiveExitOrdersBySide) == 0 {
 		return false, nil
 	}
-	var exits []activeOrderCandidate
+	exitsBySide := make(map[string][]activeOrderCandidate, len(maxActiveExitOrdersBySide))
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
 		slot.mu.RLock()
@@ -978,59 +1034,77 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 		if slot.OrderID == 0 || slot.PositionQty <= 0 {
 			return true
 		}
-		orderPrice := roundPrice(slot.OrderPrice, spm.priceDecimals)
-		if desiredExitPrices != nil && desiredExitPrices[slot.BookSide] != nil && !desiredExitPrices[slot.BookSide][orderPrice] {
-			exits = append(exits, activeOrderCandidate{
-				SlotPrice:     slot.Price,
-				BookSide:      slot.BookSide,
-				OrderID:       slot.OrderID,
-				ClientOID:     slot.ClientOID,
-				DistanceToMid: math.Abs(orderPrice - currentPrice),
-			})
+		orderSide := strings.ToUpper(strings.TrimSpace(slot.OrderSide))
+		if maxActiveExitOrdersBySide[orderSide] <= 0 {
 			return true
 		}
-		exits = append(exits, activeOrderCandidate{
+		orderPrice := roundPrice(slot.OrderPrice, spm.priceDecimals)
+		isStale := desiredExitPrices != nil &&
+			desiredExitPrices[slot.BookSide] != nil &&
+			!desiredExitPrices[slot.BookSide][orderPrice]
+		exitsBySide[orderSide] = append(exitsBySide[orderSide], activeOrderCandidate{
 			SlotPrice:     slot.Price,
 			BookSide:      slot.BookSide,
+			OrderSide:     orderSide,
+			OrderPrice:    orderPrice,
 			OrderID:       slot.OrderID,
 			ClientOID:     slot.ClientOID,
 			DistanceToMid: math.Abs(orderPrice - currentPrice),
+			Stale:         isStale,
 		})
 		return true
 	})
-	if len(exits) <= maxActiveExitOrders {
-		var stale []activeOrderCandidate
-		if desiredExitPrices != nil {
-			for _, candidate := range exits {
-				slot := spm.getOrCreateSlot(candidate.SlotPrice, candidate.BookSide)
-				slot.mu.RLock()
-				orderPrice := roundPrice(slot.OrderPrice, spm.priceDecimals)
-				isStale := desiredExitPrices[candidate.BookSide] != nil && !desiredExitPrices[candidate.BookSide][orderPrice]
-				slot.mu.RUnlock()
-				if isStale {
-					stale = append(stale, candidate)
+
+	var toCancel []activeOrderCandidate
+	for orderSide, exits := range exitsBySide {
+		maxActiveExitOrders := maxActiveExitOrdersBySide[orderSide]
+		if maxActiveExitOrders <= 0 || len(exits) == 0 {
+			continue
+		}
+		sort.Slice(exits, func(i, j int) bool {
+			if exits[i].DistanceToMid == exits[j].DistanceToMid {
+				return exits[i].OrderID > exits[j].OrderID
+			}
+			return exits[i].DistanceToMid > exits[j].DistanceToMid
+		})
+
+		if len(exits) > maxActiveExitOrders {
+			toCancel = append(toCancel, exits[:len(exits)-maxActiveExitOrders]...)
+			continue
+		}
+
+		if pressure != nil {
+			if sidePressure, ok := pressure[orderSide]; ok && sidePressure.Count > 0 && len(exits) >= maxActiveExitOrders {
+				farthest := exits[0]
+				if farthest.DistanceToMid > sidePressure.ClosestDistance {
+					toCancel = append(toCancel, farthest)
+					continue
 				}
 			}
 		}
-		if len(stale) == 0 {
-			return false, nil
+
+		var stale []activeOrderCandidate
+		for _, candidate := range exits {
+			if candidate.Stale {
+				stale = append(stale, candidate)
+			}
 		}
-		sort.Slice(stale, func(i, j int) bool {
-			return stale[i].DistanceToMid > stale[j].DistanceToMid
-		})
-		exits = stale
-		maxActiveExitOrders = len(exits) - 1
+		if len(stale) > 0 {
+			toCancel = append(toCancel, stale[0])
+		}
 	}
-	if len(exits) <= maxActiveExitOrders {
+	if len(toCancel) == 0 {
 		return false, nil
 	}
-	sort.Slice(exits, func(i, j int) bool {
-		if exits[i].DistanceToMid == exits[j].DistanceToMid {
-			return exits[i].OrderID > exits[j].OrderID
+	sort.Slice(toCancel, func(i, j int) bool {
+		if toCancel[i].OrderSide != toCancel[j].OrderSide {
+			return toCancel[i].OrderSide < toCancel[j].OrderSide
 		}
-		return exits[i].DistanceToMid > exits[j].DistanceToMid
+		if exits[i].DistanceToMid == exits[j].DistanceToMid {
+			return toCancel[i].OrderID > toCancel[j].OrderID
+		}
+		return toCancel[i].DistanceToMid > toCancel[j].DistanceToMid
 	})
-	toCancel := exits[:len(exits)-maxActiveExitOrders]
 	batchSize := spm.config.Trading.CleanupBatchSize
 	if batchSize <= 0 {
 		batchSize = 10
@@ -1042,7 +1116,7 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 	for _, candidate := range toCancel {
 		orderIDs = append(orderIDs, candidate.OrderID)
 	}
-	logger.Info("🧭 [平仓自检] 平仓挂单超过窗口，撤销 %d 个远端平仓单，保留最近 %d 个", len(orderIDs), maxActiveExitOrders)
+	logger.Info("🧭 [平仓自检] 平仓窗口需要刷新，撤销 %d 个远端平仓单后优先补回现价周边", len(orderIDs))
 
 	spm.mu.Unlock()
 	err := spm.executor.BatchCancelOrders(orderIDs)
