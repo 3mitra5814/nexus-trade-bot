@@ -1100,7 +1100,7 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 		if toCancel[i].OrderSide != toCancel[j].OrderSide {
 			return toCancel[i].OrderSide < toCancel[j].OrderSide
 		}
-		if exits[i].DistanceToMid == exits[j].DistanceToMid {
+		if toCancel[i].DistanceToMid == toCancel[j].DistanceToMid {
 			return toCancel[i].OrderID > toCancel[j].OrderID
 		}
 		return toCancel[i].DistanceToMid > toCancel[j].DistanceToMid
@@ -1918,12 +1918,20 @@ type staleEntryCandidate struct {
 	Distance  float64
 }
 
+type exitRebalancePressure struct {
+	Count           int
+	ClosestDistance float64
+}
+
 type activeOrderCandidate struct {
 	SlotPrice     float64
 	BookSide      string
+	OrderSide     string
+	OrderPrice    float64
 	OrderID       int64
 	ClientOID     string
 	DistanceToMid float64
+	Stale         bool
 }
 
 // IterateSlots 遍历所有槽位（封装 sync.Map.Range）
