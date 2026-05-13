@@ -1204,7 +1204,55 @@ func TestRestoredShortPositionUsesAnchorAlignedGrid(t *testing.T) {
 	}
 }
 
-func TestPositionSnapshotDoesNotAdoptUnmanagedGrowthByDefault(t *testing.T) {
+func TestRestoredLongPositionUsesAnchorAlignedGrid(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+
+	executor := &captureExecutor{}
+	exchange := seededExchange{positions: []*PositionInfo{{
+		Symbol:     "ETHUSDT",
+		Size:       1.19,
+		EntryPrice: 2282.66,
+		MarkPrice:  2282.60,
+	}}}
+	spm := NewSuperPositionManager(cfg, executor, exchange, 2, 2)
+	if err := spm.Initialize(2282.60, "2282.60"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(2282.60); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	if _, ok := spm.slots.Load(spm.slotKey(2282.66, BookSideLong)); ok {
+		t.Fatalf("restored long slot should align to anchor grid, not exchange entry price 2282.66")
+	}
+	if _, ok := spm.slots.Load(spm.slotKey(2282.60, BookSideLong)); !ok {
+		t.Fatalf("expected restored long slot at anchor-aligned grid 2282.60")
+	}
+
+	gotExitPrices := make(map[float64]bool)
+	for _, order := range executor.orders {
+		if order.Side != "SELL" || !order.ReduceOnly {
+			continue
+		}
+		gotExitPrices[order.Price] = true
+	}
+	for _, price := range []float64{2283.60, 2284.60, 2285.60} {
+		if !gotExitPrices[price] {
+			t.Fatalf("expected restored long exits to spread across aligned grid prices, missing %.2f got=%v orders=%+v",
+				price, gotExitPrices, executor.orders)
+		}
+	}
+}
+
+func TestPositionSnapshotAdoptsRemoteShortByDefault(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -1230,10 +1278,19 @@ func TestPositionSnapshotDoesNotAdoptUnmanagedGrowthByDefault(t *testing.T) {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
+	foundExit := false
 	for _, order := range executor.orders {
 		if order.Side == "BUY" && order.ReduceOnly {
-			t.Fatalf("unmanaged exchange short must not be adopted during reconciliation: %+v", order)
+			foundExit = true
+			break
 		}
+	}
+	if !foundExit {
+		t.Fatalf("remote exchange short should be adopted during reconciliation and protected with reduce-only BUY, orders=%+v", executor.orders)
+	}
+	localLong, localShort := spm.localPositionTotals()
+	if localLong != 0 || math.Abs(localShort-1.0) > 0.000001 {
+		t.Fatalf("expected adopted local short position 1.0, got long=%.8f short=%.8f", localLong, localShort)
 	}
 }
 

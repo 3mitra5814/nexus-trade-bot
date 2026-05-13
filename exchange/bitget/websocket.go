@@ -750,13 +750,9 @@ func (w *WebSocketManager) parseOrderUpdate(data map[string]interface{}) *OrderU
 	// 🔍 调试：打印解析后的值
 	logger.Debug("🔍 [parseOrderUpdate] 解析结果: executedQty=%.4f, avgPrice=%.2f, Price=%.2f", executedQty, avgPrice, price)
 
-	side := SideBuy
+	side := bitgetInternalOrderSide(sideStr, tradeSideStr)
 	lowerSide := strings.ToLower(strings.TrimSpace(sideStr))
-	if lowerSide == "sell" {
-		side = SideSell
-	} else if lowerSide == "buy" {
-		side = SideBuy
-	} else {
+	if lowerSide != "sell" && lowerSide != "buy" {
 		lowerTrade := strings.ToLower(strings.TrimSpace(tradeSideStr))
 		lowerPos := strings.ToLower(strings.TrimSpace(posSideStr))
 		if strings.Contains(lowerTrade, "close") || lowerPos == "short" {

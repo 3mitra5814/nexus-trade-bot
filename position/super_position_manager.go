@@ -1917,8 +1917,10 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		slot.mu.Unlock()
 	}
 
-	positions := spm.extractExchangePositions(positionsRaw)
-	spm.reconcilePositionSnapshot(positions)
+	if positionsRaw != nil {
+		positions := spm.extractExchangePositions(positionsRaw)
+		spm.reconcilePositionSnapshot(positions)
+	}
 
 	staleActive := 0
 	var staleOrders []staleOrderRef
@@ -2059,18 +2061,24 @@ func (spm *SuperPositionManager) reconcilePositionSnapshot(positions []exchangeP
 
 func (spm *SuperPositionManager) reconcileBookPositionSnapshot(bookSide string, localQty, remoteQty, entryPrice, tolerance float64) {
 	if localQty <= tolerance {
-		logger.Warn("⚠️ [对账-%s] 检测到交易所已有持仓 %.8f，但本地无槽位；仅启动初始化阶段接管已有持仓，运行中不自动追加平仓槽位", bookSide, remoteQty)
+		if remoteQty <= tolerance {
+			return
+		}
+		logger.Warn("⚠️ [对账接管-%s] 检测到交易所已有持仓 %.8f，但本地无槽位；按默认策略接管为机器人库存槽位", bookSide, remoteQty)
+		spm.adoptRemotePositionSnapshot(bookSide, remoteQty, entryPrice, tolerance)
 		return
 	}
 	if remoteQty+tolerance < localQty {
 		logger.Warn("⚠️ [对账修正-%s] 交易所持仓 %.8f 小于本地机器人持仓 %.8f，按较小值修正，避免平仓单超过真实仓位", bookSide, remoteQty, localQty)
-		spm.resetFilledSlots(bookSide)
-		if remoteQty > 0 {
-			spm.initializeSlotsFromPosition(remoteQty, bookSide, entryPrice)
-		}
+		spm.adoptRemotePositionSnapshot(bookSide, remoteQty, entryPrice, tolerance)
 		return
 	}
-	logger.Warn("⚠️ [对账-%s] 交易所持仓 %.8f 大于本地槽位持仓 %.8f，超出部分不会在运行中追加槽位；如需接管请重启机器人完成初始化恢复", bookSide, remoteQty, localQty)
+	if remoteQty-localQty <= tolerance {
+		return
+	}
+	logger.Warn("⚠️ [对账接管-%s] 交易所持仓 %.8f 大于本地槽位持仓 %.8f，按交易所快照重建机器人库存槽位",
+		bookSide, remoteQty, localQty)
+	spm.adoptRemotePositionSnapshot(bookSide, remoteQty, entryPrice, tolerance)
 }
 
 func (spm *SuperPositionManager) localPositionTotals() (float64, float64) {
@@ -2110,6 +2118,33 @@ func (spm *SuperPositionManager) resetFilledSlots(bookSide string) {
 		slot.OrderFilledQty = 0
 		return true
 	})
+}
+
+func (spm *SuperPositionManager) adoptRemotePositionSnapshot(bookSide string, remoteQty, entryPrice, tolerance float64) {
+	retainedQty := 0.0
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.Lock()
+		defer slot.mu.Unlock()
+		if slot.BookSide != bookSide || slot.PositionStatus != PositionStatusFilled {
+			return true
+		}
+		if spm.slotHasActiveOrder(slot) {
+			retainedQty += slot.PositionQty
+			return true
+		}
+		slot.PositionStatus = PositionStatusEmpty
+		slot.PositionQty = 0
+		slot.SlotStatus = SlotStatusFree
+		slot.OrderFilledQty = 0
+		return true
+	})
+
+	remaining := roundQuantity(remoteQty-retainedQty, spm.quantityDecimals)
+	if remaining <= tolerance {
+		return
+	}
+	spm.initializeSlotsFromPosition(remaining, bookSide, entryPrice)
 }
 
 // GetTotalBuyQty 获取累计买入数量（IPositionManager 接口方法，供 Reconciler 使用）
@@ -2413,6 +2448,9 @@ func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float
 		return
 	}
 	direction := "down"
+	if bookSide == BookSideLong {
+		direction = "up"
+	}
 
 	remaining := roundQuantity(totalPosition, spm.quantityDecimals)
 	allocatedQty := 0.0
@@ -2442,6 +2480,10 @@ func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float
 
 		slot := spm.getOrCreateSlot(price, bookSide)
 		slot.mu.Lock()
+		if spm.slotHasActiveOrder(slot) {
+			slot.mu.Unlock()
+			continue
+		}
 		slot.PositionStatus = PositionStatusFilled
 		slot.PositionQty = slotQty
 		slot.BookSide = bookSide

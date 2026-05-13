@@ -314,10 +314,11 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 	side, tradeSide := bitgetOrderSideAndTradeSide(b.posMode, req.Side, req.ReduceOnly)
 
 	// 🔥 Bitget 双向持仓的特殊逻辑：
+	// hedge_mode 下 side 表示持仓方向，tradeSide 表示开/平。
 	// 开多：side=buy, tradeSide=open
-	// 平多：side=sell, tradeSide=close
+	// 平多：side=buy, tradeSide=close
 	// 开空：side=sell, tradeSide=open
-	// 平空：side=buy, tradeSide=close
+	// 平空：side=sell, tradeSide=close
 
 	// 🔥 使用合约信息中的精度格式化数量和价格
 	quantityStr := fmt.Sprintf("%.*f", b.volumePlace, req.Quantity)
@@ -419,9 +420,29 @@ func bitgetOrderSideAndTradeSide(posMode string, side Side, reduceOnly bool) (st
 		return apiSide, ""
 	}
 	if reduceOnly {
-		return apiSide, "close"
+		if side == SideBuy {
+			return "sell", "close"
+		}
+		return "buy", "close"
 	}
 	return apiSide, "open"
+}
+
+func bitgetInternalOrderSide(apiSide, tradeSide string) Side {
+	side := strings.ToLower(strings.TrimSpace(apiSide))
+	trade := strings.ToLower(strings.TrimSpace(tradeSide))
+	if trade == "close" {
+		if side == "sell" {
+			return SideBuy
+		}
+		if side == "buy" {
+			return SideSell
+		}
+	}
+	if side == "sell" {
+		return SideSell
+	}
+	return SideBuy
 }
 
 // BatchPlaceOrders 批量下单
@@ -649,6 +670,7 @@ func (b *BitgetAdapter) GetOrder(ctx context.Context, symbol string, orderID int
 		AccBaseVolume string `json:"accBaseVolume"`
 		Price         string `json:"price"`
 		Side          string `json:"side"`
+		TradeSide     string `json:"tradeSide"`
 		Status        string `json:"status"`
 		PriceAvg      string `json:"priceAvg"`
 		CTime         string `json:"cTime"`
@@ -666,11 +688,7 @@ func (b *BitgetAdapter) GetOrder(ctx context.Context, symbol string, orderID int
 	executedQty := parseBitgetExecutedQty(data.FilledQty, data.AccBaseVolume, data.BaseVolume)
 	avgPrice, _ := strconv.ParseFloat(data.PriceAvg, 64)
 	updateTime, _ := strconv.ParseInt(data.UTime, 10, 64)
-
-	side := SideBuy
-	if data.Side == "sell" {
-		side = SideSell
-	}
+	side := bitgetInternalOrderSide(data.Side, data.TradeSide)
 
 	status := mapBitgetOrderStatus(data.Status)
 
@@ -709,6 +727,7 @@ func (b *BitgetAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Or
 			Fee           string `json:"fee"`
 			Price         string `json:"price"`
 			Side          string `json:"side"` // "buy" or "sell"
+			TradeSide     string `json:"tradeSide"`
 			Status        string `json:"status"`
 			PriceAvg      string `json:"priceAvg"`
 			BaseVolume    string `json:"baseVolume"`
@@ -735,11 +754,9 @@ func (b *BitgetAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Or
 		avgPrice, _ := strconv.ParseFloat(item.PriceAvg, 64)
 		updateTime, _ := strconv.ParseInt(item.UTime, 10, 64)
 
-		// 转换方向
-		side := SideBuy
-		if item.Side == "sell" {
-			side = SideSell
-		}
+		// 转换为机器人内部动作方向。Bitget 双向持仓的 side 是仓位方向，
+		// close 订单需要反转成实际买/卖动作，避免对账里把平仓单误判成开仓单。
+		side := bitgetInternalOrderSide(item.Side, item.TradeSide)
 
 		status := mapBitgetOrderStatus(item.Status)
 

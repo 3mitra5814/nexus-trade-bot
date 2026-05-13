@@ -68,7 +68,7 @@ func TestParseBitgetBatchCancelFailuresAcceptsEmptyFailureList(t *testing.T) {
 	}
 }
 
-func TestBitgetHedgeReduceOnlyKeepsCloseSide(t *testing.T) {
+func TestBitgetHedgeReduceOnlyUsesPositionSideForClose(t *testing.T) {
 	tests := []struct {
 		name      string
 		side      Side
@@ -78,8 +78,8 @@ func TestBitgetHedgeReduceOnlyKeepsCloseSide(t *testing.T) {
 	}{
 		{name: "open long", side: SideBuy, wantSide: "buy", wantTrade: "open"},
 		{name: "open short", side: SideSell, wantSide: "sell", wantTrade: "open"},
-		{name: "close long", side: SideSell, reduce: true, wantSide: "sell", wantTrade: "close"},
-		{name: "close short", side: SideBuy, reduce: true, wantSide: "buy", wantTrade: "close"},
+		{name: "close long", side: SideSell, reduce: true, wantSide: "buy", wantTrade: "close"},
+		{name: "close short", side: SideBuy, reduce: true, wantSide: "sell", wantTrade: "close"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -87,6 +87,27 @@ func TestBitgetHedgeReduceOnlyKeepsCloseSide(t *testing.T) {
 			if gotSide != tt.wantSide || gotTrade != tt.wantTrade {
 				t.Fatalf("got side=%s tradeSide=%s, want side=%s tradeSide=%s",
 					gotSide, gotTrade, tt.wantSide, tt.wantTrade)
+			}
+		})
+	}
+}
+
+func TestBitgetInternalOrderSideConvertsCloseOrdersToActionSide(t *testing.T) {
+	tests := []struct {
+		name      string
+		side      string
+		tradeSide string
+		want      Side
+	}{
+		{name: "open long", side: "buy", tradeSide: "open", want: SideBuy},
+		{name: "open short", side: "sell", tradeSide: "open", want: SideSell},
+		{name: "close long", side: "buy", tradeSide: "close", want: SideSell},
+		{name: "close short", side: "sell", tradeSide: "close", want: SideBuy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := bitgetInternalOrderSide(tt.side, tt.tradeSide); got != tt.want {
+				t.Fatalf("got %s, want %s", got, tt.want)
 			}
 		})
 	}
