@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"nexus-trade-bot/exchange/ratelimit"
 )
 
 const (
@@ -68,6 +70,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query map[s
 			return nil, fmt.Errorf("序列化 Bybit 请求体失败: %w", err)
 		}
 	}
+	if err := ratelimit.Wait(ctx, bybitRateLimitProfile(method, path, signed)); err != nil {
+		return nil, err
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, requestURL, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -110,10 +115,34 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query map[s
 	}
 
 	if response.RetCode != 0 {
+		if resp.StatusCode == http.StatusTooManyRequests || isBybitRateLimitResponse(response) {
+			return nil, fmt.Errorf("Bybit API 限频: code=%d, msg=%s", response.RetCode, strings.TrimSpace(response.RetMsg))
+		}
 		return nil, fmt.Errorf("Bybit API 错误: code=%d, msg=%s", response.RetCode, strings.TrimSpace(response.RetMsg))
 	}
 
 	return &response, nil
+}
+
+func bybitRateLimitProfile(method, path string, signed bool) ratelimit.Profile {
+	bucket := "GENERAL"
+	defaultQPS := 9
+	if strings.Contains(path, "/v5/order/") || method != http.MethodGet {
+		bucket = "TRADE"
+		defaultQPS = 9
+	} else if strings.Contains(path, "/v5/market/") {
+		bucket = "MARKET"
+		defaultQPS = 18
+	} else if signed {
+		bucket = "ACCOUNT"
+		defaultQPS = 9
+	}
+	return ratelimit.Profile{Exchange: "BYBIT", Bucket: bucket, DefaultQPS: defaultQPS}
+}
+
+func isBybitRateLimitResponse(response Response) bool {
+	msg := strings.ToLower(response.RetMsg)
+	return response.RetCode == 10006 || strings.Contains(msg, "too many") || strings.Contains(msg, "rate limit")
 }
 
 func encodeQuery(query map[string]string) string {

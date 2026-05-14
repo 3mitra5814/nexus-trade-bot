@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"nexus-trade-bot/exchange/ratelimit"
 )
 
 const (
@@ -66,6 +68,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query map[s
 			return nil, fmt.Errorf("序列化 OKX 请求体失败: %w", err)
 		}
 	}
+	if err := ratelimit.Wait(ctx, okxRateLimitProfile(method, path, signed)); err != nil {
+		return nil, err
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+requestPath, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -100,10 +105,34 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query map[s
 		return nil, fmt.Errorf("解析 OKX 响应失败: %w, 响应体: %s", err, string(respBody))
 	}
 	if response.Code != "0" {
+		if resp.StatusCode == http.StatusTooManyRequests || isOKXRateLimitResponse(response) {
+			return nil, fmt.Errorf("OKX API 限频: code=%s, msg=%s", response.Code, strings.TrimSpace(response.Msg))
+		}
 		return nil, fmt.Errorf("OKX API 错误: code=%s, msg=%s", response.Code, strings.TrimSpace(response.Msg))
 	}
 
 	return &response, nil
+}
+
+func okxRateLimitProfile(method, path string, signed bool) ratelimit.Profile {
+	bucket := "GENERAL"
+	defaultQPS := 9
+	if strings.Contains(path, "/trade/") || method != http.MethodGet {
+		bucket = "TRADE"
+		defaultQPS = 27
+	} else if strings.Contains(path, "/market/") || strings.Contains(path, "/public/") {
+		bucket = "MARKET"
+		defaultQPS = 18
+	} else if signed {
+		bucket = "ACCOUNT"
+		defaultQPS = 9
+	}
+	return ratelimit.Profile{Exchange: "OKX", Bucket: bucket, DefaultQPS: defaultQPS}
+}
+
+func isOKXRateLimitResponse(response Response) bool {
+	msg := strings.ToLower(response.Msg)
+	return strings.Contains(msg, "too many") || strings.Contains(msg, "rate limit") || response.Code == "50011"
 }
 
 func encodeQuery(query map[string]string) string {

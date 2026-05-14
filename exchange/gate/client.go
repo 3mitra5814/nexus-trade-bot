@@ -8,7 +8,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"nexus-trade-bot/exchange/ratelimit"
 )
 
 // Client Gate.io HTTP 客户端
@@ -37,6 +40,9 @@ func (c *Client) DoRequest(ctx context.Context, method, path, queryString string
 		if err != nil {
 			return nil, fmt.Errorf("序列化请求体失败: %w", err)
 		}
+	}
+	if err := ratelimit.Wait(ctx, gateRateLimitProfile(method, path)); err != nil {
+		return nil, err
 	}
 
 	timestamp := c.signer.GetTimestamp()
@@ -82,6 +88,10 @@ func (c *Client) DoRequest(ctx context.Context, method, path, queryString string
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var gateResp GateResponse
 		if err := json.Unmarshal(respBody, &gateResp); err == nil {
+			if resp.StatusCode == http.StatusTooManyRequests || isGateRateLimitLabel(gateResp.Label, gateResp.Message) {
+				return nil, fmt.Errorf("Gate.io API 限频: [%s] %s (状态码: %d)",
+					gateResp.Label, gateResp.Message, resp.StatusCode)
+			}
 			// 针对特定错误提供更友好的提示
 			switch gateResp.Label {
 			case "USER_NOT_FOUND":
@@ -99,6 +109,24 @@ func (c *Client) DoRequest(ctx context.Context, method, path, queryString string
 	}
 
 	return respBody, nil
+}
+
+func gateRateLimitProfile(method, path string) ratelimit.Profile {
+	bucket := "GENERAL"
+	defaultQPS := 9
+	if strings.Contains(path, "/candlesticks") || strings.Contains(path, "/tickers") || strings.Contains(path, "/contracts") {
+		bucket = "MARKET"
+		defaultQPS = 9
+	} else if strings.Contains(path, "/orders") || method != http.MethodGet {
+		bucket = "TRADE"
+		defaultQPS = 9
+	}
+	return ratelimit.Profile{Exchange: "GATE", Bucket: bucket, DefaultQPS: defaultQPS}
+}
+
+func isGateRateLimitLabel(label, message string) bool {
+	value := strings.ToLower(label + " " + message)
+	return strings.Contains(value, "rate") || strings.Contains(value, "too many")
 }
 
 // GetContract 获取合约信息

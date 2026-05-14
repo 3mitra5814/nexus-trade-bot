@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"nexus-trade-bot/exchange"
+	"nexus-trade-bot/exchange/ratelimit"
 	"nexus-trade-bot/logger"
 	"os"
 	"runtime"
@@ -61,7 +62,7 @@ func NewExchangeOrderExecutor(ex exchange.IExchange, symbol string, rateLimitRet
 	return &ExchangeOrderExecutor{
 		exchange:            ex,
 		symbol:              symbol,
-		rateLimiter:         rate.NewLimiter(rate.Limit(25), 30), // 25单/秒，突发30
+		rateLimiter:         rate.NewLimiter(rate.Limit(orderLocalRateLimit()), orderLocalBurst()),
 		rateLimitRetryDelay: time.Duration(rateLimitRetryDelay) * time.Second,
 		orderRetryDelay:     time.Duration(orderRetryDelay) * time.Millisecond,
 	}
@@ -89,6 +90,10 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	if err := oe.rateLimiter.Wait(waitCtx); err != nil {
 		waitCancel()
 		return nil, fmt.Errorf("速率限制等待失败: %v", err)
+	}
+	if err := ratelimit.Wait(waitCtx, exchangeTradeRateLimitProfile(oe.exchange.GetName())); err != nil {
+		waitCancel()
+		return nil, fmt.Errorf("交易所全局限速等待失败: %v", err)
 	}
 	waitCancel()
 
@@ -164,7 +169,7 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			// 持仓模式不匹配：双向持仓 vs 单向持仓
 			logger.Error("❌ 下单失败，请在交易所将双向持仓改为单向持仓。错误码: -4061")
 			return nil, fmt.Errorf("持仓模式不匹配: %w", err)
-		} else if strings.Contains(errStr, "-1003") || strings.Contains(errStr, "rate limit") {
+		} else if isRateLimitError(err) {
 			// 速率限制，等待后重试
 			logger.Warn("⚠️ 触发速率限制，等待后重试...")
 			time.Sleep(oe.rateLimitRetryDelay)
@@ -196,6 +201,17 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	}
 
 	return nil, fmt.Errorf("下单失败（重试%d次）: %w", maxRetries, lastErr)
+}
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "-1003") ||
+		strings.Contains(errStr, "429") ||
+		strings.Contains(errStr, "rate limit") ||
+		strings.Contains(errStr, "too many requests")
 }
 
 func isDuplicateClientOrderError(err error) bool {
@@ -328,12 +344,12 @@ func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Or
 }
 
 func orderConcurrency() int {
-	concurrency := runtime.GOMAXPROCS(0) * 2
-	if concurrency < 2 {
-		concurrency = 2
+	concurrency := runtime.GOMAXPROCS(0)
+	if concurrency < 1 {
+		concurrency = 1
 	}
-	if concurrency > 8 {
-		concurrency = 8
+	if concurrency > 3 {
+		concurrency = 3
 	}
 	if configured := strings.TrimSpace(os.Getenv("NEXUS_ORDER_CONCURRENCY")); configured != "" {
 		if parsed, err := strconv.Atoi(configured); err == nil && parsed > 0 {
@@ -346,6 +362,30 @@ func orderConcurrency() int {
 	return concurrency
 }
 
+func orderLocalRateLimit() int {
+	if configured := strings.TrimSpace(os.Getenv("NEXUS_ORDER_RATE_PER_SEC")); configured != "" {
+		if parsed, err := strconv.Atoi(configured); err == nil && parsed > 0 {
+			if parsed > 25 {
+				return 25
+			}
+			return parsed
+		}
+	}
+	return 4
+}
+
+func orderLocalBurst() int {
+	if configured := strings.TrimSpace(os.Getenv("NEXUS_ORDER_RATE_BURST")); configured != "" {
+		if parsed, err := strconv.Atoi(configured); err == nil && parsed > 0 {
+			if parsed > 30 {
+				return 30
+			}
+			return parsed
+		}
+	}
+	return 6
+}
+
 // CancelOrder 取消订单
 func (oe *ExchangeOrderExecutor) CancelOrder(orderID int64) error {
 	// 限流
@@ -353,6 +393,10 @@ func (oe *ExchangeOrderExecutor) CancelOrder(orderID int64) error {
 	if err := oe.rateLimiter.Wait(waitCtx); err != nil {
 		waitCancel()
 		return fmt.Errorf("速率限制等待失败: %v", err)
+	}
+	if err := ratelimit.Wait(waitCtx, exchangeTradeRateLimitProfile(oe.exchange.GetName())); err != nil {
+		waitCancel()
+		return fmt.Errorf("交易所全局限速等待失败: %v", err)
 	}
 	waitCancel()
 
@@ -378,6 +422,12 @@ func (oe *ExchangeOrderExecutor) BatchCancelOrders(orderIDs []int64) error {
 	if len(orderIDs) == 0 {
 		return nil
 	}
+	waitCtx, waitCancel := apiContext()
+	if err := ratelimit.Wait(waitCtx, exchangeTradeRateLimitProfile(oe.exchange.GetName())); err != nil {
+		waitCancel()
+		return fmt.Errorf("交易所全局限速等待失败: %v", err)
+	}
+	waitCancel()
 
 	// 使用交易所的批量撤单接口
 	ctx, cancel := apiContext()
@@ -399,6 +449,27 @@ func (oe *ExchangeOrderExecutor) BatchCancelOrders(orderIDs []int64) error {
 	}
 
 	return nil
+}
+
+func exchangeTradeRateLimitProfile(exchangeName string) ratelimit.Profile {
+	exchangeKey := strings.ToUpper(strings.TrimSpace(exchangeName))
+	exchangeKey = strings.ReplaceAll(exchangeKey, ".", "")
+	switch {
+	case strings.Contains(exchangeKey, "OKX"):
+		return ratelimit.Profile{Exchange: "OKX", Bucket: "TRADE", DefaultQPS: 27}
+	case strings.Contains(exchangeKey, "BYBIT"):
+		return ratelimit.Profile{Exchange: "BYBIT", Bucket: "TRADE", DefaultQPS: 9}
+	case strings.Contains(exchangeKey, "GATE"):
+		return ratelimit.Profile{Exchange: "GATE", Bucket: "TRADE", DefaultQPS: 9}
+	case strings.Contains(exchangeKey, "HYPER"):
+		return ratelimit.Profile{Exchange: "HYPERLIQUID", Bucket: "TRADE", DefaultQPS: 18}
+	case strings.Contains(exchangeKey, "BINANCE"):
+		return ratelimit.Profile{Exchange: "BINANCE", Bucket: "TRADE", DefaultQPS: 9}
+	case strings.Contains(exchangeKey, "BITGET"):
+		return ratelimit.Profile{Exchange: "BITGET", Bucket: "TRADE", DefaultQPS: 9}
+	default:
+		return ratelimit.Profile{Exchange: exchangeKey, Bucket: "TRADE", DefaultQPS: 9}
+	}
 }
 
 // CheckOrderStatus 检查订单状态

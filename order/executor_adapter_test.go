@@ -147,3 +147,26 @@ func TestPlaceOrderKeepsRequestedClientOrderIDWhenExchangeReturnsBlank(t *testin
 		t.Fatalf("expected requested ClientOrderID to be preserved, got %q", order.ClientOrderID)
 	}
 }
+
+func TestIsRateLimitErrorDetectsBitget429(t *testing.T) {
+	if !isRateLimitError(errors.New("bitget API 错误: code=429, msg=Too Many Requests")) {
+		t.Fatal("expected Bitget 429 to be treated as rate limit")
+	}
+}
+
+func TestExchangeTradeRateLimitProfileUsesKnownExchangeDefaults(t *testing.T) {
+	tests := map[string]int{
+		"Bitget":      9,
+		"Binance":     9,
+		"Bybit":       9,
+		"OKX":         27,
+		"Gate.io":     9,
+		"Hyperliquid": 18,
+	}
+	for name, want := range tests {
+		profile := exchangeTradeRateLimitProfile(name)
+		if profile.DefaultQPS != want {
+			t.Fatalf("%s default qps = %d, want %d", name, profile.DefaultQPS, want)
+		}
+	}
+}
