@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -265,6 +266,21 @@ func TestRecordTotalsPersistsWorkerSnapshot(t *testing.T) {
 	daily := Today(snap)
 	assertNear(t, daily.BuyQty, 258.6029)
 	assertNear(t, daily.Volume, 64.650725)
+}
+
+func TestTradingDayKeyUsesConfiguredTimezone(t *testing.T) {
+	t.Setenv("NEXUS_TRADE_BOT_TIMEZONE", "Asia/Hong_Kong")
+	tradingDayLocationOnce = sync.Once{}
+	tradingDayLocation = nil
+	t.Cleanup(func() {
+		tradingDayLocationOnce = sync.Once{}
+		tradingDayLocation = nil
+	})
+
+	utcTime := time.Date(2026, 5, 13, 16, 30, 0, 0, time.UTC)
+	if got := TradingDayKey(utcTime); got != "2026-05-14" {
+		t.Fatalf("got %s want 2026-05-14", got)
+	}
 }
 
 func assertNear(t *testing.T, got, want float64) {

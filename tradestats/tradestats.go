@@ -1,8 +1,10 @@
 package tradestats
 
 import (
+	"context"
 	"encoding/json"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,20 @@ import (
 
 	"nexus-trade-bot/utils"
 )
+
+const timezoneLookupURL = "http://ip-api.com/json/?fields=status,message,timezone,query"
+
+var (
+	tradingDayLocationOnce sync.Once
+	tradingDayLocation     *time.Location
+)
+
+type ipTimezoneResponse struct {
+	Status   string `json:"status"`
+	Timezone string `json:"timezone"`
+	Message  string `json:"message"`
+	Query    string `json:"query"`
+}
 
 type Snapshot struct {
 	TotalRealizedPNL float64                 `json:"total_realized_pnl"`
@@ -381,7 +397,7 @@ func (r *Recorder) RecordTotals(buyQty, sellQty, markPrice, realizedPNL, unreali
 		volume = (buyQty + sellQty) * markPrice
 	}
 	now := time.Now()
-	day := now.Format("2006-01-02")
+	day := TradingDayKey(now)
 	daily := r.snapshot.Daily[day]
 	r.snapshot.TotalBuyQty = math.Max(r.snapshot.TotalBuyQty, buyQty)
 	r.snapshot.TotalSellQty = math.Max(r.snapshot.TotalSellQty, sellQty)
@@ -445,7 +461,7 @@ func snapshotFromLogTotals(totals LogTotals, markPrice float64) Snapshot {
 		totals.Time = time.Now()
 	}
 	snap.UpdatedAt = totals.Time
-	day := totals.Time.Format("2006-01-02")
+	day := TradingDayKey(totals.Time)
 	snap.Daily[day] = DailyStat{RealizedPNL: totals.EstimatedProfit, Volume: volume, BuyQty: totals.BuyQty, SellQty: totals.SellQty}
 	return snap
 }
@@ -510,7 +526,7 @@ func normalizeSnapshot(snap Snapshot) Snapshot {
 
 func Today(snap Snapshot) DailyStat {
 	snap = normalizeSnapshot(snap)
-	return snap.Daily[time.Now().Format("2006-01-02")]
+	return snap.Daily[TradingDayKey(time.Now())]
 }
 
 func firstPositive(values ...float64) float64 {
@@ -585,11 +601,73 @@ func realizedPNL(entryPrice, tradePrice, qty float64, side string, bookSide stri
 func dateKeyForUpdate(updateTime int64) string {
 	if updateTime > 0 {
 		if updateTime > 1_000_000_000_000 {
-			return time.UnixMilli(updateTime).Format("2006-01-02")
+			return TradingDayKey(time.UnixMilli(updateTime))
 		}
-		return time.Unix(updateTime, 0).Format("2006-01-02")
+		return TradingDayKey(time.Unix(updateTime, 0))
 	}
-	return time.Now().Format("2006-01-02")
+	return TradingDayKey(time.Now())
+}
+
+func TradingDayKey(t time.Time) string {
+	if t.IsZero() {
+		t = time.Now()
+	}
+	return t.In(TradingDayLocation()).Format("2006-01-02")
+}
+
+func TradingDayLocation() *time.Location {
+	tradingDayLocationOnce.Do(func() {
+		tradingDayLocation = resolveTradingDayLocation()
+	})
+	return tradingDayLocation
+}
+
+func resolveTradingDayLocation() *time.Location {
+	for _, envName := range []string{"NEXUS_TRADE_BOT_TIMEZONE", "NEXUS_TIMEZONE", "TZ"} {
+		if loc := loadLocation(strings.TrimSpace(os.Getenv(envName))); loc != nil {
+			return loc
+		}
+	}
+	if loc := lookupTimezoneByServerIP(); loc != nil {
+		return loc
+	}
+	return time.Local
+}
+
+func loadLocation(name string) *time.Location {
+	if name == "" {
+		return nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil
+	}
+	return loc
+}
+
+func lookupTimezoneByServerIP() *time.Location {
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, timezoneLookupURL, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil
+	}
+	var payload ipTimezoneResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil
+	}
+	if !strings.EqualFold(payload.Status, "success") {
+		return nil
+	}
+	return loadLocation(payload.Timezone)
 }
 
 func timeForUpdate(updateTime int64, fallback time.Time) time.Time {

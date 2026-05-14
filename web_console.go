@@ -2838,7 +2838,7 @@ func (s *consoleServer) priceChangePct(robot *robotDefinition, currentPrice floa
 	if robot == nil || robot.Config == nil || currentPrice <= 0 {
 		return 0
 	}
-	date := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02")
+	date := tradestats.TradingDayKey(time.Now())
 	key := robot.ID + "|" + strings.ToUpper(strings.TrimSpace(robot.Config.Trading.Symbol))
 
 	s.priceBaseMu.Lock()
