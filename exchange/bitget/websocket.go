@@ -656,13 +656,18 @@ func (w *WebSocketManager) handleOrderUpdate(data json.RawMessage) {
 		status, _ := update["status"].(string)
 		side, _ := update["side"].(string)
 		accBaseVolume, _ := update["accBaseVolume"].(string)
+		instID, _ := update["instId"].(string)
+		if !sameBitgetSymbol(instID, w.currentSubscribedSymbol()) {
+			logger.Debug("⏳ [Bitget WS订单] 忽略非当前订阅交易对订单: update=%s subscribed=%s orderID=%s",
+				instID, w.currentSubscribedSymbol(), orderID)
+			continue
+		}
 
 		// 🔥 关键诊断：如果订单被撤销，打印完整的原始数据
 		if status == "cancelled" || status == "canceled" {
 			clientOID, _ := update["clientOid"].(string)
 			cancelReason, _ := update["cancelReason"].(string)
 			price, _ := update["price"].(string)
-			instID, _ := update["instId"].(string)
 			force, _ := update["force"].(string)
 			tradeSide, _ := update["tradeSide"].(string)
 			logger.Warn("⚠️ [Bitget 订单被交易所撤销] symbol=%s orderID=%s clientOID=%s side=%s tradeSide=%s price=%s filled=%s force=%s reason=%s",
@@ -682,6 +687,18 @@ func (w *WebSocketManager) handleOrderUpdate(data json.RawMessage) {
 			}
 		}
 	}
+}
+
+func (w *WebSocketManager) currentSubscribedSymbol() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.subscribedSymbol
+}
+
+func sameBitgetSymbol(a, b string) bool {
+	a = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(a), "-", ""))
+	b = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(b), "-", ""))
+	return a == "" || b == "" || a == b
 }
 
 // handlePriceUpdate 处理价格更新

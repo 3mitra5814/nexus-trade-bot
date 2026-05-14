@@ -57,12 +57,15 @@ type unrealizedPNLProvider interface {
 	EstimateUnrealizedPNL(markPrice float64) float64
 }
 
+type markPriceProvider func() float64
+
 // Reconciler 持仓对账器
 type Reconciler struct {
-	cfg          *config.Config
-	exchange     IExchange
-	pm           IPositionManager
-	pauseChecker func() bool
+	cfg               *config.Config
+	exchange          IExchange
+	pm                IPositionManager
+	pauseChecker      func() bool
+	markPriceProvider markPriceProvider
 }
 
 // NewReconciler 创建对账器
@@ -77,6 +80,10 @@ func NewReconciler(cfg *config.Config, exchange IExchange, pm IPositionManager) 
 // SetPauseChecker 设置暂停检查函数（用于风控暂停）
 func (r *Reconciler) SetPauseChecker(checker func() bool) {
 	r.pauseChecker = checker
+}
+
+func (r *Reconciler) SetMarkPriceProvider(provider func() float64) {
+	r.markPriceProvider = provider
 }
 
 // Start 启动对账协程
@@ -262,11 +269,24 @@ func (r *Reconciler) Reconcile() error {
 }
 
 func (r *Reconciler) reconciledUnrealizedPNL(positionsRaw interface{}) float64 {
-	markPrice := firstPositivePositionField(positionsRaw, "MarkPrice")
+	markPrice := 0.0
+	if r.markPriceProvider != nil {
+		markPrice = r.markPriceProvider()
+	}
+	markPrice = firstPositive(markPrice, firstPositivePositionField(positionsRaw, "MarkPrice"))
 	if provider, ok := r.pm.(unrealizedPNLProvider); ok && markPrice > 0 {
 		return provider.EstimateUnrealizedPNL(markPrice)
 	}
 	return sumPositionUnrealizedPNL(positionsRaw)
+}
+
+func firstPositive(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func sumPositionUnrealizedPNL(raw interface{}) float64 {

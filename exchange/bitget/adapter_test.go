@@ -68,6 +68,18 @@ func TestParseBitgetBatchCancelFailuresAcceptsEmptyFailureList(t *testing.T) {
 	}
 }
 
+func TestSameBitgetSymbolIgnoresEmptyAndDashFormatting(t *testing.T) {
+	if !sameBitgetSymbol("ETH-USDT", "ETHUSDT") {
+		t.Fatal("expected dashed and compact symbols to match")
+	}
+	if sameBitgetSymbol("XAGUSDT", "ETHUSDT") {
+		t.Fatal("expected different symbols not to match")
+	}
+	if !sameBitgetSymbol("", "ETHUSDT") {
+		t.Fatal("empty update symbol should be accepted for backward compatibility")
+	}
+}
+
 func TestBitgetHedgeReduceOnlyUsesPositionSideForClose(t *testing.T) {
 	tests := []struct {
 		name      string

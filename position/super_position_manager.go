@@ -2622,6 +2622,11 @@ func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float
 // PrintPositions 打印持仓状态（由 main.go 定期调用和退出时调用）
 // 注意：该方法内部使用 totalBuyQty 和 totalSellQty 统计数据
 func (spm *SuperPositionManager) PrintPositions() {
+	spm.PrintPositionsWithMarkPrice(0)
+}
+
+// PrintPositionsWithMarkPrice 使用外部实时价格打印状态，避免状态日志继续使用上次调仓价。
+func (spm *SuperPositionManager) PrintPositionsWithMarkPrice(markPrice float64) {
 	logger.Debug("📊 ===== 当前持仓 =====")
 	debugEnabled := logger.GetLevel() <= logger.DEBUG
 	total := 0.0
@@ -2667,6 +2672,10 @@ func (spm *SuperPositionManager) PrintPositions() {
 	lastPrice, ok := spm.lastMarketPrice.Load().(float64)
 	if !ok || lastPrice <= 0 {
 		lastPrice = spm.anchorPrice
+	}
+	if markPrice > 0 {
+		lastPrice = roundPrice(markPrice, spm.priceDecimals)
+		spm.lastMarketPrice.Store(lastPrice)
 	}
 
 	if debugEnabled {

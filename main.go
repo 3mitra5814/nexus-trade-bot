@@ -236,6 +236,7 @@ func runTrader(configPath string) {
 
 	// === 创建对账器（从仓位管理器剖离） ===
 	reconciler := safety.NewReconciler(cfg, exchangeAdapter, superPositionManager)
+	reconciler.SetMarkPriceProvider(priceMonitor.GetLastPrice)
 	// 将风控状态注入到对账器，用于暂停对账日志
 	reconciler.SetPauseChecker(func() bool {
 		return riskMonitor.IsTriggered()
@@ -399,7 +400,7 @@ func runTrader(configPath string) {
 	if err := reconciler.Reconcile(); err != nil {
 		logger.Fatalf("❌ 启动前交易所对账失败，已停止自动下单以避免重复挂单: %v", err)
 	}
-	superPositionManager.PrintPositions()
+	superPositionManager.PrintPositionsWithMarkPrice(priceMonitor.GetLastPrice())
 
 	// 启动风控监控后再做首次订单调整；如果风控流启动失败，会先进入保护状态。
 	riskMonitor.Start(ctx)
@@ -485,7 +486,7 @@ func runTrader(configPath string) {
 				// 风控触发时不打印状态
 				if !riskMonitor.IsTriggered() {
 					runProtected("状态打印", func() {
-						superPositionManager.PrintPositions()
+						superPositionManager.PrintPositionsWithMarkPrice(priceMonitor.GetLastPrice())
 						persistTradeTotals()
 					})
 				}
@@ -540,7 +541,7 @@ func runTrader(configPath string) {
 	time.Sleep(500 * time.Millisecond)
 
 	// 打印最终状态
-	superPositionManager.PrintPositions()
+	superPositionManager.PrintPositionsWithMarkPrice(priceMonitor.GetLastPrice())
 
 	logger.Info("✅ 系统已安全退出 nexus-trade-bot")
 
