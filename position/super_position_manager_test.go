@@ -298,6 +298,7 @@ func TestDuplicatePartialThenTerminalExitFillIsIgnored(t *testing.T) {
 	slot.mu.Lock()
 	slot.PositionStatus = PositionStatusFilled
 	slot.PositionQty = 0.5
+	slot.EntryPrice = 98.5
 	slot.BookSide = BookSideLong
 	slot.OrderID = 1
 	slot.ClientOID = clientOID
@@ -339,6 +340,52 @@ func TestDuplicatePartialThenTerminalExitFillIsIgnored(t *testing.T) {
 	if got := spm.GetTotalSellQty(); got != 0.5 {
 		t.Fatalf("duplicate terminal exit fill changed total sell qty, got %.8f", got)
 	}
+}
+
+func TestRealizedPNLUsesActualEntryAveragePrice(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 2
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	entryOID := spm.generateClientOrderID(99, "BUY", BookSideLong)
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1, ClientOrderID: entryOID, Status: "NEW", Side: "BUY"})
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1, ClientOrderID: entryOID, Status: "FILLED", ExecutedQty: 0.2, AvgPrice: 98.8, Side: "BUY"})
+
+	exitOID := spm.generateClientOrderID(99, "SELL", BookSideLong)
+	slot := spm.getOrCreateSlot(99, BookSideLong)
+	slot.mu.Lock()
+	slot.OrderID = 2
+	slot.ClientOID = exitOID
+	slot.OrderSide = "SELL"
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.SlotStatus = SlotStatusLocked
+	slot.mu.Unlock()
+
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 2, ClientOrderID: exitOID, Status: "FILLED", ExecutedQty: 0.2, AvgPrice: 100.1, Side: "SELL"})
+
+	assertFloatNear(t, spm.GetRealizedPNL(), gridRealizedPNL(98.8, 100.1, 0.2, BookSideLong, config.DefaultFeeRate))
+}
+
+func TestUnrealizedPNLUsesActualEntryAveragePrice(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 2
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	entryOID := spm.generateClientOrderID(101, "SELL", BookSideShort)
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1, ClientOrderID: entryOID, Status: "NEW", Side: "SELL"})
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1, ClientOrderID: entryOID, Status: "FILLED", ExecutedQty: 0.3, AvgPrice: 101.2, Side: "SELL"})
+
+	assertFloatNear(t, spm.EstimateUnrealizedPNL(100), (101.2-100)*0.3)
 }
 
 func TestLateNewAfterTerminalFillDoesNotRelockSlot(t *testing.T) {
@@ -1713,6 +1760,7 @@ func TestApplyExchangeSnapshotAppliesMissedOpenExitFill(t *testing.T) {
 	slot.mu.Lock()
 	slot.PositionStatus = PositionStatusFilled
 	slot.PositionQty = 0.5
+	slot.EntryPrice = 98.5
 	slot.BookSide = BookSideLong
 	slot.OrderID = 1
 	slot.ClientOID = clientOID
@@ -1742,7 +1790,7 @@ func TestApplyExchangeSnapshotAppliesMissedOpenExitFill(t *testing.T) {
 	if got := spm.GetTotalSellQty(); got != 0.2 {
 		t.Fatalf("expected total sell qty 0.2, got %.8f", got)
 	}
-	assertFloatNear(t, spm.GetRealizedPNL(), gridRealizedPNL(99, 100, 0.2, BookSideLong, config.DefaultFeeRate))
+	assertFloatNear(t, spm.GetRealizedPNL(), gridRealizedPNL(98.5, 100, 0.2, BookSideLong, config.DefaultFeeRate))
 }
 
 func TestApplyExchangeSnapshotClearsGoneStaleOrder(t *testing.T) {

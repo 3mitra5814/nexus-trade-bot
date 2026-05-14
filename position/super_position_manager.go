@@ -104,6 +104,7 @@ type InventorySlot struct {
 	// 持仓信息
 	PositionStatus string  // 持仓状态：空仓/有仓
 	PositionQty    float64 // 持仓数量（支持小数点后3位）
+	EntryPrice     float64 // 实际成交均价成本；为空时回退到槽位价格
 	BookSide       string  // 槽位归属方向：LONG/SHORT
 
 	// 订单信息 (买卖互斥)
@@ -303,6 +304,34 @@ func (spm *SuperPositionManager) addRealizedPNL(entryPrice, tradePrice, qty floa
 	defer spm.statsMu.Unlock()
 	oldTotal := spm.totalRealizedPNL.Load().(float64)
 	spm.totalRealizedPNL.Store(oldTotal + realized)
+}
+
+func (spm *SuperPositionManager) slotEntryPrice(slot *InventorySlot) float64 {
+	return firstPositiveFloat(slot.EntryPrice, slot.Price)
+}
+
+func (spm *SuperPositionManager) applyEntryFill(slot *InventorySlot, fillPrice, deltaQty float64) {
+	if deltaQty <= 0 {
+		return
+	}
+	fillPrice = firstPositiveFloat(fillPrice, slot.Price)
+	slot.EntryPrice = weightedAveragePrice(slot.EntryPrice, slot.PositionQty, fillPrice, deltaQty)
+	slot.PositionQty += deltaQty
+	slot.PositionStatus = PositionStatusFilled
+}
+
+func (spm *SuperPositionManager) applyExitFill(slot *InventorySlot, fillPrice, deltaQty float64, bookSide string) {
+	if deltaQty <= 0 {
+		return
+	}
+	entryPrice := spm.slotEntryPrice(slot)
+	slot.PositionQty -= deltaQty
+	if slot.PositionQty <= 0.000001 {
+		slot.PositionQty = 0
+		slot.EntryPrice = 0
+		slot.PositionStatus = PositionStatusEmpty
+	}
+	spm.addRealizedPNL(entryPrice, fillPrice, deltaQty, bookSide)
 }
 
 func (spm *SuperPositionManager) currentFeeRate() float64 {
@@ -1212,7 +1241,8 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 		isEntry := spm.isEntryOrder(side, bookSide)
 		if isEntry {
 			if deltaQty > 0 {
-				slot.PositionQty += deltaQty
+				tradePrice := firstPositiveFloat(update.AvgPrice, update.Price, price)
+				spm.applyEntryFill(slot, tradePrice, deltaQty)
 				spm.addTradedQty(side, deltaQty)
 			}
 
@@ -1234,13 +1264,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 
 		} else {
 			if deltaQty > 0 {
-				slot.PositionQty -= deltaQty
-				if slot.PositionQty < 0 {
-					slot.PositionQty = 0
-				}
 				spm.addTradedQty(side, deltaQty)
 				tradePrice := firstPositiveFloat(update.AvgPrice, update.Price, spm.exitPrice(price, bookSide))
-				spm.addRealizedPNL(price, tradePrice, deltaQty, bookSide)
+				spm.applyExitFill(slot, tradePrice, deltaQty, bookSide)
 			}
 
 			if status == "FILLED" {
@@ -1266,14 +1292,11 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 		isEntry := spm.isEntryOrder(side, bookSide)
 		if deltaQty > 0 {
 			if isEntry {
-				slot.PositionQty += deltaQty
+				tradePrice := firstPositiveFloat(update.AvgPrice, update.Price, price)
+				spm.applyEntryFill(slot, tradePrice, deltaQty)
 			} else {
-				slot.PositionQty -= deltaQty
-				if slot.PositionQty < 0 {
-					slot.PositionQty = 0
-				}
 				tradePrice := firstPositiveFloat(update.AvgPrice, update.Price, spm.exitPrice(price, bookSide))
-				spm.addRealizedPNL(price, tradePrice, deltaQty, bookSide)
+				spm.applyExitFill(slot, tradePrice, deltaQty, bookSide)
 			}
 			spm.addTradedQty(side, deltaQty)
 		}
@@ -2039,15 +2062,9 @@ func (spm *SuperPositionManager) applySnapshotFillDelta(slot *InventorySlot, sid
 	}
 
 	if spm.isEntryOrder(side, bookSide) {
-		slot.PositionQty += deltaQty
-		slot.PositionStatus = PositionStatusFilled
+		spm.applyEntryFill(slot, tradePrice, deltaQty)
 	} else {
-		slot.PositionQty -= deltaQty
-		if slot.PositionQty <= 0.000001 {
-			slot.PositionQty = 0
-			slot.PositionStatus = PositionStatusEmpty
-		}
-		spm.addRealizedPNL(slot.Price, tradePrice, deltaQty, bookSide)
+		spm.applyExitFill(slot, tradePrice, deltaQty, bookSide)
 	}
 	spm.addTradedQty(side, deltaQty)
 	slot.OrderFilledQty = executedQty
@@ -2258,11 +2275,12 @@ func (spm *SuperPositionManager) EstimateUnrealizedPNL(markPrice float64) float6
 		if slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
 			return true
 		}
+		entryPrice := spm.slotEntryPrice(slot)
 		if slot.BookSide == BookSideShort {
-			total += (slot.Price - markPrice) * slot.PositionQty
+			total += (entryPrice - markPrice) * slot.PositionQty
 			return true
 		}
-		total += (markPrice - slot.Price) * slot.PositionQty
+		total += (markPrice - entryPrice) * slot.PositionQty
 		return true
 	})
 	return total
@@ -2571,6 +2589,7 @@ func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float
 		}
 		slot.PositionStatus = PositionStatusFilled
 		slot.PositionQty = slotQty
+		slot.EntryPrice = firstPositiveFloat(entryPrice, price)
 		slot.BookSide = bookSide
 		slot.OrderID = 0
 		slot.OrderStatus = OrderStatusNotPlaced

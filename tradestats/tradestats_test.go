@@ -80,6 +80,38 @@ func TestRecorderCountsShortRealizedPNL(t *testing.T) {
 	assertNear(t, snap.TotalRealizedPNL, 0.02)
 }
 
+func TestRecorderRealizedPNLUsesActualEntryAveragePrice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "robot.yaml.stats.json")
+	recorder := NewRecorder(path, 2, 1, 0.001)
+
+	if err := recorder.Record(Update{
+		ClientOrderID: "300000_B_L_1700000000001",
+		Side:          "BUY",
+		ExecutedQty:   0.01,
+		AvgPrice:      2999.5,
+		Status:        "FILLED",
+		UpdateTime:    1700000000000,
+	}); err != nil {
+		t.Fatalf("record entry: %v", err)
+	}
+	if err := recorder.Record(Update{
+		ClientOrderID: "300000_S_L_1700000000002",
+		Side:          "SELL",
+		ExecutedQty:   0.01,
+		AvgPrice:      3001,
+		Status:        "FILLED",
+		UpdateTime:    1700000000000,
+	}); err != nil {
+		t.Fatalf("record exit: %v", err)
+	}
+
+	snap, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	assertNear(t, snap.TotalRealizedPNL, realizedPNL(2999.5, 3001, 0.01, "SELL", "LONG", 0.001))
+}
+
 func TestRecorderCountsPartiallyFilledCanceledDelta(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "robot.yaml.stats.json")
 	recorder := NewRecorder(path, 2, 1, 0)
@@ -140,9 +172,9 @@ func TestRecorderStoresRecentTradesByDelta(t *testing.T) {
 	assertNear(t, snap.RecentTrades[1].Quantity, 0.02)
 	assertNear(t, snap.RecentTrades[1].Price, 3001)
 	assertNear(t, snap.RecentTrades[0].PositionDelta, -0.01)
-	assertNear(t, snap.RecentTrades[0].PositionAfter, -0.01)
+	assertNear(t, snap.RecentTrades[0].PositionAfter, -0.02)
 	assertNear(t, snap.RecentTrades[1].PositionDelta, -0.02)
-	assertNear(t, snap.RecentTrades[1].PositionAfter, -0.03)
+	assertNear(t, snap.RecentTrades[1].PositionAfter, -0.04)
 	if snap.RecentTrades[1].Side != "SELL" || snap.RecentTrades[1].BookSide != "LONG" {
 		t.Fatalf("unexpected trade side: %+v", snap.RecentTrades[1])
 	}

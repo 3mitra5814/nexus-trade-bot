@@ -15,16 +15,17 @@ import (
 )
 
 type Snapshot struct {
-	TotalRealizedPNL float64              `json:"total_realized_pnl"`
-	UnrealizedPNL    float64              `json:"unrealized_pnl"`
-	TotalVolume      float64              `json:"total_volume"`
-	TotalBuyQty      float64              `json:"total_buy_qty,omitempty"`
-	TotalSellQty     float64              `json:"total_sell_qty,omitempty"`
-	LastMarkPrice    float64              `json:"last_mark_price,omitempty"`
-	Daily            map[string]DailyStat `json:"daily,omitempty"`
-	Orders           map[string]OrderStat `json:"orders,omitempty"`
-	RecentTrades     []TradeRecord        `json:"recent_trades,omitempty"`
-	UpdatedAt        time.Time            `json:"updated_at,omitempty"`
+	TotalRealizedPNL float64                 `json:"total_realized_pnl"`
+	UnrealizedPNL    float64                 `json:"unrealized_pnl"`
+	TotalVolume      float64                 `json:"total_volume"`
+	TotalBuyQty      float64                 `json:"total_buy_qty,omitempty"`
+	TotalSellQty     float64                 `json:"total_sell_qty,omitempty"`
+	LastMarkPrice    float64                 `json:"last_mark_price,omitempty"`
+	Daily            map[string]DailyStat    `json:"daily,omitempty"`
+	Orders           map[string]OrderStat    `json:"orders,omitempty"`
+	Positions        map[string]PositionStat `json:"positions,omitempty"`
+	RecentTrades     []TradeRecord           `json:"recent_trades,omitempty"`
+	UpdatedAt        time.Time               `json:"updated_at,omitempty"`
 }
 
 type DailyStat struct {
@@ -36,6 +37,12 @@ type DailyStat struct {
 
 type OrderStat struct {
 	ExecutedQty float64 `json:"executed_qty"`
+	AvgPrice    float64 `json:"avg_price,omitempty"`
+}
+
+type PositionStat struct {
+	Qty        float64 `json:"qty"`
+	EntryPrice float64 `json:"entry_price,omitempty"`
 }
 
 type TradeRecord struct {
@@ -229,17 +236,25 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 	if deltaQty <= 0 {
 		return false, nil
 	}
+	tradePrice := incrementalFillPrice(order, update, deltaQty, entryPrice, side, bookSide, r.priceInterval)
 	order.ExecutedQty = update.ExecutedQty
+	order.AvgPrice = firstPositive(update.AvgPrice, tradePrice, order.AvgPrice)
 	r.snapshot.Orders[normalizedClientOrderID] = order
 
-	tradePrice := firstPositive(update.AvgPrice, update.Price, expectedTradePrice(entryPrice, side, bookSide, r.priceInterval))
 	volume := deltaQty * tradePrice
-	realized := realizedPNL(entryPrice, tradePrice, deltaQty, side, bookSide, r.feeRate)
+	realized := r.applyPositionFill(entryPrice, tradePrice, deltaQty, side, bookSide)
 	dateKey := dateKeyForUpdate(update.UpdateTime)
 
 	daily := r.snapshot.Daily[dateKey]
 	daily.Volume += volume
 	daily.RealizedPNL += realized
+	if strings.EqualFold(side, "BUY") {
+		daily.BuyQty += deltaQty
+		r.snapshot.TotalBuyQty += deltaQty
+	} else if strings.EqualFold(side, "SELL") {
+		daily.SellQty += deltaQty
+		r.snapshot.TotalSellQty += deltaQty
+	}
 	positionDelta := signedPositionDelta(side, deltaQty)
 	r.snapshot.Daily[dateKey] = daily
 	r.snapshot.TotalVolume += volume
@@ -263,6 +278,27 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 	}
 	r.snapshot.UpdatedAt = now
 	return true, nil
+}
+
+func (r *Recorder) applyPositionFill(slotPrice, tradePrice, deltaQty float64, side, bookSide string) float64 {
+	key := positionStatKey(bookSide, slotPrice, r.priceDecimals)
+	position := r.snapshot.Positions[key]
+	if isEntryOrder(side, bookSide) {
+		position.EntryPrice = weightedAveragePrice(position.EntryPrice, position.Qty, tradePrice, deltaQty)
+		position.Qty += deltaQty
+		r.snapshot.Positions[key] = position
+		return 0
+	}
+
+	entryPrice := firstPositive(position.EntryPrice, slotPrice)
+	realized := realizedPNL(entryPrice, tradePrice, deltaQty, side, bookSide, r.feeRate)
+	position.Qty -= deltaQty
+	if position.Qty <= 0.000001 {
+		delete(r.snapshot.Positions, key)
+	} else {
+		r.snapshot.Positions[key] = position
+	}
+	return realized
 }
 
 func lastRecordedPosition(snap Snapshot) float64 {
@@ -463,6 +499,9 @@ func normalizeSnapshot(snap Snapshot) Snapshot {
 	if snap.Orders == nil {
 		snap.Orders = make(map[string]OrderStat)
 	}
+	if snap.Positions == nil {
+		snap.Positions = make(map[string]PositionStat)
+	}
 	if len(snap.RecentTrades) > 100 {
 		snap.RecentTrades = snap.RecentTrades[len(snap.RecentTrades)-100:]
 	}
@@ -481,6 +520,38 @@ func firstPositive(values ...float64) float64 {
 		}
 	}
 	return 0
+}
+
+func incrementalFillPrice(order OrderStat, update Update, deltaQty, entryPrice float64, side string, bookSide string, interval float64) float64 {
+	if update.AvgPrice > 0 && update.ExecutedQty > 0 && order.ExecutedQty > 0 && order.AvgPrice > 0 {
+		incrementalValue := update.AvgPrice*update.ExecutedQty - order.AvgPrice*order.ExecutedQty
+		if incrementalValue > 0 {
+			return incrementalValue / deltaQty
+		}
+	}
+	return firstPositive(update.AvgPrice, update.Price, expectedTradePrice(entryPrice, side, bookSide, interval))
+}
+
+func weightedAveragePrice(currentPrice, currentQty, fillPrice, fillQty float64) float64 {
+	if fillQty <= 0 {
+		return currentPrice
+	}
+	if currentQty <= 0 || currentPrice <= 0 {
+		return fillPrice
+	}
+	return ((currentPrice * currentQty) + (fillPrice * fillQty)) / (currentQty + fillQty)
+}
+
+func positionStatKey(bookSide string, slotPrice float64, priceDecimals int) string {
+	multiplier := math.Pow(10, float64(priceDecimals))
+	priceKey := int64(math.Round(slotPrice * multiplier))
+	return strings.ToUpper(strings.TrimSpace(bookSide)) + ":" + strconv.FormatInt(priceKey, 10)
+}
+
+func isEntryOrder(side, bookSide string) bool {
+	side = strings.ToUpper(strings.TrimSpace(side))
+	bookSide = strings.ToUpper(strings.TrimSpace(bookSide))
+	return (bookSide == "LONG" && side == "BUY") || (bookSide == "SHORT" && side == "SELL")
 }
 
 func expectedTradePrice(entryPrice float64, side string, bookSide string, interval float64) float64 {
