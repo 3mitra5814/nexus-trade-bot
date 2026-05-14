@@ -46,6 +46,7 @@ exchanges:
 ####################################
 
 trading:
+  mode: "normal"           # 运行模式：normal(普通模式，优先平衡风险与平仓) / aggressive(激进模式，优先快速累积多空单)
   direction: "long"         # 交易方向：long(做多) / short(做空) / neutral(中性双向)。现货模式仅支持 long
   symbol: "ETHUSDT"
   price_interval: 2         # 价格间隔（1美元）

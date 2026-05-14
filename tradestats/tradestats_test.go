@@ -243,7 +243,7 @@ func TestLoadWithLogFallbackUsesLatestStatsLine(t *testing.T) {
 	}
 	assertNear(t, snap.TotalVolume, 67.15)
 	assertNear(t, snap.TotalRealizedPNL, 5.00)
-	daily := Today(snap)
+	daily := snap.Daily[TradingDayKey(modTime)]
 	assertNear(t, daily.Volume, 67.15)
 	assertNear(t, daily.RealizedPNL, 5.00)
 }
@@ -281,6 +281,92 @@ func TestTradingDayKeyUsesConfiguredTimezone(t *testing.T) {
 	if got := TradingDayKey(utcTime); got != "2026-05-14" {
 		t.Fatalf("got %s want 2026-05-14", got)
 	}
+}
+
+func TestRecordTotalsDoesNotCarryPreviousDayVolumeIntoNewDay(t *testing.T) {
+	t.Setenv("NEXUS_TRADE_BOT_TIMEZONE", "Asia/Hong_Kong")
+	tradingDayLocationOnce = sync.Once{}
+	tradingDayLocation = nil
+	t.Cleanup(func() {
+		tradingDayLocationOnce = sync.Once{}
+		tradingDayLocation = nil
+	})
+
+	path := filepath.Join(t.TempDir(), "robot.yaml.stats.json")
+	recorder := NewRecorder(path, 2, 1, 0)
+	today := TradingDayKey(time.Now())
+	yesterday := TradingDayKey(time.Now().Add(-24 * time.Hour))
+	recorder.snapshot = normalizeSnapshot(Snapshot{
+		TotalBuyQty:   10,
+		TotalSellQty:  0,
+		TotalVolume:   100,
+		LastMarkPrice: 10,
+		Daily: map[string]DailyStat{
+			yesterday: {BuyQty: 10, Volume: 100},
+		},
+	})
+	recorder.snapshotLoaded = true
+
+	if err := recorder.RecordTotals(10, 0, 10, 0, 0); err != nil {
+		t.Fatalf("record totals: %v", err)
+	}
+	snap, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := snap.Daily[today].Volume; got != 0 {
+		t.Fatalf("expected new trading day volume to remain 0 when cumulative totals did not change, got %.12f", got)
+	}
+}
+
+func TestRecordTotalsDoesNotOverrideVolumeWhenTradesExist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "robot.yaml.stats.json")
+	recorder := NewRecorder(path, 2, 1, 0)
+
+	if err := recorder.Record(Update{
+		ClientOrderID: "300000_B_L_1700000000001",
+		Side:          "BUY",
+		ExecutedQty:   1,
+		AvgPrice:      100,
+		Status:        "FILLED",
+		UpdateTime:    1700000000000,
+	}); err != nil {
+		t.Fatalf("record trade: %v", err)
+	}
+	if err := recorder.RecordTotals(1, 0, 999, 0, 0); err != nil {
+		t.Fatalf("record totals: %v", err)
+	}
+	snap, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	assertNear(t, snap.TotalVolume, 100)
+}
+
+func TestLoadWithLogFallbackPrefersStatsFileWhenPresent(t *testing.T) {
+	dir := t.TempDir()
+	statsPath := filepath.Join(dir, "robot.stats.json")
+	logPath := filepath.Join(dir, "robot.log")
+	recorder := NewRecorder(statsPath, 2, 1, 0)
+	if err := recorder.Record(Update{
+		ClientOrderID: "300000_B_L_1700000000001",
+		Side:          "BUY",
+		ExecutedQty:   1,
+		AvgPrice:      100,
+		Status:        "FILLED",
+		UpdateTime:    1700000000000,
+	}); err != nil {
+		t.Fatalf("record trade: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte("2026/05/09 22:41:18 [INFO] 📊 [统计] 对账次数: 2, 累计买入: 258.60, 累计卖出: 10.00, 已实现盈亏: 5.00 USD\n"), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	snap, err := LoadWithLogFallback(statsPath, logPath, 0)
+	if err != nil {
+		t.Fatalf("load fallback: %v", err)
+	}
+	assertNear(t, snap.TotalVolume, 100)
+	assertNear(t, snap.TotalRealizedPNL, 0)
 }
 
 func assertNear(t *testing.T, got, want float64) {

@@ -40,6 +40,7 @@ type consoleServer struct {
 	robotsPath    string
 	robotsDir     string
 	priceBasePath string
+	settingsPath  string
 	sessions      map[string]bool
 	loginFailures map[string]loginFailure
 	balanceCache  map[string]accountBalanceCache
@@ -49,8 +50,13 @@ type consoleServer struct {
 	processes     map[string]*robotProcess
 	baseConfig    *config.Config
 	baseRawYAML   []byte
+	settings      consoleSettings
 	priceBaseMu   sync.Mutex
 	mu            sync.RWMutex
+}
+
+type consoleSettings struct {
+	Timezone string `json:"timezone"`
 }
 
 type authState struct {
@@ -155,6 +161,8 @@ type robotMetric struct {
 	TotalRealizedPNL float64 `json:"total_realized_pnl"`
 	TodayVolume      float64 `json:"today_volume"`
 	TotalVolume      float64 `json:"total_volume"`
+	TodayFees        float64 `json:"today_fees"`
+	TotalFees        float64 `json:"total_fees"`
 	PositionCount    int     `json:"position_count"`
 	OpenOrderCount   int     `json:"open_order_count"`
 	QuoteAsset       string  `json:"quote_asset"`
@@ -229,6 +237,8 @@ type dashboardSummary struct {
 	TotalRealizedPNL   float64 `json:"total_realized_pnl"`
 	TodayVolume        float64 `json:"today_volume"`
 	TotalVolume        float64 `json:"total_volume"`
+	TodayFees          float64 `json:"today_fees"`
+	TotalFees          float64 `json:"total_fees"`
 	TotalBalance       float64 `json:"total_balance"`
 	TotalAvailable     float64 `json:"total_available"`
 	TotalUnrealizedPNL float64 `json:"total_unrealized_pnl"`
@@ -311,6 +321,7 @@ func newConsoleServer(configPath string) (*consoleServer, error) {
 		robotsPath:    filepath.Join(rootDir, "web_console_robots.json"),
 		robotsDir:     filepath.Join(rootDir, "web_console_robots"),
 		priceBasePath: filepath.Join(rootDir, "web_console_price_baselines.json"),
+		settingsPath:  filepath.Join(rootDir, "web_console_settings.json"),
 		sessions:      make(map[string]bool),
 		loginFailures: make(map[string]loginFailure),
 		balanceCache:  make(map[string]accountBalanceCache),
@@ -328,6 +339,9 @@ func newConsoleServer(configPath string) (*consoleServer, error) {
 		return nil, err
 	}
 	if err := server.loadAccounts(); err != nil {
+		return nil, err
+	}
+	if err := server.loadSettings(); err != nil {
 		return nil, err
 	}
 	if err := server.loadRobots(); err != nil {
@@ -349,6 +363,7 @@ func (s *consoleServer) run() error {
 	mux.HandleFunc("/api/change-password", s.handleChangePassword)
 	mux.HandleFunc("/api/dashboard", s.handleDashboard)
 	mux.HandleFunc("/api/base-config", s.handleBaseConfig)
+	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/symbols", s.handleSymbols)
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
@@ -393,6 +408,36 @@ func (s *consoleServer) loadAuth() error {
 		return err
 	}
 	return json.Unmarshal(data, &s.auth)
+}
+
+func (s *consoleServer) loadSettings() error {
+	data, err := os.ReadFile(s.settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		s.settings = consoleSettings{Timezone: tradestats.CurrentTradingTimezoneName()}
+		_ = tradestats.SetTradingDayTimezone(s.settings.Timezone)
+		return s.saveSettings()
+	}
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &s.settings); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.settings.Timezone) == "" {
+		s.settings.Timezone = tradestats.CurrentTradingTimezoneName()
+	}
+	if err := tradestats.SetTradingDayTimezone(s.settings.Timezone); err != nil {
+		s.settings.Timezone = tradestats.CurrentTradingTimezoneName()
+	}
+	return nil
+}
+
+func (s *consoleServer) saveSettings() error {
+	data, err := json.MarshalIndent(s.settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.settingsPath, data, 0600)
 }
 
 func (s *consoleServer) saveAuth() error {
@@ -466,6 +511,25 @@ func (s *consoleServer) authSnapshot() authState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.auth
+}
+
+func (s *consoleServer) currentTimezone() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentTimezoneLocked()
+}
+
+func (s *consoleServer) currentTimezoneLocked() string {
+	if strings.TrimSpace(s.settings.Timezone) != "" {
+		return s.settings.Timezone
+	}
+	return tradestats.CurrentTradingTimezoneName()
+}
+
+func (s *consoleServer) settingsSnapshot() consoleSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings
 }
 
 func (s *consoleServer) mustChangePassword() bool {
@@ -680,7 +744,46 @@ func (s *consoleServer) handleBaseConfig(w http.ResponseWriter, r *http.Request)
 	if !s.requireReady(w, r) {
 		return
 	}
-	writeJSON(w, publicConfig(s.baseConfig))
+	resp := map[string]interface{}{
+		"config":   publicConfig(s.baseConfig),
+		"timezone": s.currentTimezone(),
+	}
+	writeJSON(w, resp)
+}
+
+func (s *consoleServer) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if !s.requireReady(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, s.settingsSnapshot())
+	case http.MethodPut:
+		var payload consoleSettings
+		if !decodeJSONBody(w, r, &payload) {
+			return
+		}
+		payload.Timezone = strings.TrimSpace(payload.Timezone)
+		if payload.Timezone == "" {
+			payload.Timezone = tradestats.CurrentTradingTimezoneName()
+		}
+		if _, err := time.LoadLocation(payload.Timezone); err != nil {
+			http.Error(w, "invalid timezone", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		s.settings.Timezone = payload.Timezone
+		_ = tradestats.SetTradingDayTimezone(payload.Timezone)
+		err := s.saveSettings()
+		s.mu.Unlock()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, s.settingsSnapshot())
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *consoleServer) handleSymbols(w http.ResponseWriter, r *http.Request) {
@@ -715,6 +818,8 @@ func (s *consoleServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		summary.TotalRealizedPNL += robot.Metric.TotalRealizedPNL
 		summary.TodayVolume += robot.Metric.TodayVolume
 		summary.TotalVolume += robot.Metric.TotalVolume
+		summary.TodayFees += robot.Metric.TodayFees
+		summary.TotalFees += robot.Metric.TotalFees
 		summary.TotalUnrealizedPNL += robot.Metric.UnrealizedPNL
 	}
 	for _, metric := range s.collectArchivedRobotMetrics(activeConfigPaths) {
@@ -722,6 +827,8 @@ func (s *consoleServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		summary.TotalRealizedPNL += metric.TotalRealizedPNL
 		summary.TodayVolume += metric.TodayVolume
 		summary.TotalVolume += metric.TotalVolume
+		summary.TodayFees += metric.TodayFees
+		summary.TotalFees += metric.TotalFees
 	}
 	for _, account := range accountBalances {
 		if account.Error != "" {
@@ -997,23 +1104,31 @@ func (s *consoleServer) createRobot(payload robotPayload) (*robotView, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	id := makeRobotID(payload.Name)
+	id := makeRobotID(autoRobotName(cfg))
 	cfg.Trading.OrderTag = robotOrderTag(id)
 	now := time.Now()
+	autoName := autoRobotName(cfg)
 	robot := &robotDefinition{
 		ID:         id,
-		Name:       strings.TrimSpace(payload.Name),
+		Name:       autoName,
 		ConfigPath: filepath.Join(s.robotsDir, id+".yaml"),
 		Config:     cfg,
 		AccountID:  account.ID,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	if robot.Name == "" {
-		robot.Name = "Robot " + strings.ToUpper(id[:6])
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	account, ok := s.accounts[payload.AccountID]
+	if !ok || account == nil {
+		return nil, fmt.Errorf("必须先选择一个已保存账户")
+	}
+	if err := applyAccountConfigToConfig(cfg, account); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if _, exists := s.robots[id]; exists {
 		return nil, fmt.Errorf("机器人 ID 冲突，请重试")
 	}
@@ -1053,20 +1168,26 @@ func (s *consoleServer) updateRobot(id string, payload robotPayload) (*robotView
 	if proc, exists := s.processes[id]; exists && proc.Status == "running" {
 		return nil, fmt.Errorf("编辑前必须先暂停机器人")
 	}
+	account, ok = s.accounts[payload.AccountID]
+	if !ok || account == nil {
+		return nil, fmt.Errorf("必须先选择一个已保存账户")
+	}
+	if err := applyAccountConfigToConfig(cfg, account); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if err := s.ensureNoConflictingRobotLocked(id, account.ID, cfg); err != nil {
 		return nil, err
 	}
 	cfg.Trading.OrderTag = robotOrderTag(id)
 	oldConfigBytes, _ := json.Marshal(robot.Config)
 	newConfigBytes, _ := json.Marshal(cfg)
-	oldName := robot.Name
 	oldAccountID := robot.AccountID
-	newName := strings.TrimSpace(payload.Name)
-	shouldRestart := string(oldConfigBytes) != string(newConfigBytes) || oldName != newName || oldAccountID != account.ID
+	newName := autoRobotName(cfg)
+	shouldRestart := string(oldConfigBytes) != string(newConfigBytes) || robot.Name != newName || oldAccountID != account.ID
 	robot.Name = newName
-	if robot.Name == "" {
-		robot.Name = oldName
-	}
 	robot.Config = cfg
 	robot.AccountID = account.ID
 	robot.UpdatedAt = time.Now()
@@ -1181,6 +1302,7 @@ func (s *consoleServer) startRobot(id string) error {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(os.Environ(), "NEXUS_TRADE_BOT_TIMEZONE="+s.currentTimezoneLocked())
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
 		s.mu.Unlock()
@@ -1731,6 +1853,9 @@ func (s *consoleServer) loadRobots() error {
 		return err
 	}
 	for _, robot := range robots {
+		if robot == nil || strings.TrimSpace(robot.ID) == "" {
+			continue
+		}
 		if robot.Config != nil && robot.AccountID != "" {
 			_, _ = s.applyAccountToRobotConfig(robot.AccountID, robot.Config)
 		}
@@ -1775,16 +1900,14 @@ func (s *consoleServer) normalizeRobotConfig(cfg *config.Config) (*config.Config
 func (s *consoleServer) applyAccountToRobotConfig(accountID string, cfg *config.Config) (*accountProfile, error) {
 	s.mu.RLock()
 	account, ok := s.accounts[accountID]
+	if ok {
+		account = cloneAccountProfile(account)
+	}
 	s.mu.RUnlock()
 	if !ok || account == nil {
 		return nil, fmt.Errorf("必须先选择一个已保存账户")
 	}
-	cfg.App.CurrentExchange = account.Exchange
-	if cfg.Exchanges == nil {
-		cfg.Exchanges = make(map[string]config.ExchangeConfig)
-	}
-	cfg.Exchanges[account.Exchange] = account.Config
-	return account, nil
+	return account, applyAccountConfigToConfig(cfg, account)
 }
 
 func (s *consoleServer) ensureNoConflictingRobotLocked(id string, accountID string, cfg *config.Config) error {
@@ -1860,10 +1983,45 @@ func robotDisplayName(robot *robotDefinition) string {
 	return name
 }
 
+func autoRobotName(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	symbol := formatTradingSymbolForName(cfg.Trading.Symbol)
+	market := "合约"
+	if strings.EqualFold(strings.TrimSpace(cfg.App.MarketType), "spot") {
+		market = "现货"
+	}
+	direction := "做多"
+	switch strings.ToLower(strings.TrimSpace(cfg.Trading.Direction)) {
+	case "short":
+		direction = "做空"
+	case "neutral":
+		direction = "中性"
+	}
+	if symbol == "" {
+		symbol = "未设置交易对"
+	}
+	return symbol + " · " + market + " · " + direction
+}
+
+func formatTradingSymbolForName(symbol string) string {
+	symbol = normalizeTradingSymbol(symbol)
+	for _, quote := range []string{"USDT", "USDC", "USD"} {
+		if strings.HasSuffix(symbol, quote) && len(symbol) > len(quote) {
+			return symbol[:len(symbol)-len(quote)] + "/" + quote
+		}
+	}
+	return symbol
+}
+
 func applyHardcodedRobotDefaults(cfg *config.Config) {
 	cfg.App.MarketType = normalizeMarketTypeParam(cfg.App.MarketType)
 	if cfg.App.MarketType == "spot" {
 		cfg.Trading.Direction = "long"
+	}
+	if strings.TrimSpace(cfg.Trading.Mode) == "" {
+		cfg.Trading.Mode = "normal"
 	}
 	if len(cfg.RiskControl.MonitorSymbols) == 0 {
 		cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"}
@@ -1910,9 +2068,10 @@ func (s *consoleServer) loadAccounts() error {
 		return err
 	}
 	for _, account := range accounts {
-		if account != nil {
-			account.Config = normalizeAccountExchangeConfig(account.Config)
+		if account == nil || strings.TrimSpace(account.ID) == "" {
+			continue
 		}
+		account.Config = normalizeAccountExchangeConfig(account.Config)
 		s.accounts[account.ID] = account
 	}
 	return nil
@@ -1935,7 +2094,7 @@ func (s *consoleServer) collectAccounts() []*accountProfile {
 	s.mu.RLock()
 	items := make([]*accountProfile, 0, len(s.accounts))
 	for _, account := range s.accounts {
-		items = append(items, account)
+		items = append(items, cloneAccountProfile(account))
 	}
 	s.mu.RUnlock()
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.Before(items[j].CreatedAt) })
@@ -2104,11 +2263,17 @@ func (s *consoleServer) updateAccount(id string, payload accountPayload) (*accou
 	}
 	s.mu.RLock()
 	existing, exists := s.accounts[id]
+	var existingConfig config.ExchangeConfig
+	var existingExchange string
+	if exists && existing != nil {
+		existingConfig = existing.Config
+		existingExchange = existing.Exchange
+	}
 	s.mu.RUnlock()
-	if !exists {
+	if !exists || existing == nil {
 		return nil, fmt.Errorf("账户不存在")
 	}
-	payload.Config = normalizeAccountExchangeConfig(mergeExistingSecrets(payload.Config, existing.Config, payload.Exchange == existing.Exchange))
+	payload.Config = normalizeAccountExchangeConfig(mergeExistingSecrets(payload.Config, existingConfig, payload.Exchange == existingExchange))
 	if strings.TrimSpace(payload.Config.APIKey) == "" || strings.TrimSpace(payload.Config.SecretKey) == "" {
 		return nil, fmt.Errorf("API Key 和 Secret Key 不能为空")
 	}
@@ -2156,14 +2321,21 @@ func applyAccountConfigToRobot(robot *robotDefinition, account *accountProfile) 
 	if robot == nil || robot.Config == nil {
 		return fmt.Errorf("机器人配置不存在")
 	}
+	return applyAccountConfigToConfig(robot.Config, account)
+}
+
+func applyAccountConfigToConfig(cfg *config.Config, account *accountProfile) error {
+	if cfg == nil {
+		return fmt.Errorf("机器人配置不存在")
+	}
 	if account == nil {
 		return fmt.Errorf("账户不存在")
 	}
-	robot.Config.App.CurrentExchange = account.Exchange
-	if robot.Config.Exchanges == nil {
-		robot.Config.Exchanges = make(map[string]config.ExchangeConfig)
+	cfg.App.CurrentExchange = account.Exchange
+	if cfg.Exchanges == nil {
+		cfg.Exchanges = make(map[string]config.ExchangeConfig)
 	}
-	robot.Config.Exchanges[account.Exchange] = normalizeAccountExchangeConfig(account.Config)
+	cfg.Exchanges[account.Exchange] = normalizeAccountExchangeConfig(account.Config)
 	return nil
 }
 
@@ -2742,6 +2914,8 @@ func (s *consoleServer) collectArchivedRobotMetrics(activeConfigPaths map[string
 			TotalRealizedPNL: statsSnapshot.TotalRealizedPNL,
 			TodayVolume:      todayStats.Volume,
 			TotalVolume:      statsSnapshot.TotalVolume,
+			TodayFees:        feeRateForConfigPath(configPath) * todayStats.Volume,
+			TotalFees:        feeRateForConfigPath(configPath) * statsSnapshot.TotalVolume,
 		})
 	}
 	return metrics
@@ -2877,6 +3051,7 @@ func (s *consoleServer) savePriceBaselineStore(store priceBaselineStore) {
 func robotStatsMetric(configPath string, markPrice float64) robotMetric {
 	statsSnapshot, statsErr := tradestats.LoadWithLogFallback(tradestats.PathForConfig(configPath), robotLogPath(configPath), markPrice)
 	todayStats := tradestats.Today(statsSnapshot)
+	feeRate := feeRateForConfigPath(configPath)
 	statsError := ""
 	if statsErr != nil {
 		statsError = friendlyErrorMessage(fmt.Errorf("读取交易统计失败: %w", statsErr))
@@ -2888,6 +3063,8 @@ func robotStatsMetric(configPath string, markPrice float64) robotMetric {
 		TotalRealizedPNL: statsSnapshot.TotalRealizedPNL,
 		TodayVolume:      todayStats.Volume,
 		TotalVolume:      statsSnapshot.TotalVolume,
+		TodayFees:        feeRate * todayStats.Volume,
+		TotalFees:        feeRate * statsSnapshot.TotalVolume,
 		Error:            statsError,
 	}
 }
@@ -2900,6 +3077,21 @@ func robotLogPath(configPath string) string {
 	return strings.TrimSuffix(configPath, ext) + ".log"
 }
 
+func feeRateForConfigPath(configPath string) float64 {
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil || cfg == nil {
+		return config.DefaultFeeRate
+	}
+	exchangeCfg, ok := cfg.Exchanges[cfg.App.CurrentExchange]
+	if !ok || exchangeCfg.FeeRate < 0 {
+		return config.DefaultFeeRate
+	}
+	if exchangeCfg.FeeRate == 0 {
+		return config.DefaultFeeRate
+	}
+	return exchangeCfg.FeeRate
+}
+
 func mergeStatsMetric(base, next robotMetric) robotMetric {
 	if next.CurrentPrice > 0 {
 		base.CurrentPrice = next.CurrentPrice
@@ -2909,6 +3101,8 @@ func mergeStatsMetric(base, next robotMetric) robotMetric {
 	base.TotalRealizedPNL = next.TotalRealizedPNL
 	base.TodayVolume = next.TodayVolume
 	base.TotalVolume = next.TotalVolume
+	base.TodayFees = next.TodayFees
+	base.TotalFees = next.TotalFees
 	if next.Error != "" {
 		base.Error = next.Error
 	}

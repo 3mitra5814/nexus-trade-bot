@@ -192,11 +192,16 @@ func (b *BinanceSpotAdapter) CancelOrder(ctx context.Context, symbol string, ord
 }
 
 func (b *BinanceSpotAdapter) BatchCancelOrders(ctx context.Context, symbol string, orderIDs []int64) error {
+	var failed []string
 	for _, orderID := range orderIDs {
 		if err := b.CancelOrder(ctx, symbol, orderID); err != nil {
 			logger.Warn("⚠️ [Binance Spot] 取消订单失败 %d: %v", orderID, err)
+			failed = append(failed, fmt.Sprintf("%d: %v", orderID, err))
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("Binance Spot 批量撤单后仍有 %d 个订单撤销失败: %s", len(failed), strings.Join(failed, "; "))
 	}
 	return nil
 }

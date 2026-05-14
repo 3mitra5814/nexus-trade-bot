@@ -137,6 +137,11 @@ func (oc *OrderCleaner) CleanupOrders() {
 		// 部分成交订单和所有平仓单都计入阈值，但不主动撤销，避免有仓位时失去保护。
 		if orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed {
 			isEntry := (bookSide == "SHORT" && orderSide == "SELL") || (bookSide != "SHORT" && orderSide == "BUY")
+			if isEntry && orderID == 0 {
+				logger.Debug("ℹ️ [订单清理] 跳过尚无远端 OrderID 的开仓单: price=%.8f book=%s side=%s clientOID=%s",
+					price, bookSide, orderSide, clientOID)
+				return true
+			}
 			if isEntry && bookSide == "SHORT" {
 				shortEntryOrders = append(shortEntryOrders, struct {
 					Price     float64

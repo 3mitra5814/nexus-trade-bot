@@ -522,6 +522,7 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 		if len(batch) == 1 {
 			if err := b.CancelOrder(ctx, symbol, batch[0]); err != nil {
 				logger.Warn("⚠️ [Bitget] 取消订单失败 %d: %v", batch[0], err)
+				return fmt.Errorf("Bitget 取消订单 %d 失败: %w", batch[0], err)
 			}
 			continue
 		}

@@ -63,3 +63,16 @@ func TestValidateDefaultsExchangeFeeRate(t *testing.T) {
 		t.Fatalf("expected default fee rate %.8f, got %.8f", DefaultFeeRate, cfg.Exchanges["binance"].FeeRate)
 	}
 }
+
+func TestValidateClampsDefaultRecoveryThresholdToMonitorSymbolCount(t *testing.T) {
+	cfg := validConfig()
+	cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT"}
+	cfg.RiskControl.RecoveryThreshold = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if cfg.RiskControl.RecoveryThreshold != 1 {
+		t.Fatalf("expected recovery threshold to be clamped to 1, got %d", cfg.RiskControl.RecoveryThreshold)
+	}
+}

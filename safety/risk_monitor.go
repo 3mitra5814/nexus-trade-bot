@@ -774,15 +774,14 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, priceStatus, currentVol, avgVol, volRatio, volStatus)
 			}
 		} else {
-			// 非风控状态，判断异常需要同时满足两个条件：价格低于均价 且 成交量超过配置倍数
-			priceAboveMA := currentPrice > avgPrice
-			isPriceBelow := !priceAboveMA
+			// 非风控状态，判断异常需要同时满足方向对应的危险价格侧和成交量放大。
+			isAdversePrice := r.isAdversePriceMove(currentPrice, avgPrice)
 			isVolHigh := !volNormal
 
-			if isPriceBelow && isVolHigh {
+			if isAdversePrice && isVolHigh {
 				// 同时满足两个条件才是真正的异常
-				statusMsg = fmt.Sprintf("🚨异常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",
-					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, currentVol, avgVol, volRatio)
+				statusMsg = fmt.Sprintf("🚨异常[%s|%s]: 当前价=%.4f, 均价=%.4f (%s), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",
+					klineStatus, klineAgeStr, currentPrice, avgPrice, r.adversePriceDescription(priceDeviation), currentVol, avgVol, volRatio)
 			} else {
 				// 否则显示正常（添加K线时间信息）
 				statusMsg = fmt.Sprintf("✅正常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",

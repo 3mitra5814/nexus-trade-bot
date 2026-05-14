@@ -328,6 +328,8 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		return nil
 	}
 
+	var failed []string
+
 	// Gate.io 批量撤单API一次最多20个
 	for i := 0; i < len(orderIDs); i += 20 {
 		end := i + 20
@@ -344,6 +346,13 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		results, err := g.client.BatchCancelOrders(ctx, g.settle, orderIDStrs)
 		if err != nil {
 			logger.Warn("⚠️ [Gate] 批量撤单请求失败: %v", err)
+			logger.Info("🔄 [Gate] 改为逐个撤单...")
+			for _, orderID := range batch {
+				if err := g.CancelOrder(ctx, symbol, orderID); err != nil {
+					failed = append(failed, fmt.Sprintf("%d: %v", orderID, err))
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 			continue
 		}
 
@@ -366,6 +375,7 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 			} else {
 				failCount++
 				logger.Warn("⚠️ [Gate] 取消订单失败 %s: %s", orderID, message)
+				failed = append(failed, fmt.Sprintf("%s: %s", orderID, message))
 			}
 		}
 
@@ -380,6 +390,9 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		}
 	}
 
+	if len(failed) > 0 {
+		return fmt.Errorf("Gate 批量撤单后仍有 %d 个订单撤销失败: %s", len(failed), strings.Join(failed, "; "))
+	}
 	return nil
 }
 

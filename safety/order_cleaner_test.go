@@ -122,3 +122,21 @@ func TestCleanupOrdersCancelsOnlyOrdersAboveThreshold(t *testing.T) {
 		t.Fatalf("expected to cancel only the orders above threshold, got %v", executor.canceled)
 	}
 }
+
+func TestCleanupOrdersDoesNotCancelPendingEntryWithoutOrderID(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.OrderCleanupThreshold = 1
+	cfg.Trading.CleanupBatchSize = 10
+
+	pm := &fakeCleanerPM{slots: []cleanerSlot{
+		{Price: 99, BookSide: "LONG", OrderID: 0, OrderSide: "BUY", OrderStatus: "PLACED"},
+		{Price: 98, BookSide: "LONG", OrderID: 12, OrderSide: "BUY", OrderStatus: "PLACED"},
+	}}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	if len(executor.canceled) != 1 || executor.canceled[0] != 12 {
+		t.Fatalf("expected cleaner to skip zero orderID and cancel real order only, got %v", executor.canceled)
+	}
+}

@@ -22,6 +22,7 @@ type Config struct {
 	Exchanges map[string]ExchangeConfig `yaml:"exchanges" json:"exchanges"`
 
 	Trading struct {
+		Mode                  string  `yaml:"mode" json:"mode"`
 		Direction             string  `yaml:"direction" json:"direction"`
 		Symbol                string  `yaml:"symbol" json:"symbol"`
 		PriceInterval         float64 `yaml:"price_interval" json:"price_interval"`
@@ -162,6 +163,15 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Trading.Mode == "" {
+		c.Trading.Mode = "normal"
+	}
+	c.Trading.Mode = strings.ToLower(strings.TrimSpace(c.Trading.Mode))
+	switch c.Trading.Mode {
+	case "normal", "aggressive":
+	default:
+		return fmt.Errorf("trading.mode 仅支持 normal、aggressive")
+	}
 	if c.Trading.Symbol == "" {
 		return fmt.Errorf("交易对不能为空")
 	}
@@ -250,9 +260,11 @@ func (c *Config) Validate() error {
 	monitorCount := len(c.RiskControl.MonitorSymbols)
 	if c.RiskControl.RecoveryThreshold <= 0 {
 		c.RiskControl.RecoveryThreshold = 3 // 默认3个币种
-	} else if c.RiskControl.RecoveryThreshold < 1 {
+	}
+	if c.RiskControl.RecoveryThreshold < 1 {
 		c.RiskControl.RecoveryThreshold = 1 // 最小1个
-	} else if c.RiskControl.RecoveryThreshold > monitorCount {
+	}
+	if c.RiskControl.RecoveryThreshold > monitorCount {
 		c.RiskControl.RecoveryThreshold = monitorCount // 最大为监控币种数量
 	}
 

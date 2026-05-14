@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -151,6 +152,19 @@ func TestCollectArchivedRobotMetricsSkipsActiveRobots(t *testing.T) {
 	}
 	if metrics[0].TotalVolume != 30 || metrics[0].TodayVolume != 30 {
 		t.Fatalf("expected archived volume only, got %#v", metrics[0])
+	}
+}
+
+func TestAutoRobotNameUsesSymbolMarketAndDirection(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+
+	got := autoRobotName(cfg)
+	want := "ETH/USDT · 合约 · 做空"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
 	}
 }
 
@@ -411,6 +425,116 @@ func TestPublicConfigDeepCopiesSlices(t *testing.T) {
 	public.RiskControl.MonitorSymbols[0] = "ETHUSDT"
 	if cfg.RiskControl.MonitorSymbols[0] != "BTCUSDT" {
 		t.Fatalf("public config mutated source monitor symbols: %#v", cfg.RiskControl.MonitorSymbols)
+	}
+}
+
+func TestCollectAccountsReturnsCopies(t *testing.T) {
+	server := &consoleServer{
+		accounts: map[string]*accountProfile{
+			"acc-1": {
+				ID:       "acc-1",
+				Name:     "main",
+				Exchange: "bitget",
+				Config:   config.ExchangeConfig{APIKey: "api", SecretKey: "secret"},
+			},
+		},
+	}
+
+	accounts := server.collectAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("expected one account, got %d", len(accounts))
+	}
+	accounts[0].Name = "mutated"
+	accounts[0].Config.APIKey = "mutated"
+
+	stored := server.accounts["acc-1"]
+	if stored.Name != "main" || stored.Config.APIKey != "api" {
+		t.Fatalf("collectAccounts leaked mutable account pointer: %#v", stored)
+	}
+}
+
+func TestApplyAccountToRobotConfigUsesAccountSnapshot(t *testing.T) {
+	server := &consoleServer{
+		accounts: map[string]*accountProfile{
+			"acc-1": {
+				ID:       "acc-1",
+				Name:     "main",
+				Exchange: "bitget",
+				Config:   config.ExchangeConfig{APIKey: "api", SecretKey: "secret"},
+			},
+		},
+	}
+	cfg := &config.Config{}
+
+	account, err := server.applyAccountToRobotConfig("acc-1", cfg)
+	if err != nil {
+		t.Fatalf("applyAccountToRobotConfig() error = %v", err)
+	}
+	account.Config.APIKey = "mutated"
+
+	if server.accounts["acc-1"].Config.APIKey != "api" {
+		t.Fatalf("applyAccountToRobotConfig leaked mutable account pointer: %#v", server.accounts["acc-1"])
+	}
+	if cfg.App.CurrentExchange != "bitget" || cfg.Exchanges["bitget"].APIKey != "api" {
+		t.Fatalf("expected robot config to receive account credentials, got %#v", cfg)
+	}
+}
+
+func TestLoadPersistedStoresSkipNilItems(t *testing.T) {
+	dir := t.TempDir()
+	server := &consoleServer{
+		accountsPath: filepath.Join(dir, "accounts.json"),
+		robotsPath:   filepath.Join(dir, "robots.json"),
+		accounts:     make(map[string]*accountProfile),
+		robots:       make(map[string]*robotDefinition),
+	}
+	accountsRaw, err := json.Marshal([]*accountProfile{
+		nil,
+		{ID: "", Name: "blank"},
+		{ID: "acc-1", Name: "main", Config: config.ExchangeConfig{APIKey: " api ", SecretKey: " secret "}},
+	})
+	if err != nil {
+		t.Fatalf("marshal accounts: %v", err)
+	}
+	if err := os.WriteFile(server.accountsPath, accountsRaw, 0600); err != nil {
+		t.Fatalf("write accounts: %v", err)
+	}
+	robotsRaw, err := json.Marshal([]*robotDefinition{
+		nil,
+		{ID: ""},
+		{ID: "bot-1", Name: "bot", Config: &config.Config{}},
+	})
+	if err != nil {
+		t.Fatalf("marshal robots: %v", err)
+	}
+	if err := os.WriteFile(server.robotsPath, robotsRaw, 0600); err != nil {
+		t.Fatalf("write robots: %v", err)
+	}
+
+	if err := server.loadAccounts(); err != nil {
+		t.Fatalf("loadAccounts() error = %v", err)
+	}
+	if err := server.loadRobots(); err != nil {
+		t.Fatalf("loadRobots() error = %v", err)
+	}
+
+	if len(server.accounts) != 1 || server.accounts["acc-1"] == nil {
+		t.Fatalf("expected only valid account to load, got %#v", server.accounts)
+	}
+	if len(server.robots) != 1 || server.robots["bot-1"] == nil {
+		t.Fatalf("expected only valid robot to load, got %#v", server.robots)
+	}
+}
+
+func TestCurrentTimezoneLockedCanBeUsedWhileWriteLocked(t *testing.T) {
+	server := &consoleServer{settings: consoleSettings{Timezone: "Asia/Shanghai"}}
+
+	server.mu.Lock()
+	got := server.currentTimezoneLocked()
+	server.mu.Unlock()
+
+	if got != "Asia/Shanghai" {
+		t.Fatalf("expected locked timezone lookup to use settings value, got %q", got)
 	}
 }
 

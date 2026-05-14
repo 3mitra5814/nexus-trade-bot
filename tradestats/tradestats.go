@@ -17,10 +17,13 @@ import (
 )
 
 const timezoneLookupURL = "http://ip-api.com/json/?fields=status,message,timezone,query"
+const defaultTradingTimezone = "Asia/Hong_Kong"
 
 var (
 	tradingDayLocationOnce sync.Once
 	tradingDayLocation     *time.Location
+	tradingDayTimezoneMu   sync.Mutex
+	tradingDayTimezoneName string
 )
 
 type ipTimezoneResponse struct {
@@ -131,56 +134,24 @@ func Load(path string) (Snapshot, error) {
 }
 
 func LoadWithLogFallback(statsPath string, logPath string, markPrice float64) (Snapshot, error) {
-	snap, err := Load(statsPath)
-	if markPrice <= 0 && snap.LastMarkPrice > 0 {
-		markPrice = snap.LastMarkPrice
+	if info, err := os.Stat(statsPath); err == nil && info != nil {
+		snap, loadErr := Load(statsPath)
+		if markPrice <= 0 && snap.LastMarkPrice > 0 {
+			markPrice = snap.LastMarkPrice
+		}
+		return snap, loadErr
+	} else if err != nil && !os.IsNotExist(err) {
+		return normalizeSnapshot(Snapshot{}), err
 	}
+	snap := normalizeSnapshot(Snapshot{})
 	if logPath == "" {
-		return snap, err
+		return snap, nil
 	}
 	logTotals, ok := ParseLatestLogTotals(logPath)
 	if !ok {
-		return snap, err
+		return snap, nil
 	}
-	fallback := snapshotFromLogTotals(logTotals, markPrice)
-	if fallback.TotalVolume > snap.TotalVolume {
-		snap.TotalVolume = fallback.TotalVolume
-	}
-	if fallback.TotalBuyQty > snap.TotalBuyQty {
-		snap.TotalBuyQty = fallback.TotalBuyQty
-	}
-	if fallback.TotalSellQty > snap.TotalSellQty {
-		snap.TotalSellQty = fallback.TotalSellQty
-	}
-	if fallback.LastMarkPrice > 0 {
-		snap.LastMarkPrice = fallback.LastMarkPrice
-	}
-	if snap.UnrealizedPNL == 0 {
-		snap.UnrealizedPNL = fallback.UnrealizedPNL
-	}
-	if math.Abs(fallback.TotalRealizedPNL) > math.Abs(snap.TotalRealizedPNL) {
-		snap.TotalRealizedPNL = fallback.TotalRealizedPNL
-	}
-	for day, value := range fallback.Daily {
-		current := snap.Daily[day]
-		if value.Volume > current.Volume {
-			current.Volume = value.Volume
-		}
-		if value.BuyQty > current.BuyQty {
-			current.BuyQty = value.BuyQty
-		}
-		if value.SellQty > current.SellQty {
-			current.SellQty = value.SellQty
-		}
-		if math.Abs(value.RealizedPNL) > math.Abs(current.RealizedPNL) {
-			current.RealizedPNL = value.RealizedPNL
-		}
-		snap.Daily[day] = current
-	}
-	if fallback.UpdatedAt.After(snap.UpdatedAt) {
-		snap.UpdatedAt = fallback.UpdatedAt
-	}
-	return snap, err
+	return snapshotFromLogTotals(logTotals, markPrice), nil
 }
 
 func ParseLatestLogTotals(logPath string) (LogTotals, bool) {
@@ -392,34 +363,53 @@ func (r *Recorder) RecordTotals(buyQty, sellQty, markPrice, realizedPNL, unreali
 	if err := r.loadLocked(); err != nil {
 		return err
 	}
-	volume := 0.0
-	if markPrice > 0 && !math.IsNaN(markPrice) && !math.IsInf(markPrice, 0) {
-		volume = (buyQty + sellQty) * markPrice
-	}
 	now := time.Now()
-	day := TradingDayKey(now)
-	daily := r.snapshot.Daily[day]
 	r.snapshot.TotalBuyQty = math.Max(r.snapshot.TotalBuyQty, buyQty)
 	r.snapshot.TotalSellQty = math.Max(r.snapshot.TotalSellQty, sellQty)
 	if markPrice > 0 && !math.IsNaN(markPrice) && !math.IsInf(markPrice, 0) {
 		r.snapshot.LastMarkPrice = markPrice
 	}
-	daily.BuyQty = math.Max(daily.BuyQty, buyQty)
-	daily.SellQty = math.Max(daily.SellQty, sellQty)
-	if volume > r.snapshot.TotalVolume {
-		r.snapshot.TotalVolume = volume
-	}
-	if volume > daily.Volume {
-		daily.Volume = volume
-	}
-	if len(r.snapshot.Orders) == 0 && math.Abs(realizedPNL) > math.Abs(r.snapshot.TotalRealizedPNL) {
-		r.snapshot.TotalRealizedPNL = realizedPNL
-	}
-	if len(r.snapshot.Orders) == 0 && math.Abs(realizedPNL) > math.Abs(daily.RealizedPNL) {
-		daily.RealizedPNL = realizedPNL
+	if len(r.snapshot.Orders) == 0 && len(r.snapshot.RecentTrades) == 0 {
+		day := TradingDayKey(now)
+		daily := r.snapshot.Daily[day]
+		previousBuyQty := 0.0
+		previousSellQty := 0.0
+		for dayKey, stat := range r.snapshot.Daily {
+			if dayKey == day {
+				continue
+			}
+			previousBuyQty += stat.BuyQty
+			previousSellQty += stat.SellQty
+		}
+		todayBuyQty := buyQty - previousBuyQty
+		if todayBuyQty < 0 {
+			todayBuyQty = 0
+		}
+		todaySellQty := sellQty - previousSellQty
+		if todaySellQty < 0 {
+			todaySellQty = 0
+		}
+		daily.BuyQty = math.Max(daily.BuyQty, todayBuyQty)
+		daily.SellQty = math.Max(daily.SellQty, todaySellQty)
+		if markPrice > 0 && !math.IsNaN(markPrice) && !math.IsInf(markPrice, 0) {
+			volume := (buyQty + sellQty) * markPrice
+			todayVolume := (todayBuyQty + todaySellQty) * markPrice
+			if volume > r.snapshot.TotalVolume {
+				r.snapshot.TotalVolume = volume
+			}
+			if todayVolume > daily.Volume {
+				daily.Volume = todayVolume
+			}
+		}
+		if math.Abs(realizedPNL) > math.Abs(r.snapshot.TotalRealizedPNL) {
+			r.snapshot.TotalRealizedPNL = realizedPNL
+		}
+		if math.Abs(realizedPNL) > math.Abs(daily.RealizedPNL) {
+			daily.RealizedPNL = realizedPNL
+		}
+		r.snapshot.Daily[day] = daily
 	}
 	r.snapshot.UnrealizedPNL = unrealizedPNL
-	r.snapshot.Daily[day] = daily
 	r.snapshot.UpdatedAt = now
 	return r.saveLocked()
 }
@@ -623,6 +613,12 @@ func TradingDayLocation() *time.Location {
 }
 
 func resolveTradingDayLocation() *time.Location {
+	tradingDayTimezoneMu.Lock()
+	override := strings.TrimSpace(tradingDayTimezoneName)
+	tradingDayTimezoneMu.Unlock()
+	if loc := loadLocation(override); loc != nil {
+		return loc
+	}
 	for _, envName := range []string{"NEXUS_TRADE_BOT_TIMEZONE", "NEXUS_TIMEZONE", "TZ"} {
 		if loc := loadLocation(strings.TrimSpace(os.Getenv(envName))); loc != nil {
 			return loc
@@ -631,7 +627,34 @@ func resolveTradingDayLocation() *time.Location {
 	if loc := lookupTimezoneByServerIP(); loc != nil {
 		return loc
 	}
-	return time.Local
+	if loc := loadLocation(defaultTradingTimezone); loc != nil {
+		return loc
+	}
+	return time.FixedZone("UTC+8", 8*3600)
+}
+
+func CurrentTradingTimezoneName() string {
+	name := strings.TrimSpace(TradingDayLocation().String())
+	if name == "" || strings.EqualFold(name, "Local") {
+		return defaultTradingTimezone
+	}
+	return name
+}
+
+func SetTradingDayTimezone(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = defaultTradingTimezone
+	}
+	if _, err := time.LoadLocation(name); err != nil {
+		return err
+	}
+	tradingDayTimezoneMu.Lock()
+	tradingDayTimezoneName = name
+	tradingDayLocation = nil
+	tradingDayLocationOnce = sync.Once{}
+	tradingDayTimezoneMu.Unlock()
+	return nil
 }
 
 func loadLocation(name string) *time.Location {

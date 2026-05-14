@@ -119,7 +119,7 @@ type InventorySlot struct {
 	// 🔥 新增：槽位锁定状态，防止并发重复操作
 	SlotStatus string // FREE/PENDING/LOCKED
 
-	// PostOnly失败计数（连续失败3次后降级为普通单）
+	// PostOnly失败计数（仅记录交易所拒绝/过期，不包含程序主动撤单）
 	PostOnlyFailCount int
 
 	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
@@ -222,6 +222,18 @@ func (spm *SuperPositionManager) tradingDirection() string {
 		return "long"
 	}
 	return direction
+}
+
+func (spm *SuperPositionManager) tradingMode() string {
+	mode := strings.ToLower(strings.TrimSpace(spm.config.Trading.Mode))
+	if mode == "" {
+		return "normal"
+	}
+	return mode
+}
+
+func (spm *SuperPositionManager) isAggressiveMode() bool {
+	return spm.tradingMode() == "aggressive"
 }
 
 func (spm *SuperPositionManager) enabledBookSides() []string {
@@ -535,7 +547,6 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	enabledBookSides := spm.enabledBookSides()
 	desiredEntryPrices := make(map[string]map[float64]bool, len(enabledBookSides))
 	desiredEntrySlots := make(map[string][]float64, len(enabledBookSides))
-	desiredExitPrices := make(map[string]map[float64]bool, len(enabledBookSides))
 	maxExitOrdersBySide := make(map[string]int, 2)
 
 	for _, bookSide := range enabledBookSides {
@@ -550,27 +561,25 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		if spm.exitOrderSide(bookSide) == "BUY" {
 			exitWindowSize = buyWindowSize
 		}
-		desiredExitPrices[bookSide] = make(map[float64]bool)
-		for _, price := range spm.calculateExitSlotPrices(currentGridPrice, currentPrice, exitWindowSize, bookSide) {
-			desiredExitPrices[bookSide][price] = true
-		}
 		maxExitOrdersBySide[spm.exitOrderSide(bookSide)] += exitWindowSize
 	}
 
 	if allowWindowRebalance {
-		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, maxExitOrdersBySide, desiredExitPrices, nil); err != nil {
+		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, maxExitOrdersBySide, nil); err != nil {
 			spm.mu.Unlock()
 			return err
 		} else if rebalanced {
 			spm.mu.Unlock()
 			return spm.adjustOrders(currentPrice, false)
 		}
-		if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
-			spm.mu.Unlock()
-			return err
-		} else if rebalanced {
-			spm.mu.Unlock()
-			return spm.adjustOrders(currentPrice, false)
+		if !spm.isAggressiveMode() {
+			if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
+				spm.mu.Unlock()
+				return err
+			} else if rebalanced {
+				spm.mu.Unlock()
+				return spm.adjustOrders(currentPrice, false)
+			}
 		}
 	}
 
@@ -638,7 +647,16 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		if slot.PositionStatus != PositionStatusFilled || slot.SlotStatus != SlotStatusFree || slot.OrderID != 0 || slot.ClientOID != "" || slot.PositionQty <= 0 {
 			return true
 		}
-		exitPrice := spm.makerSafeExitPrice(spm.exitPrice(slotPrice, slot.BookSide), currentPrice, slot.BookSide)
+		exitPrice := spm.exitPrice(slotPrice, slot.BookSide)
+		if !spm.isAggressiveMode() || spm.tradingDirection() == "neutral" {
+			exitPrice = spm.makerSafeExitPrice(exitPrice, currentPrice, slot.BookSide)
+		} else {
+			exitPrice = roundPrice(exitPrice, spm.priceDecimals)
+			windowMaxDistance := float64(sellWindowSize) * spm.config.Trading.PriceInterval
+			if math.Abs(slotPrice-currentPrice) > windowMaxDistance {
+				return true
+			}
+		}
 		exitQty, ok := spm.exitOrderQuantity(slot.PositionQty, exitPrice)
 		if !ok {
 			return true
@@ -679,7 +697,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 		exitPressure[exitSide] = pressure
 	}
 	if len(exitPressure) > 0 {
-		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, maxExitOrdersBySide, desiredExitPrices, exitPressure); err != nil {
+		if rebalanced, err := spm.rebalanceExitWindow(currentPrice, maxExitOrdersBySide, exitPressure); err != nil {
 			spm.mu.Unlock()
 			return err
 		} else if rebalanced {
@@ -702,142 +720,179 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	}
 
 	exitOrdersToCreate := 0
-	skippedDuplicateExitKeys := make(map[string]struct{})
-	for i := 0; i < len(exitCandidates) && exitOrdersToCreate < allowedNewExitOrders; i++ {
-		candidate := exitCandidates[i]
-		exitSide := spm.exitOrderSide(candidate.BookSide)
-		if exitSide == "BUY" {
-			if remainingBuySlots <= 0 {
-				continue
-			}
-		} else if exitSide == "SELL" {
-			if remainingSellSlots <= 0 {
-				continue
-			}
-		}
-		slot := spm.getOrCreateSlot(candidate.SlotPrice, candidate.BookSide)
-		slot.mu.Lock()
-		if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
-			slot.mu.Unlock()
-			continue
-		}
-		slot.SlotStatus = SlotStatusPending
-		usePostOnly := true
-		clientOID := spm.generateClientOrderID(candidate.SlotPrice, exitSide, candidate.BookSide)
-		placementKey := spm.orderPlacementKey(exitSide, candidate.BookSide, candidate.ExitPrice)
-		if _, exists := plannedOrderKeys[placementKey]; exists {
-			slot.SlotStatus = SlotStatusFree
-			slot.mu.Unlock()
-			if _, logged := skippedDuplicateExitKeys[placementKey]; !logged {
-				logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
-					candidate.BookSide, exitSide, formatPrice(candidate.ExitPrice, spm.priceDecimals))
-				skippedDuplicateExitKeys[placementKey] = struct{}{}
-			}
-			continue
-		}
-		plannedOrderKeys[placementKey] = struct{}{}
-		slot.ClientOID = clientOID
-		slot.OrderSide = exitSide
-		slot.OrderPrice = candidate.ExitPrice
-		slot.OrderStatus = OrderStatusPlaced
-		slot.OrderCreatedAt = time.Now()
-		slot.mu.Unlock()
-		ordersToPlace = append(ordersToPlace, &OrderRequest{Symbol: spm.config.Trading.Symbol, Side: exitSide, Price: candidate.ExitPrice, Quantity: candidate.Quantity, PriceDecimals: spm.priceDecimals, ReduceOnly: true, PostOnly: usePostOnly, ClientOrderID: clientOID})
-		exitOrdersToCreate++
-		if exitSide == "BUY" {
-			remainingBuySlots--
-		} else if exitSide == "SELL" {
-			remainingSellSlots--
-		}
-	}
-
-	remainingOrdersForEntry = threshold - currentOrderCount - exitOrdersToCreate
-	if remainingOrdersForEntry < 0 {
-		remainingOrdersForEntry = 0
-	}
-
-	allowedNewEntryOrders := remainingBuySlots + remainingSellSlots
-	if allowedNewEntryOrders < 0 {
-		allowedNewEntryOrders = 0
-	}
-	if spm.tradingDirection() != "neutral" {
-		allowedNewEntryOrders = remainingOrdersForEntry
-	}
-	if allowedNewEntryOrders > remainingOrdersForEntry {
-		allowedNewEntryOrders = remainingOrdersForEntry
-	}
 	entryOrdersToCreate := 0
+	skippedDuplicateExitKeys := make(map[string]struct{})
 
-	for _, bookSide := range enabledBookSides {
-		entrySide := spm.entryOrderSide(bookSide)
-		for _, price := range desiredEntrySlots[bookSide] {
-			if entryOrdersToCreate >= allowedNewEntryOrders {
-				break
-			}
-			if spm.tradingDirection() == "neutral" {
-				if entrySide == "BUY" {
-					if remainingBuySlots <= 0 {
-						break
-					}
-				} else if entrySide == "SELL" {
-					if remainingSellSlots <= 0 {
-						break
-					}
+	createExitOrders := func(limit int) {
+		if limit <= 0 {
+			return
+		}
+		for i := 0; i < len(exitCandidates) && exitOrdersToCreate < limit; i++ {
+			candidate := exitCandidates[i]
+			exitSide := spm.exitOrderSide(candidate.BookSide)
+			if exitSide == "BUY" {
+				if remainingBuySlots <= 0 {
+					continue
+				}
+			} else if exitSide == "SELL" {
+				if remainingSellSlots <= 0 {
+					continue
 				}
 			}
-			slot := spm.getOrCreateSlot(price, bookSide)
+			slot := spm.getOrCreateSlot(candidate.SlotPrice, candidate.BookSide)
 			slot.mu.Lock()
-			slot.BookSide = bookSide
-			if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusEmpty {
+			if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
 				slot.mu.Unlock()
 				continue
 			}
-			if spm.slotHasActiveOrder(slot) || slot.OrderID != 0 || slot.ClientOID != "" {
-				slot.mu.Unlock()
-				continue
-			}
-
-			quantity, ok := spm.entryOrderQuantity(price)
-			if !ok {
-				slot.mu.Unlock()
-				continue
-			}
-			clientOID := spm.generateClientOrderID(price, entrySide, bookSide)
-			placementKey := spm.orderPlacementKey(entrySide, bookSide, price)
+			slot.SlotStatus = SlotStatusPending
+			usePostOnly := true
+			clientOID := spm.generateClientOrderID(candidate.SlotPrice, exitSide, candidate.BookSide)
+			placementKey := spm.orderPlacementKey(exitSide, candidate.BookSide, candidate.ExitPrice)
 			if _, exists := plannedOrderKeys[placementKey]; exists {
+				slot.SlotStatus = SlotStatusFree
 				slot.mu.Unlock()
-				logger.Warn("⚠️ [跳过重复开仓单] %s %s %s 已存在活跃/待提交订单",
-					bookSide, entrySide, formatPrice(price, spm.priceDecimals))
+				if _, logged := skippedDuplicateExitKeys[placementKey]; !logged {
+					logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
+						candidate.BookSide, exitSide, formatPrice(candidate.ExitPrice, spm.priceDecimals))
+					skippedDuplicateExitKeys[placementKey] = struct{}{}
+				}
 				continue
 			}
 			plannedOrderKeys[placementKey] = struct{}{}
-			slot.SlotStatus = SlotStatusPending
 			slot.ClientOID = clientOID
-			slot.OrderSide = entrySide
-			slot.OrderPrice = price
+			slot.OrderSide = exitSide
+			slot.OrderPrice = candidate.ExitPrice
 			slot.OrderStatus = OrderStatusPlaced
 			slot.OrderCreatedAt = time.Now()
-			usePostOnly := true
 			slot.mu.Unlock()
+			ordersToPlace = append(ordersToPlace, &OrderRequest{Symbol: spm.config.Trading.Symbol, Side: exitSide, Price: candidate.ExitPrice, Quantity: candidate.Quantity, PriceDecimals: spm.priceDecimals, ReduceOnly: true, PostOnly: usePostOnly, ClientOrderID: clientOID})
+			exitOrdersToCreate++
+			if exitSide == "BUY" {
+				remainingBuySlots--
+			} else if exitSide == "SELL" {
+				remainingSellSlots--
+			}
+		}
+	}
 
-			ordersToPlace = append(ordersToPlace, &OrderRequest{
-				Symbol:        spm.config.Trading.Symbol,
-				Side:          entrySide,
-				Price:         price,
-				Quantity:      quantity,
-				PriceDecimals: spm.priceDecimals,
-				PostOnly:      usePostOnly,
-				ClientOrderID: clientOID,
-			})
-			entryOrdersToCreate++
-			if spm.tradingDirection() == "neutral" {
-				if entrySide == "BUY" {
-					remainingBuySlots--
-				} else if entrySide == "SELL" {
-					remainingSellSlots--
+	createEntryOrders := func(limit int) {
+		if limit <= 0 {
+			return
+		}
+		for _, bookSide := range enabledBookSides {
+			entrySide := spm.entryOrderSide(bookSide)
+			for _, price := range desiredEntrySlots[bookSide] {
+				if entryOrdersToCreate >= limit {
+					break
+				}
+				if spm.tradingDirection() == "neutral" {
+					if entrySide == "BUY" {
+						if remainingBuySlots <= 0 {
+							break
+						}
+					} else if entrySide == "SELL" {
+						if remainingSellSlots <= 0 {
+							break
+						}
+					}
+				}
+				slot := spm.getOrCreateSlot(price, bookSide)
+				slot.mu.Lock()
+				slot.BookSide = bookSide
+				if slot.SlotStatus != SlotStatusFree || slot.PositionStatus != PositionStatusEmpty {
+					slot.mu.Unlock()
+					continue
+				}
+				if spm.slotHasActiveOrder(slot) || slot.OrderID != 0 || slot.ClientOID != "" {
+					slot.mu.Unlock()
+					continue
+				}
+
+				quantity, ok := spm.entryOrderQuantity(price)
+				if !ok {
+					slot.mu.Unlock()
+					continue
+				}
+				clientOID := spm.generateClientOrderID(price, entrySide, bookSide)
+				placementKey := spm.orderPlacementKey(entrySide, bookSide, price)
+				if _, exists := plannedOrderKeys[placementKey]; exists {
+					slot.mu.Unlock()
+					logger.Warn("⚠️ [跳过重复开仓单] %s %s %s 已存在活跃/待提交订单",
+						bookSide, entrySide, formatPrice(price, spm.priceDecimals))
+					continue
+				}
+				plannedOrderKeys[placementKey] = struct{}{}
+				slot.SlotStatus = SlotStatusPending
+				slot.ClientOID = clientOID
+				slot.OrderSide = entrySide
+				slot.OrderPrice = price
+				slot.OrderStatus = OrderStatusPlaced
+				slot.OrderCreatedAt = time.Now()
+				usePostOnly := true
+				slot.mu.Unlock()
+
+				ordersToPlace = append(ordersToPlace, &OrderRequest{
+					Symbol:        spm.config.Trading.Symbol,
+					Side:          entrySide,
+					Price:         price,
+					Quantity:      quantity,
+					PriceDecimals: spm.priceDecimals,
+					PostOnly:      usePostOnly,
+					ClientOrderID: clientOID,
+				})
+				entryOrdersToCreate++
+				if spm.tradingDirection() == "neutral" {
+					if entrySide == "BUY" {
+						remainingBuySlots--
+					} else if entrySide == "SELL" {
+						remainingSellSlots--
+					}
 				}
 			}
 		}
+	}
+
+	if spm.isAggressiveMode() {
+		allowedNewEntryOrders := remainingOrders
+		if spm.tradingDirection() == "neutral" {
+			sideTotal := remainingBuySlots + remainingSellSlots
+			if allowedNewEntryOrders > sideTotal {
+				allowedNewEntryOrders = sideTotal
+			}
+		}
+		if allowedNewEntryOrders < 0 {
+			allowedNewEntryOrders = 0
+		}
+		createEntryOrders(allowedNewEntryOrders)
+
+		remainingOrdersForExit := threshold - currentOrderCount - entryOrdersToCreate
+		if remainingOrdersForExit < 0 {
+			remainingOrdersForExit = 0
+		}
+		if allowedNewExitOrders > remainingOrdersForExit {
+			allowedNewExitOrders = remainingOrdersForExit
+		}
+		createExitOrders(allowedNewExitOrders)
+	} else {
+		createExitOrders(allowedNewExitOrders)
+
+		remainingOrdersForEntry = threshold - currentOrderCount - exitOrdersToCreate
+		if remainingOrdersForEntry < 0 {
+			remainingOrdersForEntry = 0
+		}
+
+		allowedNewEntryOrders := remainingBuySlots + remainingSellSlots
+		if allowedNewEntryOrders < 0 {
+			allowedNewEntryOrders = 0
+		}
+		if spm.tradingDirection() != "neutral" {
+			allowedNewEntryOrders = remainingOrdersForEntry
+		}
+		if allowedNewEntryOrders > remainingOrdersForEntry {
+			allowedNewEntryOrders = remainingOrdersForEntry
+		}
+		createEntryOrders(allowedNewEntryOrders)
 	}
 
 	logger.Info("📊 [订单配额] 阈值:%d, 当前订单:%d(买:%d/%d 卖:%d/%d), 开仓:%d, 平仓:%d, 剩余:%d, 平仓候选:%d, 新增平仓:%d, 新增开仓:%d",
@@ -1048,7 +1103,7 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 	return true, nil
 }
 
-func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrdersBySide map[string]int, desiredExitPrices map[string]map[float64]bool, pressure map[string]exitRebalancePressure) (bool, error) {
+func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxActiveExitOrdersBySide map[string]int, pressure map[string]exitRebalancePressure) (bool, error) {
 	if len(maxActiveExitOrdersBySide) == 0 {
 		return false, nil
 	}
@@ -1071,9 +1126,6 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 			return true
 		}
 		orderPrice := roundPrice(slot.OrderPrice, spm.priceDecimals)
-		isStale := desiredExitPrices != nil &&
-			desiredExitPrices[slot.BookSide] != nil &&
-			!desiredExitPrices[slot.BookSide][orderPrice]
 		exitsBySide[orderSide] = append(exitsBySide[orderSide], activeOrderCandidate{
 			SlotPrice:     slot.Price,
 			BookSide:      slot.BookSide,
@@ -1082,7 +1134,6 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 			OrderID:       slot.OrderID,
 			ClientOID:     slot.ClientOID,
 			DistanceToMid: math.Abs(orderPrice - currentPrice),
-			Stale:         isStale,
 		})
 		return true
 	})
@@ -1115,15 +1166,6 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 			}
 		}
 
-		var stale []activeOrderCandidate
-		for _, candidate := range exits {
-			if candidate.Stale {
-				stale = append(stale, candidate)
-			}
-		}
-		if len(stale) > 0 {
-			toCancel = append(toCancel, stale[0])
-		}
 	}
 	if len(toCancel) == 0 {
 		return false, nil
@@ -1206,15 +1248,21 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 	}
 
 	// 更新订单ID (如果是首个推送)
-	if slot.OrderID == 0 {
+	if slot.OrderID == 0 && update.OrderID != 0 {
 		logger.Debug("📝 [首次设置OrderID] 槽位 %.2f: OrderID=%d, ClientOID=%s", price, update.OrderID, update.ClientOrderID)
 		slot.OrderID = update.OrderID
 		slot.ClientOID = update.ClientOrderID
 		slot.OrderSide = side
-	} else if slot.OrderID != update.OrderID {
+	} else if slot.OrderID != 0 && update.OrderID != 0 && slot.OrderID != update.OrderID {
 		// OrderID 不一致但 ClientOrderID 匹配，更新 OrderID (Gate.io 批量下单可能出现此情况)
 		logger.Debug("📝 [更新OrderID] 槽位 %.2f: %d -> %d (ClientOID: %s)", price, slot.OrderID, update.OrderID, update.ClientOrderID)
 		slot.OrderID = update.OrderID
+	}
+	if slot.ClientOID == "" {
+		slot.ClientOID = update.ClientOrderID
+	}
+	if slot.OrderSide == "" {
+		slot.OrderSide = side
 	}
 
 	deltaQty := 0.0
@@ -1322,9 +1370,14 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
 			}
 		} else {
 			if slot.PositionQty > 0 {
-				slot.PostOnlyFailCount++
-				logger.Info("🔄 [平仓单取消-%s] 价格: %s, 保持持仓状态: %.4f, PostOnly失败计数: %d",
-					bookSide, formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PostOnlyFailCount)
+				if status == "REJECTED" || status == "EXPIRED" {
+					slot.PostOnlyFailCount++
+					logger.Info("🔄 [平仓单%s-%s] 价格: %s, 保持持仓状态: %.4f, PostOnly失败计数: %d",
+						status, bookSide, formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PostOnlyFailCount)
+				} else {
+					logger.Info("🔄 [平仓单取消-%s] 价格: %s, 保持持仓状态: %.4f",
+						bookSide, formatPrice(price, spm.priceDecimals), slot.PositionQty)
+				}
 				slot.PositionStatus = PositionStatusFilled
 				slot.SlotStatus = SlotStatusFree
 			} else {
@@ -1697,6 +1750,24 @@ func (spm *SuperPositionManager) calculateSlotPrices(gridPrice float64, count in
 }
 
 func (spm *SuperPositionManager) calculateEntrySlotPrices(gridPrice, currentPrice float64, count int, bookSide string) []float64 {
+	if spm.isAggressiveMode() && spm.tradingDirection() != "neutral" {
+		direction := "down"
+		if bookSide == BookSideShort {
+			direction = "up"
+		}
+		raw := spm.calculateSlotPrices(gridPrice, count, direction)
+		prices := make([]float64, 0, len(raw))
+		for _, price := range raw {
+			if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+				continue
+			}
+			if !spm.isMakerSafeEntryPrice(price, currentPrice, bookSide) {
+				continue
+			}
+			prices = append(prices, price)
+		}
+		return prices
+	}
 	if count <= 0 {
 		return nil
 	}
@@ -1750,11 +1821,11 @@ func (spm *SuperPositionManager) calculateExitSlotPrices(gridPrice, currentPrice
 	}
 	maxAttempts := count*4 + 20
 	for i := 1; len(prices) < count && i <= maxAttempts; i++ {
-		price := currentPrice
+		price := gridPrice
 		if direction == "down" {
-			price = currentPrice - float64(i)*priceInterval
+			price = gridPrice - float64(i)*priceInterval
 		} else {
-			price = currentPrice + float64(i)*priceInterval
+			price = gridPrice + float64(i)*priceInterval
 		}
 		price = roundPrice(price, spm.priceDecimals)
 		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
@@ -1809,6 +1880,13 @@ func (spm *SuperPositionManager) entryOrderQuantity(price float64) (float64, boo
 func (spm *SuperPositionManager) exitOrderQuantity(positionQty, price float64) (float64, bool) {
 	if positionQty <= 0 || price <= 0 || math.IsNaN(positionQty) || math.IsInf(positionQty, 0) || math.IsNaN(price) || math.IsInf(price, 0) {
 		return 0, false
+	}
+	if spm.isAggressiveMode() && spm.tradingDirection() != "neutral" {
+		quantity := roundQuantity(positionQty, spm.quantityDecimals)
+		if quantity <= 0 {
+			return 0, false
+		}
+		return quantity, true
 	}
 	maxQty := spm.maxConfiguredOrderQuantity(price)
 	if maxQty <= 0 {
@@ -1957,7 +2035,6 @@ type activeOrderCandidate struct {
 	OrderID       int64
 	ClientOID     string
 	DistanceToMid float64
-	Stale         bool
 }
 
 // IterateSlots 遍历所有槽位（封装 sync.Map.Range）
@@ -1994,6 +2071,7 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 	orders := spm.extractExchangeOrders(openOrdersRaw)
 	openOrderIDs := make(map[int64]struct{}, len(orders))
 	openClientOIDs := make(map[string]struct{}, len(orders))
+	var conflictingSnapshotOrderIDs []int64
 
 	for _, order := range orders {
 		if order.OrderID != 0 {
@@ -2008,6 +2086,15 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		}
 		slot := spm.getOrCreateSlot(price, bookSide)
 		slot.mu.Lock()
+		if spm.snapshotOrderConflictsWithCurrentSlot(slot, order) {
+			logger.Warn("⚠️ [对账] 快照挂单与当前槽位订单冲突，保留当前跟踪订单并准备撤销冲突单: slot=%s, currentOrderID=%d, currentClientOID=%s, snapshotOrderID=%d, snapshotClientOID=%s",
+				formatPrice(price, spm.priceDecimals), slot.OrderID, slot.ClientOID, order.OrderID, order.ClientOrderID)
+			if order.OrderID != 0 {
+				conflictingSnapshotOrderIDs = append(conflictingSnapshotOrderIDs, order.OrderID)
+			}
+			slot.mu.Unlock()
+			continue
+		}
 		slot.BookSide = bookSide
 		slot.OrderID = order.OrderID
 		slot.ClientOID = order.ClientOrderID
@@ -2023,6 +2110,13 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 			slot.SlotStatus = SlotStatusLocked
 		}
 		slot.mu.Unlock()
+	}
+	if len(conflictingSnapshotOrderIDs) > 0 && spm.executor != nil {
+		if err := spm.executor.BatchCancelOrders(conflictingSnapshotOrderIDs); err != nil {
+			logger.Error("❌ [对账] 撤销快照冲突订单失败: %v (orderIDs=%v)", err, conflictingSnapshotOrderIDs)
+		} else {
+			logger.Warn("🧹 [对账] 已撤销 %d 张快照冲突订单: %v", len(conflictingSnapshotOrderIDs), conflictingSnapshotOrderIDs)
+		}
 	}
 
 	if positionsRaw != nil {
@@ -2053,6 +2147,20 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		logger.Warn("⚠️ [对账] 发现 %d 个本地活跃订单不在交易所挂单列表中", staleActive)
 		spm.refreshStaleOrders(staleOrders)
 	}
+}
+
+func (spm *SuperPositionManager) snapshotOrderConflictsWithCurrentSlot(slot *InventorySlot, order exchangeOrderSnapshot) bool {
+	if slot == nil || !spm.slotHasActiveOrder(slot) {
+		return false
+	}
+	clientOID := strings.TrimSpace(order.ClientOrderID)
+	if slot.ClientOID != "" && clientOID != "" {
+		return slot.ClientOID != clientOID
+	}
+	if slot.OrderID != 0 && order.OrderID != 0 {
+		return slot.OrderID != order.OrderID
+	}
+	return false
 }
 
 func (spm *SuperPositionManager) applySnapshotFillDelta(slot *InventorySlot, side, bookSide string, executedQty, tradePrice float64) {
@@ -2359,8 +2467,10 @@ func (spm *SuperPositionManager) UpdateSlotOrderStatusIfCurrent(price float64, b
 func (spm *SuperPositionManager) CancelEntryOrders() {
 	var orderIDs []int64
 	var targets []struct {
-		price    float64
-		bookSide string
+		price     float64
+		bookSide  string
+		orderID   int64
+		clientOID string
 	}
 
 	spm.slots.Range(func(key, value interface{}) bool {
@@ -2371,9 +2481,11 @@ func (spm *SuperPositionManager) CancelEntryOrders() {
 		if slot.OrderID > 0 && spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
 			orderIDs = append(orderIDs, slot.OrderID)
 			targets = append(targets, struct {
-				price    float64
-				bookSide string
-			}{price: price, bookSide: slot.BookSide})
+				price     float64
+				bookSide  string
+				orderID   int64
+				clientOID string
+			}{price: price, bookSide: slot.BookSide, orderID: slot.OrderID, clientOID: slot.ClientOID})
 		}
 		slot.mu.RUnlock()
 		return true
@@ -2404,10 +2516,7 @@ func (spm *SuperPositionManager) CancelEntryOrders() {
 
 		// 更新槽位状态
 		for _, target := range targets {
-			slot := spm.getOrCreateSlot(target.price, target.bookSide)
-			slot.mu.Lock()
-			slot.OrderStatus = OrderStatusCancelRequested
-			slot.mu.Unlock()
+			spm.UpdateSlotOrderStatusIfCurrent(target.price, target.bookSide, OrderStatusCancelRequested, target.orderID, target.clientOID)
 		}
 
 		// 等待2秒让撤单生效（WebSocket推送通知）
@@ -2427,9 +2536,11 @@ func (spm *SuperPositionManager) CancelEntryOrders() {
 					slot.OrderStatus != OrderStatusCanceled {
 					orderIDs = append(orderIDs, slot.OrderID)
 					targets = append(targets, struct {
-						price    float64
-						bookSide string
-					}{price: price, bookSide: slot.BookSide})
+						price     float64
+						bookSide  string
+						orderID   int64
+						clientOID string
+					}{price: price, bookSide: slot.BookSide, orderID: slot.OrderID, clientOID: slot.ClientOID})
 				}
 				slot.mu.RUnlock()
 				return true

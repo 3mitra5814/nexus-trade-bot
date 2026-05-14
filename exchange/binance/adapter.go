@@ -287,6 +287,7 @@ func (b *BinanceAdapter) BatchCancelOrders(ctx context.Context, symbol string, o
 
 	// 🔥 Binance 批量撤单限制：最多10个
 	batchSize := 10
+	var failed []string
 	for i := 0; i < len(orderIDs); i += batchSize {
 		end := i + batchSize
 		if end > len(orderIDs) {
@@ -299,6 +300,7 @@ func (b *BinanceAdapter) BatchCancelOrders(ctx context.Context, symbol string, o
 		if len(batch) == 1 {
 			if err := b.CancelOrder(ctx, symbol, batch[0]); err != nil {
 				logger.Warn("⚠️ [Binance] 取消订单失败 %d: %v", batch[0], err)
+				failed = append(failed, fmt.Sprintf("%d: %v", batch[0], err))
 			}
 			continue
 		}
@@ -313,7 +315,9 @@ func (b *BinanceAdapter) BatchCancelOrders(ctx context.Context, symbol string, o
 			// 失败时尝试单个撤单
 			logger.Info("🔄 [Binance] 改为逐个撤单...")
 			for _, orderID := range batch {
-				_ = b.CancelOrder(ctx, symbol, orderID)
+				if err := b.CancelOrder(ctx, symbol, orderID); err != nil {
+					failed = append(failed, fmt.Sprintf("%d: %v", orderID, err))
+				}
 				time.Sleep(100 * time.Millisecond) // 避免限频
 			}
 		} else {
@@ -326,6 +330,9 @@ func (b *BinanceAdapter) BatchCancelOrders(ctx context.Context, symbol string, o
 		}
 	}
 
+	if len(failed) > 0 {
+		return fmt.Errorf("Binance 批量撤单后仍有 %d 个订单撤销失败: %s", len(failed), strings.Join(failed, "; "))
+	}
 	return nil
 }
 

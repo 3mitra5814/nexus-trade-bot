@@ -129,6 +129,11 @@ type hookExecutor struct {
 	beforeReturn func(req *OrderRequest, orderID int64)
 }
 
+type cancelHookExecutor struct {
+	captureExecutor
+	onCancel func(orderIDs []int64)
+}
+
 func (e *captureExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	orders, _ := e.BatchPlaceOrders([]*OrderRequest{req})
 	if len(orders) == 0 {
@@ -192,6 +197,16 @@ func (e *captureExecutor) BatchCancelOrders(orderIDs []int64) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.canceled = append(e.canceled, orderIDs...)
+	return nil
+}
+
+func (e *cancelHookExecutor) BatchCancelOrders(orderIDs []int64) error {
+	e.mu.Lock()
+	e.canceled = append(e.canceled, orderIDs...)
+	e.mu.Unlock()
+	if e.onCancel != nil {
+		e.onCancel(orderIDs)
+	}
 	return nil
 }
 
@@ -507,6 +522,41 @@ func TestNewOrderUpdateBeforePlaceResponseLocksPendingSlot(t *testing.T) {
 	if slot.OrderStatus != OrderStatusConfirmed || slot.SlotStatus != SlotStatusLocked || slot.OrderID != 7 {
 		t.Fatalf("expected pending slot to become confirmed/locked, status=%s slot=%s orderID=%d",
 			slot.OrderStatus, slot.SlotStatus, slot.OrderID)
+	}
+}
+
+func TestOrderUpdateWithoutOrderIDPreservesExistingOrderID(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 2
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	clientOID := spm.generateClientOrderID(99, "BUY", BookSideLong)
+	slot := spm.getOrCreateSlot(99, BookSideLong)
+	slot.mu.Lock()
+	slot.OrderID = 7
+	slot.ClientOID = clientOID
+	slot.OrderSide = "BUY"
+	slot.OrderStatus = OrderStatusPlaced
+	slot.SlotStatus = SlotStatusLocked
+	slot.mu.Unlock()
+
+	spm.OnOrderUpdate(OrderUpdate{
+		ClientOrderID: clientOID,
+		Status:        "NEW",
+		Side:          "BUY",
+		Price:         99,
+	})
+
+	slot.mu.RLock()
+	gotOrderID := slot.OrderID
+	slot.mu.RUnlock()
+	if gotOrderID != 7 {
+		t.Fatalf("expected zero-order-id update to preserve existing order id 7, got %d", gotOrderID)
 	}
 }
 
@@ -836,6 +886,122 @@ func TestAdjustOrdersDoesNotRebalanceOnSubIntervalPriceNoise(t *testing.T) {
 	}
 	if len(executor.orders) != initialOrderCount {
 		t.Fatalf("expected no replacement orders on sub-interval price noise, got %d orders", len(executor.orders))
+	}
+}
+
+func TestAdjustOrdersDoesNotCancelProtectedExitOnPriceNoise(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 1
+	cfg.Trading.SellWindowSize = 1
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(2298.57, "2298.57"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	slot := spm.getOrCreateSlot(2245.57, BookSideShort)
+	clientOID := spm.generateClientOrderID(2245.57, "BUY", BookSideShort)
+	slot.mu.Lock()
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.01
+	slot.SlotStatus = SlotStatusLocked
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.OrderSide = "BUY"
+	slot.OrderPrice = 2244.57
+	slot.OrderID = 1001
+	slot.ClientOID = clientOID
+	slot.mu.Unlock()
+
+	if err := spm.AdjustOrders(2298.73); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("expected protected exit order to survive sub-interval price noise, canceled=%v", executor.canceled)
+	}
+}
+
+func TestCanceledExitDoesNotIncrementPostOnlyFailCount(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 1
+	cfg.Trading.SellWindowSize = 1
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	clientOID := spm.generateClientOrderID(2245.57, "BUY", BookSideShort)
+	slot := spm.getOrCreateSlot(2245.57, BookSideShort)
+	slot.mu.Lock()
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.01
+	slot.SlotStatus = SlotStatusLocked
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.OrderSide = "BUY"
+	slot.OrderPrice = 2244.57
+	slot.OrderID = 1001
+	slot.ClientOID = clientOID
+	slot.mu.Unlock()
+
+	spm.OnOrderUpdate(OrderUpdate{
+		OrderID:       1001,
+		ClientOrderID: clientOID,
+		Status:        "CANCELED",
+		Side:          "BUY",
+	})
+
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.PostOnlyFailCount != 0 {
+		t.Fatalf("expected normal cancel not to increment PostOnlyFailCount, got %d", slot.PostOnlyFailCount)
+	}
+	if slot.PositionStatus != PositionStatusFilled || slot.PositionQty != 0.01 {
+		t.Fatalf("expected canceled exit to preserve position, status=%s qty=%.8f", slot.PositionStatus, slot.PositionQty)
+	}
+}
+
+func TestRejectedExitIncrementsPostOnlyFailCount(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 1
+	cfg.Trading.SellWindowSize = 1
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	clientOID := spm.generateClientOrderID(2245.57, "BUY", BookSideShort)
+	slot := spm.getOrCreateSlot(2245.57, BookSideShort)
+	slot.mu.Lock()
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.01
+	slot.SlotStatus = SlotStatusLocked
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.OrderSide = "BUY"
+	slot.OrderPrice = 2244.57
+	slot.OrderID = 1001
+	slot.ClientOID = clientOID
+	slot.mu.Unlock()
+
+	spm.OnOrderUpdate(OrderUpdate{
+		OrderID:       1001,
+		ClientOrderID: clientOID,
+		Status:        "REJECTED",
+		Side:          "BUY",
+	})
+
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.PostOnlyFailCount != 1 {
+		t.Fatalf("expected rejected exit to increment PostOnlyFailCount, got %d", slot.PostOnlyFailCount)
 	}
 }
 
@@ -1606,6 +1772,88 @@ func TestPriceGridShiftFollowsNearestGridBeforeRebalancing(t *testing.T) {
 	}
 }
 
+func TestAggressiveModeKeepsDirectionalEntryOrdersOnGridShift(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "aggressive"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 6
+	cfg.Trading.CleanupBatchSize = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	if err := spm.AdjustOrdersWithRebalance(95, true); err != nil {
+		t.Fatalf("price shift AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("aggressive mode should keep old directional entry orders, got canceled=%v", executor.canceled)
+	}
+}
+
+func TestAggressiveModePrioritizesEntryOrdersBeforeExitOrders(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "aggressive"
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 1
+	cfg.Trading.OrderCleanupThreshold = 3
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	slot := spm.getOrCreateSlot(101, BookSideLong)
+	slot.mu.Lock()
+	slot.BookSide = BookSideLong
+	slot.Price = 101
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.3
+	slot.EntryPrice = 101
+	slot.SlotStatus = SlotStatusFree
+	slot.mu.Unlock()
+
+	if err := spm.AdjustOrders(100.4); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	entryCount := 0
+	exitCount := 0
+	for i, order := range executor.orders {
+		if order.ReduceOnly {
+			exitCount++
+			if i < 2 {
+				t.Fatalf("aggressive mode should place entry orders before exits, got early exit order at index %d: %+v", i, order)
+			}
+			continue
+		}
+		if order.Side == "BUY" {
+			entryCount++
+		}
+	}
+	if entryCount != 2 {
+		t.Fatalf("aggressive mode should fill entry quota first, got entry=%d orders=%v", entryCount, executor.orders)
+	}
+	if exitCount != 1 {
+		t.Fatalf("aggressive mode should place the remaining exit after filling entry quota, got exit=%d orders=%v", exitCount, executor.orders)
+	}
+}
+
 func TestAdjustOrdersDoesNotDuplicateWhenExchangeReturnsBlankClientOID(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -1821,6 +2069,96 @@ func TestApplyExchangeSnapshotClearsGoneStaleOrder(t *testing.T) {
 	if slot.OrderID != 0 || slot.ClientOID != "" || slot.SlotStatus != SlotStatusFree || slot.OrderStatus != OrderStatusCanceled {
 		t.Fatalf("expected stale gone order to be cleared, orderID=%d clientOID=%q slot=%s status=%s",
 			slot.OrderID, slot.ClientOID, slot.SlotStatus, slot.OrderStatus)
+	}
+}
+
+func TestApplyExchangeSnapshotDoesNotOverwriteActiveSlotWithConflictingOrder(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 2
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	currentOID := spm.generateClientOrderID(99, "BUY", BookSideLong)
+	conflictOID := spm.generateClientOrderID(99, "BUY", BookSideLong)
+	slot := spm.getOrCreateSlot(99, BookSideLong)
+	slot.mu.Lock()
+	slot.OrderID = 11
+	slot.ClientOID = currentOID
+	slot.OrderSide = "BUY"
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.OrderPrice = 99
+	slot.SlotStatus = SlotStatusLocked
+	slot.BookSide = BookSideLong
+	slot.mu.Unlock()
+
+	spm.ApplyExchangeSnapshot(nil, []*Order{
+		{OrderID: 11, ClientOrderID: currentOID, Side: "BUY", Status: OrderStatusConfirmed, Price: 99, Quantity: 0.3},
+		{OrderID: 12, ClientOrderID: conflictOID, Side: "BUY", Status: OrderStatusConfirmed, Price: 99, Quantity: 0.3},
+	})
+
+	slot.mu.RLock()
+	gotOrderID := slot.OrderID
+	gotClientOID := slot.ClientOID
+	slot.mu.RUnlock()
+	if gotOrderID != 11 || gotClientOID != currentOID {
+		t.Fatalf("snapshot conflict must not overwrite current tracked order, got orderID=%d clientOID=%q",
+			gotOrderID, gotClientOID)
+	}
+	if len(executor.canceled) != 1 || executor.canceled[0] != 12 {
+		t.Fatalf("expected conflicting snapshot order 12 to be canceled, got %v", executor.canceled)
+	}
+}
+
+func TestCancelEntryOrdersDoesNotClobberReplacementSlotOrder(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+
+	var spm *SuperPositionManager
+	executor := &cancelHookExecutor{}
+	spm = NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+
+	oldEntryOID := spm.generateClientOrderID(99, "BUY", BookSideLong)
+	replacementExitOID := spm.generateClientOrderID(99, "SELL", BookSideLong)
+	slot := spm.getOrCreateSlot(99, BookSideLong)
+	slot.mu.Lock()
+	slot.BookSide = BookSideLong
+	slot.OrderID = 11
+	slot.ClientOID = oldEntryOID
+	slot.OrderSide = "BUY"
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.OrderPrice = 99
+	slot.SlotStatus = SlotStatusLocked
+	slot.PositionStatus = PositionStatusEmpty
+	slot.mu.Unlock()
+
+	executor.onCancel = func(orderIDs []int64) {
+		slot.mu.Lock()
+		defer slot.mu.Unlock()
+		slot.OrderID = 22
+		slot.ClientOID = replacementExitOID
+		slot.OrderSide = "SELL"
+		slot.OrderStatus = OrderStatusConfirmed
+		slot.OrderPrice = 100
+		slot.SlotStatus = SlotStatusLocked
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = 0.3
+	}
+
+	spm.CancelEntryOrders()
+
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.OrderID != 22 || slot.ClientOID != replacementExitOID || slot.OrderStatus != OrderStatusConfirmed || slot.OrderSide != "SELL" {
+		t.Fatalf("old entry cancel must not clobber replacement exit order, orderID=%d clientOID=%q side=%s status=%s",
+			slot.OrderID, slot.ClientOID, slot.OrderSide, slot.OrderStatus)
 	}
 }
 

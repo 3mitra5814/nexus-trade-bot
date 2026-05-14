@@ -118,6 +118,42 @@ func TestPlaceOrderRecoversOpenOrderAfterAmbiguousError(t *testing.T) {
 	}
 }
 
+type recordingCancelExchange struct {
+	cancelFailExchange
+	batchIDs []int64
+}
+
+func (e *recordingCancelExchange) BatchCancelOrders(ctx context.Context, symbol string, orderIDs []int64) error {
+	e.batchIDs = append(e.batchIDs, orderIDs...)
+	return nil
+}
+
+func TestBatchCancelOrdersSkipsInvalidOrderIDs(t *testing.T) {
+	ex := &recordingCancelExchange{}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 1, 1)
+
+	err := executor.BatchCancelOrders([]int64{0, -1, 42})
+	if err == nil {
+		t.Fatal("expected invalid order IDs to be reported")
+	}
+	if len(ex.batchIDs) != 1 || ex.batchIDs[0] != 42 {
+		t.Fatalf("expected only valid order ID to reach exchange, got %v", ex.batchIDs)
+	}
+}
+
+func TestBatchCancelOrdersRejectsOnlyInvalidOrderIDs(t *testing.T) {
+	ex := &recordingCancelExchange{}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 1, 1)
+
+	err := executor.BatchCancelOrders([]int64{0})
+	if err == nil {
+		t.Fatal("expected all-invalid order IDs to fail")
+	}
+	if len(ex.batchIDs) != 0 {
+		t.Fatalf("expected exchange not to be called, got %v", ex.batchIDs)
+	}
+}
+
 type blankClientIDPlaceExchange struct {
 	cancelFailExchange
 }

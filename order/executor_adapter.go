@@ -422,6 +422,18 @@ func (oe *ExchangeOrderExecutor) BatchCancelOrders(orderIDs []int64) error {
 	if len(orderIDs) == 0 {
 		return nil
 	}
+	validOrderIDs := make([]int64, 0, len(orderIDs))
+	var invalidOrderIDs []string
+	for _, orderID := range orderIDs {
+		if orderID <= 0 {
+			invalidOrderIDs = append(invalidOrderIDs, fmt.Sprintf("%d", orderID))
+			continue
+		}
+		validOrderIDs = append(validOrderIDs, orderID)
+	}
+	if len(validOrderIDs) == 0 {
+		return fmt.Errorf("批量撤单失败：没有有效订单ID，收到: %s", strings.Join(invalidOrderIDs, ", "))
+	}
 	waitCtx, waitCancel := apiContext()
 	if err := ratelimit.Wait(waitCtx, exchangeTradeRateLimitProfile(oe.exchange.GetName())); err != nil {
 		waitCancel()
@@ -431,13 +443,13 @@ func (oe *ExchangeOrderExecutor) BatchCancelOrders(orderIDs []int64) error {
 
 	// 使用交易所的批量撤单接口
 	ctx, cancel := apiContext()
-	err := oe.exchange.BatchCancelOrders(ctx, oe.symbol, orderIDs)
+	err := oe.exchange.BatchCancelOrders(ctx, oe.symbol, validOrderIDs)
 	cancel()
 	if err != nil {
 		logger.Warn("⚠️ [%s] 批量撤单失败: %v，尝试单个撤单", oe.exchange.GetName(), err)
 		// 如果批量撤单失败，尝试单个撤单
 		var failed []string
-		for _, orderID := range orderIDs {
+		for _, orderID := range validOrderIDs {
 			if err := oe.CancelOrder(orderID); err != nil {
 				logger.Warn("⚠️ [%s] 取消订单 %d 失败: %v", oe.exchange.GetName(), orderID, err)
 				failed = append(failed, fmt.Sprintf("%d: %v", orderID, err))
@@ -446,6 +458,9 @@ func (oe *ExchangeOrderExecutor) BatchCancelOrders(orderIDs []int64) error {
 		if len(failed) > 0 {
 			return fmt.Errorf("批量撤单失败，且 %d 个订单单独撤销失败: %s", len(failed), strings.Join(failed, "; "))
 		}
+	}
+	if len(invalidOrderIDs) > 0 {
+		return fmt.Errorf("批量撤单部分跳过无效订单ID: %s", strings.Join(invalidOrderIDs, ", "))
 	}
 
 	return nil

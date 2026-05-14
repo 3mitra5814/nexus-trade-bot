@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nexus-trade-bot/tradestats"
 )
 
 // LogLevel 日志级别
@@ -36,6 +38,21 @@ var (
 	fileLogEnabled            = true
 	stdLoggerOutput io.Writer = os.Stderr
 )
+
+func currentLogTime() time.Time {
+	return time.Now().In(tradestats.TradingDayLocation())
+}
+
+func currentLogTimestamp() string {
+	return currentLogTime().Format("2006/01/02 15:04:05")
+}
+
+func writeConsoleLine(message string) {
+	mu.RLock()
+	consoleOutput := stdLoggerOutput
+	mu.RUnlock()
+	_, _ = fmt.Fprintf(consoleOutput, "%s %s\n", currentLogTimestamp(), strings.TrimSuffix(message, "\n"))
+}
 
 // String 返回日志级别的字符串表示
 func (l LogLevel) String() string {
@@ -110,7 +127,6 @@ func SetConsoleOutput(w io.Writer) {
 	}
 	mu.Lock()
 	stdLoggerOutput = w
-	log.SetOutput(w)
 	mu.Unlock()
 }
 
@@ -123,7 +139,7 @@ func initFileLogger() {
 	}
 
 	// 如果已经初始化且日期相同，不需要重新初始化
-	today := time.Now().Format("2006-01-02")
+	today := currentLogTime().Format("2006-01-02")
 	if fileLogger != nil && currentDate == today {
 		return
 	}
@@ -137,7 +153,7 @@ func initFileLogger() {
 	// 创建log文件夹
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		// 如果创建失败，只输出到控制台
-		log.Printf("[WARN] 创建日志文件夹失败: %v，将只输出到控制台", err)
+		writeConsoleLine(fmt.Sprintf("[WARN] 创建日志文件夹失败: %v，将只输出到控制台", err))
 		return
 	}
 
@@ -146,7 +162,7 @@ func initFileLogger() {
 	file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		// 如果打开失败，只输出到控制台
-		log.Printf("[WARN] 打开日志文件失败: %v，将只输出到控制台", err)
+		writeConsoleLine(fmt.Sprintf("[WARN] 打开日志文件失败: %v，将只输出到控制台", err))
 		return
 	}
 
@@ -156,7 +172,7 @@ func initFileLogger() {
 	fileLogger = log.New(file, "", 0)
 	cleanupOldLogs()
 
-	log.Printf("[INFO] 文件日志已启用，日志文件: %s", logFileName)
+	writeConsoleLine(fmt.Sprintf("[INFO] 文件日志已启用，日志文件: %s", logFileName))
 }
 
 // closeFileLogger 关闭文件日志
@@ -175,7 +191,7 @@ func closeFileLogger() {
 // checkAndRotateLog 检查并轮转日志文件（如果需要）
 // 注意：调用此函数前必须已持有fileMu锁
 func checkAndRotateLog() {
-	today := time.Now().Format("2006-01-02")
+	today := currentLogTime().Format("2006-01-02")
 	if currentDate != today {
 		// 日期变化，重新初始化文件日志
 		// 关闭旧文件
@@ -208,7 +224,7 @@ func cleanupOldLogs() {
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().AddDate(0, 0, -logKeepDays)
+	cutoff := currentLogTime().AddDate(0, 0, -logKeepDays)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -252,20 +268,14 @@ func logf(level LogLevel, format string, args ...interface{}) {
 	}
 	prefix := fmt.Sprintf("[%s] ", level.String())
 	message := fmt.Sprintf(prefix+format, args...)
-
-	mu.RLock()
-	consoleOutput := stdLoggerOutput
-	mu.RUnlock()
-
-	// 输出到控制台（启动脚本会重定向到 web-console.log 或机器人日志）
-	log.New(consoleOutput, "", log.LstdFlags).Printf(prefix+format, args...)
+	writeConsoleLine(message)
 
 	fileMu.Lock()
 	// 检查是否需要轮转日志文件
 	checkAndRotateLog()
 	if fileLogger != nil {
 		// 写入文件（包含时间戳）
-		fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), message)
+		fileLogger.Printf("%s %s", currentLogTimestamp(), message)
 	}
 	fileMu.Unlock()
 }
@@ -278,20 +288,14 @@ func logln(level LogLevel, args ...interface{}) {
 	}
 	prefix := fmt.Sprintf("[%s] ", level.String())
 	message := fmt.Sprintln(append([]interface{}{prefix}, args...)...)
-
-	mu.RLock()
-	consoleOutput := stdLoggerOutput
-	mu.RUnlock()
-
-	// 输出到控制台（启动脚本会重定向到 web-console.log 或机器人日志）
-	log.New(consoleOutput, "", log.LstdFlags).Println(append([]interface{}{prefix}, args...)...)
+	writeConsoleLine(message)
 
 	fileMu.Lock()
 	// 检查是否需要轮转日志文件
 	checkAndRotateLog()
 	if fileLogger != nil {
 		// 写入文件（包含时间戳，去掉末尾的换行符，因为Println会自动添加）
-		fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), strings.TrimSuffix(message, "\n"))
+		fileLogger.Printf("%s %s", currentLogTimestamp(), strings.TrimSuffix(message, "\n"))
 	}
 	fileMu.Unlock()
 }
