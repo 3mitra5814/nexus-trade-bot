@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#instalación-con-un-solo-comando)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#idiomas)
 
 ## Únete a la comunidad
 
@@ -19,6 +19,13 @@ Las dudas de despliegue, los detalles de las APIs de exchanges, la experiencia e
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | Español | [Tiếng Việt](README.vi.md) | [हिन्दी](README.hi.md) | [Português](README.pt.md) | [العربية](README.ar.md) | [繁體中文](README.zh-TW.md)
 
+## Lee esto primero
+
+Si eres usuario final, empieza con la instalación de un solo comando, abre la consola web, añade una API con permiso de trading y sin permiso de retiro, y prueba primero con un bot pequeño.
+
+Si eres desarrollador, empieza compilando desde el código fuente, revisa `config.example.yaml`, ejecuta `go test ./...` y usa worker mode cuando quieras lanzar un bot con un archivo de configuración específico.
+
+El README está ordenado para avanzar de lo práctico a lo técnico: instalación, exchanges, funciones, ejemplos de estrategia, parámetros, instalación manual y checklist antes de operar en real.
 
 ## Instalación con un solo comando
 
@@ -59,19 +66,16 @@ password: admin
 
 Cambie la contraseña predeterminada inmediatamente después de su primer inicio de sesión.
 
+## Exchanges admitidos
 
-## Intercambios admitidos
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
-| Intercambio | Soporte |
-| --- | --- |
-| Binance | Futuros: estable. Lugar: estable. Lo mejor para redes al contado y perpetuas USDT/USDC de alta liquidez. |
-| Bitget | Futuros: estable. Lugar: estable. Lo mejor para el comercio en red y las estrategias de volumen de reembolso de tarifas. |
-| Gate.io | Futuros: estable. Lugar: estable. Útil para la diversificación de múltiples intercambios. |
-| Bybit | Futuros: beta. Lugar: estable. Pruebe primero con un tamaño más pequeño. |
-| OKX | Futuros: beta. Lugar: estable. Requiere clave API, clave secreta y frase de contraseña. |
-| Hyperliquid | Futuros: beta. Lugar: beta. Utiliza configuración API basada en billetera y pares al contado USDC. |
-
-Enlace de reembolso de Bitget: [hasta un 70% de reembolso de tarifa, código de invitación `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
+Enlace de reembolso de Bitget: [hasta 70% de reembolso de comisiones, código de invitación `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## Qué hace

@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#वन-कमांड-इंस्टाल)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#भाषाएँ)
 
 ## उपयोगकर्ता समूह से जुड़ें
 
@@ -19,6 +19,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Tiếng Việt](README.vi.md) | हिन्दी | [Português](README.pt.md) | [العربية](README.ar.md) | [繁體中文](README.zh-TW.md)
 
+## पहले यह पढ़ें
+
+यदि आप सामान्य उपयोगकर्ता हैं, तो वन-कमांड इंस्टॉल से वेब कंसोल खोलें, केवल ट्रेडिंग अनुमति वाला और निकासी अनुमति के बिना API key जोड़ें, फिर छोटे टेस्ट बॉट से शुरुआत करें।
+
+यदि आप डेवलपर हैं, तो source से build करें, `config.example.yaml` देखें, `go test ./...` चलाएँ, और किसी खास config file से bot चलाने के लिए worker mode इस्तेमाल करें।
+
+यह README व्यावहारिक क्रम में है: इंस्टॉल, समर्थित एक्सचेंज, फीचर, रणनीति उदाहरण, पैरामीटर, मैनुअल इंस्टॉल और live trading से पहले checklist।
 
 ## वन-कमांड इंस्टाल
 
@@ -59,19 +66,16 @@ password: admin
 
 अपने पहले लॉगिन के तुरंत बाद डिफ़ॉल्ट पासवर्ड बदलें।
 
-
 ## समर्थित एक्सचेंज
 
-| विनिमय | समर्थन |
-| --- | --- |
-| Binance | वायदा: स्थिर. स्थान: स्थिर. उच्च-तरलता यूएसडीटी/यूएसडीसी सतत और स्पॉट ग्रिड के लिए सर्वोत्तम। |
-| Bitget | वायदा: स्थिर. स्थान: स्थिर. ग्रिड ट्रेडिंग और शुल्क-छूट वॉल्यूम रणनीतियों के लिए सर्वोत्तम। |
-| Gate.io | वायदा: स्थिर. स्थान: स्थिर. बहु-विनिमय विविधीकरण के लिए उपयोगी। |
-| Bybit | वायदा: बीटा. स्थान: स्थिर. पहले छोटे आकार के साथ परीक्षण करें. |
-| OKX | वायदा: बीटा. स्थान: स्थिर. एपीआई कुंजी, गुप्त कुंजी और पासफ़्रेज़ की आवश्यकता है। |
-| Hyperliquid | वायदा: बीटा. स्थान: बीटा. वॉलेट-आधारित एपीआई सेटअप और यूएसडीसी स्पॉट जोड़े का उपयोग करता है। |
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
-बिटगेट छूट लिंक: [70% तक शुल्क छूट, आमंत्रण कोड `4n9z`](https://partner.hdmune.cn/bg/3DLRKF)।
+Bitget rebate link: [70% तक fee rebate, invite code `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## यह क्या करता है

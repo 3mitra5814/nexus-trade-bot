@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#원-명령-설치)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#언어)
 
 ## 사용자 그룹 참여
 
@@ -19,6 +19,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | 한국어 | [日本語](README.ja.md) | [Español](README.es.md) | [Tiếng Việt](README.vi.md) | [हिन्दी](README.hi.md) | [Português](README.pt.md) | [العربية](README.ar.md) | [繁體中文](README.zh-TW.md)
 
+## 먼저 읽어보세요
+
+일반 사용자라면 원클릭 설치로 웹 콘솔을 열고, 출금 권한이 없는 거래 전용 API를 추가한 뒤 작은 금액의 테스트 봇부터 시작하세요.
+
+개발자라면 소스 빌드, `config.example.yaml` 확인, `go test ./...` 실행 순서로 시작하고, 특정 설정 파일로 봇을 띄울 때 worker mode를 사용하세요.
+
+이 README는 설치, 지원 거래소, 기능, 전략 예시, 파라미터, 수동 설치, 실거래 전 점검 순서로 구성되어 있습니다.
 
 ## 원 명령 설치
 
@@ -59,17 +66,14 @@ password: admin
 
 처음 로그인한 후 즉시 기본 비밀번호를 변경하세요.
 
-
 ## 지원되는 거래소
 
-| 교환 | 지원 |
-| --- | --- |
-| Binance | 선물: 안정적. 스팟: 안정적. 유동성이 높은 USDT/USDC 영구 및 현물 그리드에 가장 적합합니다. |
-| Bitget | 선물: 안정적. 스팟: 안정적. 그리드 거래 및 수수료 리베이트 볼륨 전략에 가장 적합합니다. |
-| Gate.io | 선물: 안정적. 스팟: 안정적. 다중 거래소 다양화에 유용합니다. |
-| Bybit | 선물: 베타. 스팟: 안정적. 먼저 더 작은 크기로 테스트해 보세요. |
-| OKX | 선물: 베타. 스팟: 안정적. API 키, 비밀 키, 암호가 필요합니다. |
-| Hyperliquid | 선물: 베타. 스팟: 베타. 지갑 기반 API 설정 및 USDC 현물 쌍을 사용합니다. |
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
 Bitget 리베이트 링크: [최대 70% 수수료 리베이트, 초대 코드 `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 

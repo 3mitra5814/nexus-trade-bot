@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#一鍵安裝)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#語言)
 
 ## 加入用戶群
 
@@ -19,6 +19,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Tiếng Việt](README.vi.md) | [हिन्दी](README.hi.md) | [Português](README.pt.md) | [العربية](README.ar.md) | 繁體中文
 
+## 先看這裡
+
+如果你是普通用戶，建議先用一鍵安裝啟動網頁控制台，只新增「允許交易、禁止提現」的 API，然後用小資金建立測試機器人，確認邏輯和風險都符合預期後再放大。
+
+如果你是開發者，建議從原始碼建置開始，先看 `config.example.yaml`，執行 `go test ./...`，再依需要用 worker 模式載入指定設定檔。
+
+這份 README 的閱讀順序是：安裝、支援交易所、功能說明、策略例子、參數說明、手動安裝、實盤前檢查。
 
 ## 一鍵安裝
 
@@ -59,17 +66,14 @@ password: admin
 
 首次登入後立即更改預設密碼。
 
-
 ## 支援的交易所
 
-|交流 |支援|
-| --- | --- |
-| Binance | 期貨：穩定。現貨：穩定。最適合高流動性 USDT/USDC 永續和現貨網格。 |
-| Bitget | 期貨：穩定。現貨：穩定。最適合網格交易和返傭交易量策略。 |
-| Gate.io | 期貨：穩定。現貨：穩定。對於多交易所多元化很有用。 |
-| Bybit | 期貨：測試版。現貨：穩定。首先用較小的尺寸進行測試。 |
-| OKX | 期貨：測試版。現貨：穩定。需要 API 金鑰、金鑰和密碼。 |
-| Hyperliquid | 期貨：測試版。現貨：測試版。使用基於錢包的 API 設定和 USDC 現貨對。 |
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
 Bitget 返利連結：[最高 70% 手續費返利，邀請碼 `4n9z`](https://partner.hdmune.cn/bg/3DLRKF)。
 

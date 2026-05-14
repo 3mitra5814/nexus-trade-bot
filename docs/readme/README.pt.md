@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#instalação-com-um-comando)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#idiomas)
 
 ## Entre na comunidade
 
@@ -19,6 +19,13 @@ Dúvidas de implantação, detalhes das APIs das exchanges, experiência de trad
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Tiếng Việt](README.vi.md) | [हिन्दी](README.hi.md) | Português | [العربية](README.ar.md) | [繁體中文](README.zh-TW.md)
 
+## Leia isto primeiro
+
+Se você é usuário final, comece pela instalação com um comando, abra o console web, adicione uma API com permissão de trading e sem permissão de saque, e teste primeiro com um bot pequeno.
+
+Se você é desenvolvedor, comece compilando a partir do código fonte, revise `config.example.yaml`, rode `go test ./...` e use worker mode quando quiser iniciar um bot com um arquivo de configuração específico.
+
+O README segue do uso prático ao detalhe técnico: instalação, exchanges, recursos, exemplos de estratégia, parâmetros, instalação manual e checklist antes de operar ao vivo.
 
 ## Instalação com um comando
 
@@ -59,19 +66,16 @@ password: admin
 
 Altere a senha padrão imediatamente após seu primeiro login.
 
+## Exchanges suportadas
 
-## Trocas suportadas
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
-| Troca | Suporte |
-| --- | --- |
-| Binance | Futuros: estáveis. Local: estável. Melhor para grades perpétuas e spot de USDT/USDC de alta liquidez. |
-| Bitget | Futuros: estáveis. Local: estável. Melhor para estratégias de negociação em rede e volume de descontos de taxas. |
-| Gate.io | Futuros: estáveis. Local: estável. Útil para diversificação em múltiplas bolsas. |
-| Bybit | Futuros: beta. Local: estável. Teste primeiro com tamanho menor. |
-| OKX | Futuros: beta. Local: estável. Requer chave de API, chave secreta e senha. |
-| Hyperliquid | Futuros: beta. Local: beta. Usa configuração de API baseada em carteira e pares spot USDC. |
-
-Link de desconto Bitget: [desconto de até 70% na taxa, código de convite `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
+Link de rebate da Bitget: [até 70% de rebate de taxas, código de convite `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## O que faz

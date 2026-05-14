@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#التثبيت-بأمر-واحد)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#اللغات)
 
 ## انضم إلى مجتمع المستخدمين
 
@@ -19,6 +19,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Tiếng Việt](README.vi.md) | [हिन्दी](README.hi.md) | [Português](README.pt.md) | العربية | [繁體中文](README.zh-TW.md)
 
+## اقرأ هذا أولاً
+
+إذا كنت مستخدماً عادياً، ابدأ بالتثبيت بأمر واحد، افتح لوحة الويب، أضف مفتاح API بصلاحية التداول فقط وبدون صلاحية السحب، ثم جرّب بوتاً صغيراً قبل استخدام حجم أكبر.
+
+إذا كنت مطوراً، ابدأ بالبناء من المصدر، راجع `config.example.yaml`، شغّل `go test ./...`، ثم استخدم worker mode عند تشغيل بوت من ملف إعدادات محدد.
+
+تم ترتيب README من العملي إلى التقني: التثبيت، المنصات المدعومة، الوظائف، أمثلة الاستراتيجية، الإعدادات، التثبيت اليدوي، وقائمة الفحص قبل التداول الحقيقي.
 
 ## التثبيت بأمر واحد
 
@@ -59,17 +66,14 @@ password: admin
 
 قم بتغيير كلمة المرور الافتراضية مباشرة بعد تسجيل الدخول الأول.
 
+## المنصات المدعومة
 
-## التبادلات المدعومة
-
-| صرف | الدعم |
-| --- | --- |
-| Binance | العقود الآجلة: مستقرة. البقعة: مستقرة. الأفضل لشبكات USDT/USDC الدائمة والبقعية عالية السيولة. |
-| Bitget | العقود الآجلة: مستقرة. البقعة: مستقرة. الأفضل للتداول الشبكي واستراتيجيات حجم خصم الرسوم. |
-| Gate.io | العقود الآجلة: مستقرة. البقعة: مستقرة. مفيدة لتنويع البورصة المتعددة. |
-| Bybit | العقود الآجلة: بيتا. البقعة: مستقرة. اختبر بحجم أصغر أولاً. |
-| OKX | العقود الآجلة: بيتا. البقعة: مستقرة. يتطلب مفتاح API والمفتاح السري وعبارة المرور. |
-| Hyperliquid | العقود الآجلة: بيتا. البقعة: بيتا. يستخدم إعداد واجهة برمجة التطبيقات المستندة إلى المحفظة وأزواج USDC الفورية. |
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
 رابط خصم Bitget: [خصم رسوم يصل إلى 70%، رمز الدعوة `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 

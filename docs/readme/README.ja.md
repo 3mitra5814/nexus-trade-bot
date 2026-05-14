@@ -8,8 +8,8 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#ワンコマンドインストール)
+[![Languages](https://img.shields.io/badge/languages-11-orange)](#言語)
 
 ## ユーザーグループに参加
 
@@ -19,6 +19,13 @@
 
 [English](../../README.md) | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [한국어](README.ko.md) | 日本語 | [Español](README.es.md) | [Tiếng Việt](README.vi.md) | [हिन्दी](README.hi.md) | [Português](README.pt.md) | [العربية](README.ar.md) | [繁體中文](README.zh-TW.md)
 
+## まずここを読んでください
+
+通常ユーザーは、ワンコマンドインストールで Web コンソールを開き、出金権限のない取引用 API キーだけを追加し、小さなテストボットから始めるのがおすすめです。
+
+開発者は、ソースからビルドし、`config.example.yaml` を確認し、`go test ./...` を実行してから、必要に応じて worker mode で指定した設定ファイルを読み込んでください。
+
+この README は、インストール、対応取引所、機能、戦略例、パラメータ、手動インストール、実運用前チェックの順に読めるようにしています。
 
 ## ワンコマンドインストール
 
@@ -59,19 +66,16 @@ password: admin
 
 最初のログイン直後にデフォルトのパスワードを変更します。
 
+## サポートされている取引所
 
-## サポートされている交換
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
-|交換 |サポート |
-| --- | --- |
-| Binance | 先物：安定。スポット：安定。流動性の高いUSDT/USDC永久グリッドおよびスポットグリッドに最適です。 |
-| Bitget | 先物：安定。スポット：安定。グリッド取引と手数料リベートのボリューム戦略に最適です。 |
-| Gate.io | 先物：安定。スポット：安定。複数取引所の分散に役立ちます。 |
-| Bybit | 先物: ベータ版。スポット：安定。最初に小さいサイズでテストしてください。 |
-| OKX | 先物: ベータ版。スポット：安定。 API キー、秘密キー、パスフレーズが必要です。 |
-| Hyperliquid | 先物: ベータ版。スポット：ベータ版。ウォレットベースの API セットアップと USDC スポット ペアを使用します。 |
-
-Bitget リベート リンク: [最大 70% の手数料リベート、招待コード `4n9z`](https://partner.hdmune.cn/bg/3DLRKF)。
+Bitget リベートリンク: [最大 70% の手数料リベート、招待コード `4n9z`](https://partner.hdmune.cn/bg/3DLRKF)。
 
 
 ## 何をするのか

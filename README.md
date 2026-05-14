@@ -19,6 +19,13 @@ Questions, deployment notes, exchange-specific fixes, and live trading lessons a
 
 English | [简体中文](docs/readme/README.zh-CN.md) | [Русский](docs/readme/README.ru.md) | [한국어](docs/readme/README.ko.md) | [日本語](docs/readme/README.ja.md) | [Español](docs/readme/README.es.md) | [Tiếng Việt](docs/readme/README.vi.md) | [हिन्दी](docs/readme/README.hi.md) | [Português](docs/readme/README.pt.md) | [العربية](docs/readme/README.ar.md) | [繁體中文](docs/readme/README.zh-TW.md)
 
+## Read This First
+
+If you are a trader, start with the one-command install, open the web console, add an API key with trading permission only, and create a small test bot before using real size.
+
+If you are a developer, the useful path is: build from source, inspect `config.example.yaml`, run `go test ./...`, then use worker mode when you want to launch a bot from a specific config file.
+
+The README is organized from practical use to technical detail: install, supported exchanges, what the bot does, strategy examples, parameters, manual installation, and live-trading checks.
 
 ## One-Command Install
 
@@ -59,17 +66,14 @@ password: admin
 
 Change the default password immediately after your first login.
 
-
 ## Supported Exchanges
 
-| Exchange | Support |
-| --- | --- |
-| Binance | Futures: stable. Spot: stable. Best for high-liquidity USDT/USDC perpetual and spot grids. |
-| Bitget | Futures: stable. Spot: stable. Best for grid trading and fee-rebate volume strategies. |
-| Gate.io | Futures: stable. Spot: stable. Useful for multi-exchange diversification. |
-| Bybit | Futures: beta. Spot: stable. Test with smaller size first. |
-| OKX | Futures: beta. Spot: stable. Requires API Key, Secret Key, and Passphrase. |
-| Hyperliquid | Futures: beta. Spot: beta. Uses wallet-based API setup and USDC spot pairs. |
+- Binance ☑️
+- Bitget ☑️
+- Gate.io ☑️
+- Bybit ☑️
+- OKX ☑️
+- Hyperliquid ☑️
 
 Bitget rebate link: [up to 70% fee rebate, invite code `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 

@@ -6,6 +6,8 @@ const consoleHTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Nexus Trade Bot</title>
+<link rel="icon" type="image/png" href="/logo/nexus-logo.png">
+<link rel="apple-touch-icon" href="/logo/nexus-logo.png">
 <style>
 :root{--bg:#08111f;--panel:#101b30;--line:#263a5b;--text:#e9f1ff;--muted:#8ea3c3;--cyan:#76d7ff;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b}
 *{box-sizing:border-box}
@@ -21,7 +23,11 @@ button{cursor:pointer}
 	body.light .menu-action{color:#101828}
 	.menu-action:hover{background:rgba(118,215,255,.14);transform:none}
 	.menu-sep{height:1px;background:rgba(70,100,150,.25);margin:2px 0}
-	.top{display:flex;justify-content:flex-end;gap:10px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+	.top{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+	.brand{display:inline-flex;align-items:center;gap:10px;min-width:0;color:var(--text);text-decoration:none}
+	.brand-logo{width:42px;height:42px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,.08);border:1px solid rgba(118,215,255,.22);padding:4px}
+	body.light .brand-logo{background:#fff;border-color:#d7e0ec}
+	.brand-name{font-size:18px;font-weight:900;letter-spacing:0;white-space:nowrap}
 	.top-actions{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;position:relative;margin-left:auto}
 	.top-link{display:inline-flex;align-items:center;justify-content:center;gap:8px;color:var(--text);text-decoration:none}
 	.top-link:hover{text-decoration:none}
@@ -179,13 +185,14 @@ body.light .symbol-option{color:#101828}
 .symbol-meta{color:var(--muted);font-size:12px}
 	@media (max-width:1200px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
 	@media (max-width:900px){.login-shell{grid-template-columns:1fr}.login-brand{padding:24px}.exchange-strip{grid-template-columns:repeat(6,44px)}}
-	@media (max-width:760px){.app{padding:12px}.top{align-items:stretch;gap:10px}.top-actions,.auth-actions{width:100%;justify-content:flex-end}.auth-actions .btn,.auth-actions .btnp{flex:0 1 auto;min-width:0;padding:10px 8px}.metrics,.form,.robot-stats,.grid{grid-template-columns:1fr}.grid{gap:12px}.card.balance-card{grid-column:auto}.panel,.card,.modal-card,.login-shell,.glass{border-radius:14px}.panel{padding:14px}.robot{padding:14px}.item{align-items:flex-start;flex-direction:column}.modal{align-items:flex-end;padding:0}.modal-card{width:100%;max-height:94vh;border-radius:18px 18px 0 0;padding:16px}.head{gap:10px}.field input,.field select{min-height:46px}.login-wrap{padding:0;align-items:stretch}.login-shell{min-height:100vh;border:0;border-radius:0}.login-card{padding:24px 18px}.login-brand{padding:22px 18px}.login-brand h2{font-size:28px}.exchange-strip{grid-template-columns:repeat(6,44px)}.metrics{gap:10px}.v{font-size:22px}.rname{font-size:18px}}
-@media (max-width:420px){.exchange-strip{grid-template-columns:repeat(3,44px)}.auth-actions{display:flex;justify-content:flex-end;flex-wrap:wrap}.auth-actions .btn,.auth-actions .btnp{font-size:13px}.lang-menu{right:0;min-width:160px}.robot-top{flex-direction:column}.status{align-self:flex-start}.promo{font-size:13px}.login-brand .panel{margin-bottom:0}}
+	@media (max-width:760px){.app{padding:12px}.top{align-items:stretch;gap:10px}.brand{width:100%}.brand-logo{width:38px;height:38px}.brand-name{font-size:17px}.top-actions,.auth-actions{width:100%;justify-content:flex-end}.auth-actions .btn,.auth-actions .btnp{flex:0 1 auto;min-width:0;padding:10px 8px}.metrics,.form,.robot-stats,.grid{grid-template-columns:1fr}.grid{gap:12px}.card.balance-card{grid-column:auto}.panel,.card,.modal-card,.login-shell,.glass{border-radius:14px}.panel{padding:14px}.robot{padding:14px}.item{align-items:flex-start;flex-direction:column}.modal{align-items:flex-end;padding:0}.modal-card{width:100%;max-height:94vh;border-radius:18px 18px 0 0;padding:16px}.head{gap:10px}.field input,.field select{min-height:46px}.login-wrap{padding:0;align-items:stretch}.login-shell{min-height:100vh;border:0;border-radius:0}.login-card{padding:24px 18px}.login-brand{padding:22px 18px}.login-brand h2{font-size:28px}.exchange-strip{grid-template-columns:repeat(6,44px)}.metrics{gap:10px}.v{font-size:22px}.rname{font-size:18px}}
+@media (max-width:420px){.brand-logo{width:34px;height:34px}.brand-name{font-size:16px}.exchange-strip{grid-template-columns:repeat(3,44px)}.auth-actions{display:flex;justify-content:flex-end;flex-wrap:wrap}.auth-actions .btn,.auth-actions .btnp{font-size:13px}.lang-menu{right:0;min-width:160px}.robot-top{flex-direction:column}.status{align-self:flex-start}.promo{font-size:13px}.login-brand .panel{margin-bottom:0}}
 </style>
 </head>
 <body>
 	<div class="app">
 	<div class="top hidden" id="topBar">
+	<a class="brand" href="/" aria-label="Nexus Trade Bot"><img class="brand-logo" src="/logo/nexus-logo.png" alt=""><span class="brand-name">Nexus Trade Bot</span></a>
 	<div class="top-actions" id="authBar"><a class="btn top-link" href="https://t.me/nexustradebot8" target="_blank" rel="noopener"><strong data-i18n="community.title">加入用户群</strong><span>Telegram</span></a><div class="settings-wrap"><button class="icon-btn" id="settingsBtn" aria-label="设置" title="设置">⚙</button><div class="settings-menu hidden" id="settingsMenu"><button class="menu-action" id="languageBtn"><span data-i18n="settings.language">语言切换</span><span>›</span></button><button class="menu-action" id="themeToggleBtn"><span data-i18n="settings.theme">黑白切换</span><img id="themeIcon" src="/logo/月亮.png" alt="" style="width:20px;height:20px"></button><button class="menu-action" id="passwordMenuBtn"><span data-i18n="settings.password">修改密码</span><span>›</span></button><div class="menu-sep"></div><button class="menu-action" id="logoutBtn"><span data-i18n="nav.logout">退出登录</span><span>↗</span></button></div><div class="lang-menu hidden" id="languageMenu"></div></div><div class="row auth-actions"><button class="btn" id="manageAccountsBtn" data-i18n="nav.api">API管理</button><button class="btnp" id="createRobotBtn" data-i18n="nav.newRobot">新建机器人</button></div></div>
 	</div>
 	<div id="console" class="hidden">
