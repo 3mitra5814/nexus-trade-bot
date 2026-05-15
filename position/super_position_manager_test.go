@@ -1507,6 +1507,68 @@ func TestPositionSnapshotAdoptsRemoteShortByDefault(t *testing.T) {
 	}
 }
 
+func TestPositionSnapshotAddsRemoteShortDeltaNearCurrentGrid(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "HYPEUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.05
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 3, 2)
+	if err := spm.Initialize(45.277, "45.277"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	oldSlot := spm.getOrCreateSlot(43.777, BookSideShort)
+	oldSlot.mu.Lock()
+	oldSlot.BookSide = BookSideShort
+	oldSlot.PositionStatus = PositionStatusFilled
+	oldSlot.PositionQty = 0.69
+	oldSlot.EntryPrice = 43.777
+	oldSlot.SlotStatus = SlotStatusFree
+	oldSlot.mu.Unlock()
+
+	spm.ApplyExchangeSnapshot([]*PositionInfo{{
+		Symbol:     "HYPEUSDT",
+		Size:       -1.35,
+		EntryPrice: 43.777,
+		MarkPrice:  45.277,
+	}}, nil)
+
+	localLong, localShort := spm.localPositionTotals()
+	if localLong != 0 || math.Abs(localShort-1.35) > 0.000001 {
+		t.Fatalf("expected local short to be topped up to 1.35, got long=%.8f short=%.8f", localLong, localShort)
+	}
+	newSlot := spm.getOrCreateSlot(45.277, BookSideShort)
+	newSlot.mu.RLock()
+	newQty := newSlot.PositionQty
+	newStatus := newSlot.PositionStatus
+	newSlot.mu.RUnlock()
+	if newStatus != PositionStatusFilled || math.Abs(newQty-0.66) > 0.000001 {
+		t.Fatalf("expected missing short delta to be restored near current grid at 45.277 with qty 0.66, status=%s qty=%.8f",
+			newStatus, newQty)
+	}
+
+	if err := spm.AdjustOrders(45.277); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	foundNearExit := false
+	for _, order := range executor.orders {
+		if order.Side == "BUY" && order.ReduceOnly && order.Price == 45.227 {
+			foundNearExit = true
+			break
+		}
+	}
+	if !foundNearExit {
+		t.Fatalf("expected newly adopted short delta to get a near-market BUY exit at 45.227, orders=%+v", executor.orders)
+	}
+}
+
 func TestAdjustOrdersPrioritizesExitOrdersOverEntries(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -1897,6 +1959,172 @@ func TestAdjustOrdersDoesNotDuplicateWhenExchangeReturnsBlankClientOID(t *testin
 			t.Fatalf("expected slot %v locked with request clientOID, got oid=%q status=%s want oid=%q",
 				req.Price, gotOID, gotStatus, req.ClientOrderID)
 		}
+	}
+}
+
+func TestPendingOrderWithoutClientOIDBlocksDuplicateExitPrice(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 1000
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	pendingSlot := spm.getOrCreateSlot(103, BookSideShort)
+	pendingSlot.mu.Lock()
+	pendingSlot.BookSide = BookSideShort
+	pendingSlot.PositionStatus = PositionStatusFilled
+	pendingSlot.PositionQty = 1
+	pendingSlot.SlotStatus = SlotStatusPending
+	pendingSlot.OrderStatus = OrderStatusPlaced
+	pendingSlot.OrderSide = "BUY"
+	pendingSlot.OrderPrice = 99.4
+	pendingSlot.OrderCreatedAt = time.Now()
+	pendingSlot.mu.Unlock()
+
+	candidateSlot := spm.getOrCreateSlot(102, BookSideShort)
+	candidateSlot.mu.Lock()
+	candidateSlot.BookSide = BookSideShort
+	candidateSlot.PositionStatus = PositionStatusFilled
+	candidateSlot.PositionQty = 1
+	candidateSlot.SlotStatus = SlotStatusFree
+	candidateSlot.mu.Unlock()
+
+	if err := spm.AdjustOrders(100.4); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	for _, order := range executor.orders {
+		if order.ReduceOnly && order.Side == "BUY" && order.Price == 99.4 {
+			t.Fatalf("pending unconfirmed order must block duplicate BUY exit at 99.40, orders=%v", executor.orders)
+		}
+	}
+}
+
+func TestCleanupGhostOrderStatesClearsStalePendingWithoutIdentity(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	slot := spm.getOrCreateSlot(99, BookSideLong)
+	slot.mu.Lock()
+	slot.BookSide = BookSideLong
+	slot.PositionStatus = PositionStatusEmpty
+	slot.SlotStatus = SlotStatusPending
+	slot.OrderStatus = OrderStatusPlaced
+	slot.OrderSide = "BUY"
+	slot.OrderPrice = 99
+	slot.OrderCreatedAt = time.Now().Add(-pendingOrderIdentityGrace - time.Second)
+	slot.mu.Unlock()
+
+	spm.cleanupGhostOrderStates()
+
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.SlotStatus != SlotStatusFree || slot.OrderStatus != OrderStatusNotPlaced || slot.OrderSide != "" || slot.OrderPrice != 0 {
+		t.Fatalf("expected stale pending order state to be cleared, slot=%s status=%s side=%q price=%.2f",
+			slot.SlotStatus, slot.OrderStatus, slot.OrderSide, slot.OrderPrice)
+	}
+}
+
+func TestAdjustOrdersSpreadsMakerSafeExitPricesWhenTargetsCollapse(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 1000
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	for _, price := range []float64{98, 99, 100} {
+		slot := spm.getOrCreateSlot(price, BookSideLong)
+		slot.mu.Lock()
+		slot.BookSide = BookSideLong
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = 1
+		slot.EntryPrice = price
+		slot.SlotStatus = SlotStatusFree
+		slot.mu.Unlock()
+	}
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	gotExitPrices := map[float64]bool{}
+	for _, order := range executor.orders {
+		if order.ReduceOnly && order.Side == "SELL" {
+			if gotExitPrices[order.Price] {
+				t.Fatalf("exit order price duplicated at %.2f, orders=%v", order.Price, executor.orders)
+			}
+			gotExitPrices[order.Price] = true
+		}
+	}
+	for _, want := range []float64{101, 102, 103} {
+		if !gotExitPrices[want] {
+			t.Fatalf("expected maker-safe exits to be spaced by interval and include %.2f, got %v orders=%v",
+				want, gotExitPrices, executor.orders)
+		}
+	}
+}
+
+func TestApplyExchangeSnapshotCancelsDuplicateSamePriceOrders(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 1000
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	keepOID := spm.generateClientOrderID(100, "SELL", BookSideLong)
+	duplicateOID := spm.generateClientOrderID(99, "SELL", BookSideLong)
+	keepSlot := spm.getOrCreateSlot(100, BookSideLong)
+	keepSlot.mu.Lock()
+	keepSlot.BookSide = BookSideLong
+	keepSlot.PositionStatus = PositionStatusFilled
+	keepSlot.PositionQty = 1
+	keepSlot.OrderID = 11
+	keepSlot.ClientOID = keepOID
+	keepSlot.OrderSide = "SELL"
+	keepSlot.OrderStatus = OrderStatusConfirmed
+	keepSlot.OrderPrice = 101
+	keepSlot.SlotStatus = SlotStatusLocked
+	keepSlot.mu.Unlock()
+
+	spm.ApplyExchangeSnapshot(nil, []*Order{
+		{OrderID: 11, ClientOrderID: keepOID, Side: "SELL", Status: OrderStatusConfirmed, Price: 101, Quantity: 1},
+		{OrderID: 12, ClientOrderID: duplicateOID, Side: "SELL", Status: OrderStatusConfirmed, Price: 101, Quantity: 1},
+	})
+
+	if len(executor.canceled) != 1 || executor.canceled[0] != 12 {
+		t.Fatalf("expected duplicate same-price order 12 to be canceled, got %v", executor.canceled)
+	}
+	duplicateSlot := spm.getOrCreateSlot(99, BookSideLong)
+	duplicateSlot.mu.RLock()
+	defer duplicateSlot.mu.RUnlock()
+	if duplicateSlot.OrderID != 0 || duplicateSlot.ClientOID != "" {
+		t.Fatalf("duplicate snapshot order must not be adopted locally, orderID=%d clientOID=%q",
+			duplicateSlot.OrderID, duplicateSlot.ClientOID)
 	}
 }
 

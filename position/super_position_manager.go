@@ -97,6 +97,8 @@ const (
 	SlotStatusLocked  = "LOCKED"  // 已锁定，有活跃订单
 )
 
+const pendingOrderIdentityGrace = 30 * time.Second
+
 // InventorySlot 库存槽位（每个价格点一个）
 type InventorySlot struct {
 	Price float64 // 价格（作为key，支持高精度）
@@ -750,14 +752,32 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			clientOID := spm.generateClientOrderID(candidate.SlotPrice, exitSide, candidate.BookSide)
 			placementKey := spm.orderPlacementKey(exitSide, candidate.BookSide, candidate.ExitPrice)
 			if _, exists := plannedOrderKeys[placementKey]; exists {
-				slot.SlotStatus = SlotStatusFree
-				slot.mu.Unlock()
-				if _, logged := skippedDuplicateExitKeys[placementKey]; !logged {
-					logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
-						candidate.BookSide, exitSide, formatPrice(candidate.ExitPrice, spm.priceDecimals))
-					skippedDuplicateExitKeys[placementKey] = struct{}{}
+				originalExitPrice := candidate.ExitPrice
+				adjustedExitPrice, ok := spm.nextUnusedMakerSafeExitPrice(originalExitPrice, currentPrice, candidate.BookSide, exitSide, plannedOrderKeys)
+				if !ok {
+					slot.SlotStatus = SlotStatusFree
+					slot.mu.Unlock()
+					if _, logged := skippedDuplicateExitKeys[placementKey]; !logged {
+						logger.Warn("⚠️ [跳过重复平仓单] %s %s %s 已存在活跃/待提交订单",
+							candidate.BookSide, exitSide, formatPrice(originalExitPrice, spm.priceDecimals))
+						skippedDuplicateExitKeys[placementKey] = struct{}{}
+					}
+					continue
 				}
-				continue
+				exitQty, ok := spm.exitOrderQuantity(slot.PositionQty, adjustedExitPrice)
+				if !ok {
+					slot.SlotStatus = SlotStatusFree
+					slot.mu.Unlock()
+					continue
+				}
+				candidate.ExitPrice = adjustedExitPrice
+				candidate.Quantity = exitQty
+				placementKey = spm.orderPlacementKey(exitSide, candidate.BookSide, candidate.ExitPrice)
+				logger.Warn("↔️ [平仓价格避让] %s %s 槽位 %s: %s 已占用，改挂 %s",
+					candidate.BookSide, exitSide,
+					formatPrice(candidate.SlotPrice, spm.priceDecimals),
+					formatPrice(originalExitPrice, spm.priceDecimals),
+					formatPrice(candidate.ExitPrice, spm.priceDecimals))
 			}
 			plannedOrderKeys[placementKey] = struct{}{}
 			slot.ClientOID = clientOID
@@ -1504,7 +1524,10 @@ func (spm *SuperPositionManager) slotHasActiveOrder(slot *InventorySlot) bool {
 		return false
 	}
 	if slot.SlotStatus == SlotStatusPending {
-		return strings.TrimSpace(slot.ClientOID) != ""
+		if strings.TrimSpace(slot.ClientOID) != "" || slot.OrderID != 0 {
+			return true
+		}
+		return isActiveOrderStatus(slot.OrderStatus) && strings.TrimSpace(slot.OrderSide) != ""
 	}
 	if !isActiveOrderStatus(slot.OrderStatus) {
 		return false
@@ -1514,12 +1537,28 @@ func (spm *SuperPositionManager) slotHasActiveOrder(slot *InventorySlot) bool {
 
 func (spm *SuperPositionManager) cleanupGhostOrderStates() {
 	var cleaned int
+	now := time.Now()
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
 		slot.mu.Lock()
+		clientOID := strings.TrimSpace(slot.ClientOID)
+		if slot.SlotStatus == SlotStatusPending &&
+			slot.OrderID == 0 &&
+			clientOID == "" &&
+			slot.OrderFilledQty == 0 &&
+			(slot.OrderCreatedAt.IsZero() || now.Sub(slot.OrderCreatedAt) > pendingOrderIdentityGrace) {
+			logger.Warn("🧹 [槽位修复] 清理无标识待提交订单状态: price=%s book=%s side=%s status=%s",
+				formatPrice(slot.Price, spm.priceDecimals), slot.BookSide, slot.OrderSide, slot.OrderStatus)
+			slot.SlotStatus = SlotStatusFree
+			slot.OrderStatus = OrderStatusNotPlaced
+			slot.OrderSide = ""
+			slot.OrderPrice = 0
+			slot.OrderCreatedAt = time.Time{}
+			cleaned++
+		}
 		if slot.SlotStatus == SlotStatusFree &&
 			slot.OrderID == 0 &&
-			strings.TrimSpace(slot.ClientOID) == "" &&
+			clientOID == "" &&
 			slot.OrderFilledQty == 0 &&
 			isActiveOrderStatus(slot.OrderStatus) {
 			logger.Warn("🧹 [槽位修复] 清理幽灵订单状态: price=%s book=%s side=%s status=%s",
@@ -1954,6 +1993,33 @@ func (spm *SuperPositionManager) makerSafeExitPrice(targetPrice, currentPrice fl
 	return spm.firstGridAbove(currentPrice, safetyBuffer)
 }
 
+func (spm *SuperPositionManager) nextUnusedMakerSafeExitPrice(targetPrice, currentPrice float64, bookSide, exitSide string, used map[string]struct{}) (float64, bool) {
+	priceInterval := spm.config.Trading.PriceInterval
+	if priceInterval <= 0 {
+		return 0, false
+	}
+	price := spm.makerSafeExitPrice(targetPrice, currentPrice, bookSide)
+	maxAttempts := spm.config.Trading.BuyWindowSize + spm.config.Trading.SellWindowSize + 20
+	if maxAttempts < 20 {
+		maxAttempts = 20
+	}
+	for i := 0; i < maxAttempts; i++ {
+		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			return 0, false
+		}
+		key := spm.orderPlacementKey(exitSide, bookSide, price)
+		if _, exists := used[key]; !exists {
+			return price, true
+		}
+		if bookSide == BookSideShort {
+			price = roundPrice(price-priceInterval, spm.priceDecimals)
+		} else {
+			price = roundPrice(price+priceInterval, spm.priceDecimals)
+		}
+	}
+	return 0, false
+}
+
 func (spm *SuperPositionManager) firstGridAbove(currentPrice, safetyBuffer float64) float64 {
 	priceInterval := spm.config.Trading.PriceInterval
 	price := roundPrice(currentPrice+priceInterval, spm.priceDecimals)
@@ -2071,7 +2137,7 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 	orders := spm.extractExchangeOrders(openOrdersRaw)
 	openOrderIDs := make(map[int64]struct{}, len(orders))
 	openClientOIDs := make(map[string]struct{}, len(orders))
-	var conflictingSnapshotOrderIDs []int64
+	var cancelSnapshotOrderIDs []int64
 
 	for _, order := range orders {
 		if order.OrderID != 0 {
@@ -2080,6 +2146,11 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		if order.ClientOrderID != "" {
 			openClientOIDs[order.ClientOrderID] = struct{}{}
 		}
+	}
+	filteredOrders, duplicateOrderIDs := spm.filterDuplicateSnapshotOrders(orders)
+	cancelSnapshotOrderIDs = append(cancelSnapshotOrderIDs, duplicateOrderIDs...)
+
+	for _, order := range filteredOrders {
 		price, side, bookSide, valid := spm.parseClientOrderID(order.ClientOrderID)
 		if !valid {
 			continue
@@ -2090,7 +2161,7 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 			logger.Warn("⚠️ [对账] 快照挂单与当前槽位订单冲突，保留当前跟踪订单并准备撤销冲突单: slot=%s, currentOrderID=%d, currentClientOID=%s, snapshotOrderID=%d, snapshotClientOID=%s",
 				formatPrice(price, spm.priceDecimals), slot.OrderID, slot.ClientOID, order.OrderID, order.ClientOrderID)
 			if order.OrderID != 0 {
-				conflictingSnapshotOrderIDs = append(conflictingSnapshotOrderIDs, order.OrderID)
+				cancelSnapshotOrderIDs = append(cancelSnapshotOrderIDs, order.OrderID)
 			}
 			slot.mu.Unlock()
 			continue
@@ -2111,11 +2182,11 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		}
 		slot.mu.Unlock()
 	}
-	if len(conflictingSnapshotOrderIDs) > 0 && spm.executor != nil {
-		if err := spm.executor.BatchCancelOrders(conflictingSnapshotOrderIDs); err != nil {
-			logger.Error("❌ [对账] 撤销快照冲突订单失败: %v (orderIDs=%v)", err, conflictingSnapshotOrderIDs)
+	if len(cancelSnapshotOrderIDs) > 0 && spm.executor != nil {
+		if err := spm.executor.BatchCancelOrders(cancelSnapshotOrderIDs); err != nil {
+			logger.Error("❌ [对账] 撤销快照冲突订单失败: %v (orderIDs=%v)", err, cancelSnapshotOrderIDs)
 		} else {
-			logger.Warn("🧹 [对账] 已撤销 %d 张快照冲突订单: %v", len(conflictingSnapshotOrderIDs), conflictingSnapshotOrderIDs)
+			logger.Warn("🧹 [对账] 已撤销 %d 张快照冲突/重复订单: %v", len(cancelSnapshotOrderIDs), cancelSnapshotOrderIDs)
 		}
 	}
 
@@ -2147,6 +2218,67 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		logger.Warn("⚠️ [对账] 发现 %d 个本地活跃订单不在交易所挂单列表中", staleActive)
 		spm.refreshStaleOrders(staleOrders)
 	}
+}
+
+type snapshotOrderSelection struct {
+	Index int
+	Order exchangeOrderSnapshot
+	Score int
+}
+
+func (spm *SuperPositionManager) filterDuplicateSnapshotOrders(orders []exchangeOrderSnapshot) ([]exchangeOrderSnapshot, []int64) {
+	if len(orders) == 0 {
+		return nil, nil
+	}
+	filtered := make([]exchangeOrderSnapshot, 0, len(orders))
+	seen := make(map[string]snapshotOrderSelection, len(orders))
+	var duplicateOrderIDs []int64
+
+	for _, order := range orders {
+		price, side, bookSide, valid := spm.parseClientOrderID(order.ClientOrderID)
+		if !valid || !isActiveOrderStatus(normalizeRemoteOrderStatus(order.Status)) || order.Price <= 0 {
+			filtered = append(filtered, order)
+			continue
+		}
+		key := spm.orderPlacementKey(side, bookSide, order.Price)
+		score := spm.snapshotOrderKeepScore(price, bookSide, order)
+		if kept, exists := seen[key]; exists {
+			if score > kept.Score {
+				if kept.Order.OrderID != 0 {
+					duplicateOrderIDs = append(duplicateOrderIDs, kept.Order.OrderID)
+				}
+				filtered[kept.Index] = order
+				seen[key] = snapshotOrderSelection{Index: kept.Index, Order: order, Score: score}
+			} else if order.OrderID != 0 {
+				duplicateOrderIDs = append(duplicateOrderIDs, order.OrderID)
+			}
+			logger.Warn("⚠️ [对账] 发现同价重复挂单，保留一张并撤销多余订单: key=%s", key)
+			continue
+		}
+		seen[key] = snapshotOrderSelection{Index: len(filtered), Order: order, Score: score}
+		filtered = append(filtered, order)
+	}
+	return filtered, duplicateOrderIDs
+}
+
+func (spm *SuperPositionManager) snapshotOrderKeepScore(slotPrice float64, bookSide string, order exchangeOrderSnapshot) int {
+	score := 0
+	if order.ExecutedQty > 0 {
+		score++
+	}
+	slot := spm.getOrCreateSlot(slotPrice, bookSide)
+	slot.mu.RLock()
+	if spm.slotHasActiveOrder(slot) {
+		clientOID := strings.TrimSpace(order.ClientOrderID)
+		if slot.ClientOID != "" && clientOID != "" && slot.ClientOID == clientOID {
+			score += 4
+		}
+		if slot.OrderID != 0 && order.OrderID != 0 && slot.OrderID == order.OrderID {
+			score += 4
+		}
+	}
+	slot.mu.RUnlock()
+	return score
 }
 
 func (spm *SuperPositionManager) snapshotOrderConflictsWithCurrentSlot(slot *InventorySlot, order exchangeOrderSnapshot) bool {
@@ -2286,9 +2418,10 @@ func (spm *SuperPositionManager) reconcileBookPositionSnapshot(bookSide string, 
 	if remoteQty-localQty <= tolerance {
 		return
 	}
-	logger.Warn("⚠️ [对账接管-%s] 交易所持仓 %.8f 大于本地槽位持仓 %.8f，按交易所快照重建机器人库存槽位",
-		bookSide, remoteQty, localQty)
-	spm.adoptRemotePositionSnapshot(bookSide, remoteQty, entryPrice, tolerance)
+	deltaQty := remoteQty - localQty
+	logger.Warn("⚠️ [对账补仓-%s] 交易所持仓 %.8f 大于本地槽位持仓 %.8f，按当前网格补齐差额 %.8f",
+		bookSide, remoteQty, localQty, deltaQty)
+	spm.adoptRemotePositionDelta(bookSide, deltaQty, entryPrice, tolerance)
 }
 
 func (spm *SuperPositionManager) localPositionTotals() (float64, float64) {
@@ -2355,6 +2488,22 @@ func (spm *SuperPositionManager) adoptRemotePositionSnapshot(bookSide string, re
 		return
 	}
 	spm.initializeSlotsFromPosition(remaining, bookSide, entryPrice)
+}
+
+func (spm *SuperPositionManager) adoptRemotePositionDelta(bookSide string, deltaQty, entryPrice, tolerance float64) {
+	remaining := roundQuantity(deltaQty, spm.quantityDecimals)
+	if remaining <= tolerance {
+		return
+	}
+	referencePrice := spm.currentRecoveryReferencePrice(entryPrice)
+	spm.initializeSlotsFromPositionAtReference(remaining, bookSide, entryPrice, referencePrice)
+}
+
+func (spm *SuperPositionManager) currentRecoveryReferencePrice(entryPrice float64) float64 {
+	if lastPrice, ok := spm.lastMarketPrice.Load().(float64); ok && lastPrice > 0 {
+		return lastPrice
+	}
+	return firstPositiveFloat(spm.anchorPrice, entryPrice)
 }
 
 // GetTotalBuyQty 获取累计买入数量（IPositionManager 接口方法，供 Reconciler 使用）
@@ -2654,10 +2803,14 @@ func (spm *SuperPositionManager) getExistingPositions() existingPositions {
 
 // initializeSlotsFromPosition 从现有持仓初始化平仓槽位（用于程序重启后恢复状态）
 func (spm *SuperPositionManager) initializeSlotsFromPosition(totalPosition float64, bookSide string, entryPrice float64) {
+	spm.initializeSlotsFromPositionAtReference(totalPosition, bookSide, entryPrice, firstPositiveFloat(spm.anchorPrice, entryPrice))
+}
+
+func (spm *SuperPositionManager) initializeSlotsFromPositionAtReference(totalPosition float64, bookSide string, entryPrice, reference float64) {
 	if totalPosition <= 0 {
 		return
 	}
-	referencePrice := spm.findNearestGridPrice(firstPositiveFloat(spm.anchorPrice, entryPrice))
+	referencePrice := spm.findNearestGridPrice(reference)
 	if referencePrice <= 0 {
 		return
 	}
