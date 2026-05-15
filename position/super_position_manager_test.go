@@ -831,7 +831,7 @@ func TestDirectionalFuturesPlacesOnlyDirectionalEntryOrders(t *testing.T) {
 	}
 }
 
-func TestDirectionalEntryWindowBackfillsLatestPriceWithoutRebalance(t *testing.T) {
+func TestDirectionalEntryWindowDoesNotOverfillWithoutRebalance(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -855,7 +855,7 @@ func TestDirectionalEntryWindowBackfillsLatestPriceWithoutRebalance(t *testing.T
 		t.Fatalf("second AdjustOrders() error = %v", err)
 	}
 
-	wantSells := map[float64]bool{2309.00: false, 2310.00: false, 2311.00: false, 2312.00: false, 2313.00: false, 2314.00: false}
+	sellEntries := 0
 	for _, order := range executor.orders {
 		if order.ReduceOnly {
 			continue
@@ -864,15 +864,14 @@ func TestDirectionalEntryWindowBackfillsLatestPriceWithoutRebalance(t *testing.T
 			t.Fatalf("short mode should not place BUY entry orders: %+v", order)
 		}
 		if order.Side == "SELL" {
-			if _, ok := wantSells[order.Price]; ok {
-				wantSells[order.Price] = true
+			sellEntries++
+			if order.Price == 2314.00 {
+				t.Fatalf("sell window is already full; expected no over-window backfill at %.2f without rebalance, orders=%v", order.Price, executor.orders)
 			}
 		}
 	}
-	for price, seen := range wantSells {
-		if !seen {
-			t.Fatalf("expected moved SELL window to include %.2f, orders=%v", price, executor.orders)
-		}
+	if sellEntries != cfg.Trading.SellWindowSize {
+		t.Fatalf("expected sell entries to remain capped at %d, got %d orders=%v", cfg.Trading.SellWindowSize, sellEntries, executor.orders)
 	}
 	if len(executor.canceled) != 0 {
 		t.Fatalf("directional inventory grid should not cancel stale entries on window move, got %v", executor.canceled)
@@ -1775,7 +1774,7 @@ func TestAdjustOrdersPlacesExitEvenWhenEntryThresholdIsFull(t *testing.T) {
 	}
 }
 
-func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries(t *testing.T) {
+func TestDirectionalAdjustOrdersWaitsForEntryCapacityBeforeBackfillingCurrentWindow(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "long"
@@ -1783,7 +1782,7 @@ func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries
 	cfg.Trading.OrderQuantity = 30
 	cfg.Trading.BuyWindowSize = 3
 	cfg.Trading.SellWindowSize = 3
-	cfg.Trading.OrderCleanupThreshold = 3
+	cfg.Trading.OrderCleanupThreshold = 50
 	cfg.Trading.CleanupBatchSize = 10
 
 	executor := &captureExecutor{}
@@ -1802,22 +1801,61 @@ func TestDirectionalAdjustOrdersBackfillsCurrentWindowWithoutCancelingOldEntries
 		t.Fatalf("directional inventory grid should keep old entry orders until fill/cleanup, got %v", executor.canceled)
 	}
 
-	has109 := false
-	has108 := false
+	unexpectedBackfill := false
 	for _, order := range executor.orders {
 		if order.Side != "BUY" || order.ReduceOnly {
 			continue
 		}
 		switch order.Price {
-		case 109:
-			has109 = true
-		case 108:
-			has108 = true
+		case 109, 108, 107:
+			unexpectedBackfill = true
 		}
 	}
-	if !has109 || !has108 {
-		t.Fatalf("expected current entry window to be refilled at 109 and 108, got has109=%v has108=%v orders=%v",
-			has109, has108, executor.orders)
+	if unexpectedBackfill {
+		t.Fatalf("entry side is already full; expected no over-window backfill before rebalance, orders=%v", executor.orders)
+	}
+}
+
+func TestDirectionalShortDoesNotBackfillWhenSellWindowFull(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 50
+	cfg.Trading.CleanupBatchSize = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	if err := spm.AdjustOrdersWithRebalance(99, false); err != nil {
+		t.Fatalf("second AdjustOrders() error = %v", err)
+	}
+
+	activeShortEntries := 0
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if slot.BookSide == BookSideShort && slot.OrderSide == "SELL" && spm.slotHasActiveOrder(slot) {
+			activeShortEntries++
+		}
+		return true
+	})
+	if activeShortEntries != cfg.Trading.SellWindowSize {
+		t.Fatalf("short entry orders must stay capped at sell window size, got %d want %d", activeShortEntries, cfg.Trading.SellWindowSize)
+	}
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price == 100 {
+			t.Fatalf("sell window was full; expected no backfill at 100 before stale entries are canceled, orders=%v", executor.orders)
+		}
 	}
 }
 
@@ -2159,7 +2197,7 @@ func TestCleanupGhostOrderStatesClearsStalePendingWithoutIdentity(t *testing.T) 
 	}
 }
 
-func TestAdjustOrdersSpreadsMakerSafeExitPricesWhenTargetsCollapse(t *testing.T) {
+func TestAdjustOrdersAllowsSamePriceReduceOnlyExitsWhenTargetsCollapse(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "long"
@@ -2190,24 +2228,21 @@ func TestAdjustOrdersSpreadsMakerSafeExitPricesWhenTargetsCollapse(t *testing.T)
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
-	gotExitPrices := map[float64]bool{}
+	var exitCountAtTarget int
 	for _, order := range executor.orders {
 		if order.ReduceOnly && order.Side == "SELL" {
-			if gotExitPrices[order.Price] {
-				t.Fatalf("exit order price duplicated at %.2f, orders=%v", order.Price, executor.orders)
+			if order.Price != 101 {
+				t.Fatalf("expected collapsed maker-safe exits to stay at nearest target 101.00, got %.2f orders=%v", order.Price, executor.orders)
 			}
-			gotExitPrices[order.Price] = true
+			exitCountAtTarget++
 		}
 	}
-	for _, want := range []float64{101, 102, 103} {
-		if !gotExitPrices[want] {
-			t.Fatalf("expected maker-safe exits to be spaced by interval and include %.2f, got %v orders=%v",
-				want, gotExitPrices, executor.orders)
-		}
+	if exitCountAtTarget != 3 {
+		t.Fatalf("expected all 3 reduce-only exits at the nearest maker-safe price, got %d orders=%v", exitCountAtTarget, executor.orders)
 	}
 }
 
-func TestApplyExchangeSnapshotCancelsDuplicateSamePriceOrders(t *testing.T) {
+func TestApplyExchangeSnapshotAllowsDuplicateSamePriceExitOrders(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "long"
@@ -2238,14 +2273,14 @@ func TestApplyExchangeSnapshotCancelsDuplicateSamePriceOrders(t *testing.T) {
 		{OrderID: 12, ClientOrderID: duplicateOID, Side: "SELL", Status: OrderStatusConfirmed, Price: 101, Quantity: 1},
 	})
 
-	if len(executor.canceled) != 1 || executor.canceled[0] != 12 {
-		t.Fatalf("expected duplicate same-price order 12 to be canceled, got %v", executor.canceled)
+	if len(executor.canceled) != 0 {
+		t.Fatalf("same-price reduce-only exits should be kept, got canceled %v", executor.canceled)
 	}
 	duplicateSlot := spm.getOrCreateSlot(99, BookSideLong)
 	duplicateSlot.mu.RLock()
 	defer duplicateSlot.mu.RUnlock()
-	if duplicateSlot.OrderID != 0 || duplicateSlot.ClientOID != "" {
-		t.Fatalf("duplicate snapshot order must not be adopted locally, orderID=%d clientOID=%q",
+	if duplicateSlot.OrderID != 12 || duplicateSlot.ClientOID != duplicateOID {
+		t.Fatalf("duplicate same-price exit order should be adopted locally, orderID=%d clientOID=%q",
 			duplicateSlot.OrderID, duplicateSlot.ClientOID)
 	}
 }
