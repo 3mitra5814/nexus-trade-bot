@@ -37,6 +37,12 @@ func (noopExchange) CancelAllOrders(ctx context.Context, symbol string) error {
 	return nil
 }
 
+type binanceNamedExchange struct {
+	noopExchange
+}
+
+func (binanceNamedExchange) GetName() string { return "Binance" }
+
 type seededExchange struct {
 	noopExchange
 	positions []*PositionInfo
@@ -44,6 +50,20 @@ type seededExchange struct {
 
 func (e seededExchange) GetPositions(ctx context.Context, symbol string) (interface{}, error) {
 	return e.positions, nil
+}
+
+type staleFillExchange struct {
+	noopExchange
+	positions []*PositionInfo
+	order     interface{}
+}
+
+func (e staleFillExchange) GetPositions(ctx context.Context, symbol string) (interface{}, error) {
+	return e.positions, nil
+}
+
+func (e staleFillExchange) GetOrder(ctx context.Context, symbol string, orderID int64) (interface{}, error) {
+	return e.order, nil
 }
 
 type goneOrderExchange struct {
@@ -401,6 +421,108 @@ func TestUnrealizedPNLUsesActualEntryAveragePrice(t *testing.T) {
 	spm.OnOrderUpdate(OrderUpdate{OrderID: 1, ClientOrderID: entryOID, Status: "FILLED", ExecutedQty: 0.3, AvgPrice: 101.2, Side: "SELL"})
 
 	assertFloatNear(t, spm.EstimateUnrealizedPNL(100), (101.2-100)*0.3)
+}
+
+func TestOnOrderUpdateAcceptsBinanceBrokerPrefixedClientOID(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "SOLUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.02
+	cfg.Trading.OrderQuantity = 29
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, binanceNamedExchange{}, 2, 3)
+	clientOID := spm.generateClientOrderID(91.36, "SELL", BookSideShort)
+	slot := spm.getOrCreateSlot(91.36, BookSideShort)
+	slot.mu.Lock()
+	slot.OrderID = 123
+	slot.ClientOID = clientOID
+	slot.OrderSide = "SELL"
+	slot.OrderStatus = OrderStatusConfirmed
+	slot.SlotStatus = SlotStatusLocked
+	slot.mu.Unlock()
+
+	prefixedOID := utils.AddBrokerPrefix("binance", clientOID)
+	if !spm.OnOrderUpdate(OrderUpdate{
+		OrderID:       123,
+		ClientOrderID: prefixedOID,
+		Status:        "FILLED",
+		Side:          "SELL",
+		ExecutedQty:   0.32,
+		AvgPrice:      91.36,
+	}) {
+		t.Fatal("expected prefixed Binance order update to be accepted")
+	}
+
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.PositionStatus != PositionStatusFilled || math.Abs(slot.PositionQty-0.32) > 1e-9 {
+		t.Fatalf("expected filled short position from prefixed update, status=%s qty=%.8f", slot.PositionStatus, slot.PositionQty)
+	}
+	if slot.ClientOID != "" || slot.OrderID != 0 {
+		t.Fatalf("filled order should clear active tracking, orderID=%d clientOID=%q", slot.OrderID, slot.ClientOID)
+	}
+}
+
+func TestSnapshotRefreshesStaleFillBeforePositionReconcile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "SOLUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.02
+	cfg.Trading.OrderQuantity = 29
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+
+	clientOID := utils.GenerateOrderIDWithTag(91.16, "SELL", BookSideShort, 2, "")
+	exchange := staleFillExchange{
+		positions: []*PositionInfo{{Symbol: "SOLUSDT", Size: -0.96, EntryPrice: 91.2, MarkPrice: 91.3}},
+		order: struct {
+			OrderID       int64
+			ClientOrderID string
+			Side          string
+			Status        string
+			Price         float64
+			Quantity      float64
+			ExecutedQty   float64
+			AvgPrice      float64
+		}{
+			OrderID:       99,
+			ClientOrderID: utils.AddBrokerPrefix("binance", clientOID),
+			Side:          "SELL",
+			Status:        "FILLED",
+			Price:         91.16,
+			Quantity:      0.32,
+			ExecutedQty:   0.32,
+			AvgPrice:      91.16,
+		},
+	}
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, exchange, 2, 3)
+	for _, price := range []float64{91.20, 91.18} {
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = 0.32
+		slot.SlotStatus = SlotStatusFree
+		slot.BookSide = BookSideShort
+		slot.mu.Unlock()
+	}
+	pendingSlot := spm.getOrCreateSlot(91.16, BookSideShort)
+	pendingSlot.mu.Lock()
+	pendingSlot.OrderID = 99
+	pendingSlot.ClientOID = clientOID
+	pendingSlot.OrderSide = "SELL"
+	pendingSlot.OrderStatus = OrderStatusConfirmed
+	pendingSlot.SlotStatus = SlotStatusLocked
+	pendingSlot.BookSide = BookSideShort
+	pendingSlot.mu.Unlock()
+
+	spm.ApplyExchangeSnapshot(exchange.positions, nil)
+
+	_, localShort := spm.localPositionTotals()
+	if math.Abs(localShort-0.96) > 1e-9 {
+		t.Fatalf("stale fill and position reconcile should not double count, localShort=%.8f", localShort)
+	}
 }
 
 func TestLateNewAfterTerminalFillDoesNotRelockSlot(t *testing.T) {

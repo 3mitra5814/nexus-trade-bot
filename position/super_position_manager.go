@@ -417,8 +417,7 @@ func (spm *SuperPositionManager) generateClientOrderID(price float64, side, book
 // 返回: price, side, bookSide, valid
 func (spm *SuperPositionManager) parseClientOrderID(clientOrderID string) (float64, string, string, bool) {
 	// 1. 先移除交易所前缀
-	exchangeName := strings.ToLower(spm.exchange.GetName())
-	cleanID := utils.RemoveBrokerPrefix(exchangeName, clientOrderID)
+	cleanID := spm.normalizeClientOrderID(clientOrderID)
 
 	// 2. 使用统一的 utils 包解析
 	price, side, bookSide, _, orderTag, valid := utils.ParseOrderIDWithTag(cleanID, spm.priceDecimals)
@@ -437,6 +436,27 @@ func (spm *SuperPositionManager) parseClientOrderID(clientOrderID string) (float
 	// 例如: 3116.85 和 3114.85 可能都被四舍五入成同一个值
 
 	return price, side, bookSide, true
+}
+
+func (spm *SuperPositionManager) normalizeClientOrderID(clientOrderID string) string {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return ""
+	}
+	if spm.exchange != nil {
+		exchangeName := strings.ToLower(strings.TrimSpace(spm.exchange.GetName()))
+		if exchangeName != "" {
+			if cleaned := utils.RemoveBrokerPrefix(exchangeName, clientOrderID); cleaned != clientOrderID {
+				return cleaned
+			}
+		}
+	}
+	for _, exchangeName := range []string{"binance", "gate"} {
+		if cleaned := utils.RemoveBrokerPrefix(exchangeName, clientOrderID); cleaned != clientOrderID {
+			return cleaned
+		}
+	}
+	return clientOrderID
 }
 
 // placeInitialBuyOrders 设定初始槽位（并恢复持仓槽位）
@@ -1227,6 +1247,8 @@ func (spm *SuperPositionManager) rebalanceExitWindow(currentPrice float64, maxAc
 
 // OnOrderUpdate 订单更新回调（异步订单同步流）
 func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) bool {
+	update.ClientOrderID = spm.normalizeClientOrderID(update.ClientOrderID)
+
 	// 🔥 重构：完全依赖 ClientOrderID 解析
 	price, side, bookSide, valid := spm.parseClientOrderID(update.ClientOrderID)
 
@@ -2190,11 +2212,6 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		}
 	}
 
-	if positionsRaw != nil {
-		positions := spm.extractExchangePositions(positionsRaw)
-		spm.reconcilePositionSnapshot(positions)
-	}
-
 	staleActive := 0
 	var staleOrders []staleOrderRef
 	spm.slots.Range(func(key, value interface{}) bool {
@@ -2217,6 +2234,11 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 	if staleActive > 0 {
 		logger.Warn("⚠️ [对账] 发现 %d 个本地活跃订单不在交易所挂单列表中", staleActive)
 		spm.refreshStaleOrders(staleOrders)
+	}
+
+	if positionsRaw != nil {
+		positions := spm.extractExchangePositions(positionsRaw)
+		spm.reconcilePositionSnapshot(positions)
 	}
 }
 
@@ -3191,6 +3213,7 @@ func (spm *SuperPositionManager) extractExchangeOrders(raw interface{}) []exchan
 			AvgPrice:      reflectFloatField(value, "AvgPrice", "FillPrice"),
 			UpdateTime:    reflectInt64Field(value, "UpdateTime", "UpdatedTime"),
 		}
+		order.ClientOrderID = spm.normalizeClientOrderID(order.ClientOrderID)
 		if order.ClientOrderID == "" && order.OrderID == 0 {
 			continue
 		}

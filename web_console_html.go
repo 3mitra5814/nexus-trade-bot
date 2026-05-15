@@ -142,7 +142,7 @@ body.light .log-view{background:#0f172a;color:#e5edf8;border-color:#d7e0ec}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes pulse{50%{opacity:.35}}
 @keyframes numPulse{0%{filter:brightness(1.5);opacity:.55;transform:translateY(-1px)}100%{filter:brightness(1);opacity:1;transform:translateY(0)}}
-@keyframes appEnter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes appEnter{from{opacity:0}to{opacity:1}}
 @keyframes panelIn{from{opacity:0;transform:translateY(10px) scale(.992)}to{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes cardIn{from{opacity:0;transform:translateY(10px) scale(.99)}to{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes menuIn{from{opacity:0;transform:translateY(-6px) scale(.965)}to{opacity:1;transform:translateY(0) scale(1)}}
@@ -217,6 +217,15 @@ body.light .symbol-option{color:#101828}
 	@media (max-width:900px){.login-shell{grid-template-columns:1fr}.login-brand{padding:24px}.exchange-strip{grid-template-columns:repeat(6,44px)}}
 	@media (max-width:760px){.app{padding:12px}.top{align-items:stretch;gap:12px}.brand{width:100%}.brand-logo{width:44px;height:44px}.brand-name{font-size:18px}.brand-tagline{font-size:12px;white-space:normal}.top-actions,.auth-actions{width:100%;justify-content:flex-end}.auth-actions .btn,.auth-actions .btnp{flex:0 1 auto;min-width:0;padding:10px 8px}.metrics,.form,.robot-stats,.grid{grid-template-columns:1fr}.grid{gap:12px}.card.balance-card{grid-column:auto}.panel,.card,.modal-card,.login-shell,.glass{border-radius:14px}.panel{padding:14px}.robot{padding:14px}.item{align-items:flex-start;flex-direction:column}.modal{align-items:flex-end;padding:0}.modal-card{width:100%;max-height:94vh;border-radius:18px 18px 0 0;padding:16px}.head{gap:10px}.field input,.field select{min-height:46px}.login-wrap{padding:0;align-items:stretch}.login-shell{min-height:100vh;border:0;border-radius:0}.login-card{padding:24px 18px}.login-brand{padding:22px 18px}.login-brand h2{font-size:28px}.exchange-strip{grid-template-columns:repeat(6,44px)}.metrics{gap:10px}.v{font-size:22px}.rname{font-size:18px}}
 @media (max-width:420px){.brand-logo{width:38px;height:38px}.brand-name{font-size:16px}.brand-tagline{font-size:11px}.settings-btn{width:46px;height:46px;font-size:23px}.exchange-strip{grid-template-columns:repeat(3,44px)}.auth-actions{display:flex;justify-content:flex-end;flex-wrap:wrap}.auth-actions .btn,.auth-actions .btnp{font-size:13px}.lang-menu{right:0;min-width:160px}.robot-top{flex-direction:column}.status{align-self:flex-start}.promo{font-size:13px}.login-brand .panel{margin-bottom:0}}
+body.auth-active{min-height:100dvh;overflow-x:hidden}
+body.auth-active .app{max-width:none;min-height:100dvh;margin:0;padding:0;display:flex;align-items:center;justify-content:center}
+body.auth-active #loginScreen{width:100%}
+.login-wrap{width:100%;min-height:100dvh;overflow:auto;padding:clamp(18px,4vw,40px)}
+.login-card{display:flex;flex-direction:column;justify-content:center}
+.modal{z-index:100;overflow:auto}
+#passwordScreen,#changePasswordModal{align-items:center;justify-content:center}
+#passwordScreen .modal-card,#changePasswordModal .modal-card{width:min(520px,calc(100vw - 32px));margin:auto}
+@media (max-width:760px){body.auth-active .app{max-width:none;padding:0}.modal{align-items:center;padding:16px}.modal-card{width:min(100%,calc(100vw - 32px));max-height:calc(100dvh - 32px);border-radius:18px;padding:16px}.login-wrap{padding:16px;align-items:center}.login-shell{width:min(100%,560px);min-height:0;border-radius:18px;border:1px solid rgba(110,231,255,.10)}body.light .login-shell{border-color:#d7e0ec}.login-brand,.login-card{padding:22px 18px}.login-brand h2{font-size:28px}}
 @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}}
 </style>
 </head>
@@ -367,7 +376,7 @@ function applyTheme(theme){document.body.classList.toggle('light',theme==='light
 function initTheme(){applyTheme(localStorage.getItem('nexus_trade_bot_theme')||'dark')}
 function startAuto(){stopAuto();refreshTimer=setInterval(()=>{if(!byId('console').classList.contains('hidden'))loadDashboard(true)},5000)}
 function stopAuto(){if(refreshTimer){clearInterval(refreshTimer);refreshTimer=null}}
-async function init(){try{const s=await api('/api/status');const ready=s.authenticated&&!s.must_change_password;show('loginScreen',!s.authenticated);show('passwordScreen',s.authenticated&&s.must_change_password);show('console',ready);show('authBar',ready);show('topBar',ready);if(ready){await loadBaseConfig();await loadSymbols();await loadAccounts();await loadDashboard();startAuto()}else stopAuto()}catch(e){msg('loginMsg',e.message,'err');show('loginScreen',true);show('console',false);show('authBar',false);show('topBar',false);stopAuto()}}
+async function init(){try{const s=await api('/api/status');const ready=s.authenticated&&!s.must_change_password;document.body.classList.toggle('auth-active',!ready);show('loginScreen',!s.authenticated);show('passwordScreen',s.authenticated&&s.must_change_password);show('console',ready);show('authBar',ready);show('topBar',ready);if(ready){await loadBaseConfig();await loadSymbols();await loadAccounts();await loadDashboard();startAuto()}else stopAuto()}catch(e){document.body.classList.add('auth-active');msg('loginMsg',e.message,'err');show('loginScreen',true);show('console',false);show('authBar',false);show('topBar',false);stopAuto()}}
 async function loadBaseConfig(){const payload=await api('/api/base-config');baseConfig=payload.config||payload;consoleSettings.timezone=payload.timezone||consoleSettings.timezone;updateTimezoneLabel();const exchanges=Object.keys(baseConfig.exchanges||{}).sort((a,b)=>a==='bitget'?-1:b==='bitget'?1:exLabel(a).localeCompare(exLabel(b)));byId('accountExchange').innerHTML=exchanges.map(x=>'<option value="'+x+'">'+esc(exLabel(x))+'</option>').join('');if(exchanges.includes('bitget'))byId('accountExchange').value='bitget';syncAccountExchangeUI();updateSymbolOptions()}
 function updateTimezoneLabel(){if(byId('timezoneLabel'))byId('timezoneLabel').textContent=consoleSettings.timezone||'Asia/Hong_Kong'}
 async function saveTimezone(){const input=window.prompt(t('settings.timezonePrompt')||'Timezone',consoleSettings.timezone||'Asia/Hong_Kong');if(input===null)return;const value=String(input).trim();if(!value)return;try{consoleSettings=await api('/api/settings',{method:'PUT',body:JSON.stringify({timezone:value})});updateTimezoneLabel();await loadDashboard(true)}catch(e){alert(e.message)}}

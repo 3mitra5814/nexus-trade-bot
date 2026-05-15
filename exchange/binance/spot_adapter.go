@@ -369,7 +369,7 @@ func (b *BinanceSpotAdapter) StartOrderStream(ctx context.Context, callback func
 			UpdateTime    int64
 		}{
 			OrderID:       update.Id,
-			ClientOrderID: update.ClientOrderId,
+			ClientOrderID: utils.RemoveBrokerPrefix("binance", update.ClientOrderId),
 			Symbol:        update.Symbol,
 			Side:          update.Side,
 			Type:          update.Type,
