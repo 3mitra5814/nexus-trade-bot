@@ -26,3 +26,24 @@ func TestClientOrderIDDecodeKeepsLegacyBase32Compatibility(t *testing.T) {
 		t.Fatalf("legacy decode = %q, want %q", got, raw)
 	}
 }
+
+func TestPosSideForOKXOrder(t *testing.T) {
+	tests := []struct {
+		name       string
+		side       Side
+		reduceOnly bool
+		want       string
+	}{
+		{name: "open long", side: SideBuy, reduceOnly: false, want: "long"},
+		{name: "close long", side: SideSell, reduceOnly: true, want: "long"},
+		{name: "open short", side: SideSell, reduceOnly: false, want: "short"},
+		{name: "close short", side: SideBuy, reduceOnly: true, want: "short"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := posSideForOKXOrder(tt.side, tt.reduceOnly); got != tt.want {
+				t.Fatalf("posSideForOKXOrder() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

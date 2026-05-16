@@ -445,6 +445,18 @@ func bitgetInternalOrderSide(apiSide, tradeSide string) Side {
 	return SideBuy
 }
 
+func (b *BitgetAdapter) ValidatePositionMode(ctx context.Context, direction string) error {
+	account, err := b.GetAccount(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 Bitget 持仓模式失败: %w", err)
+	}
+	b.posMode = account.PosMode
+	if strings.EqualFold(strings.TrimSpace(direction), "neutral") && account.PosMode != "hedge_mode" {
+		return fmt.Errorf("Bitget 中性模式需要双向持仓 hedge_mode，当前为 %s，请切换双向持仓后再启动", account.PosMode)
+	}
+	return nil
+}
+
 // BatchPlaceOrders 批量下单
 func (b *BitgetAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderRequest) ([]*Order, bool) {
 	placedOrders := make([]*Order, 0, len(orders))

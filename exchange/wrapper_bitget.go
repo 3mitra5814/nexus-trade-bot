@@ -216,6 +216,10 @@ func (w *bitgetWrapper) GetPositions(ctx context.Context, symbol string) ([]*Pos
 	return positions, nil
 }
 
+func (w *bitgetWrapper) ValidatePositionMode(ctx context.Context, direction string) error {
+	return w.adapter.ValidatePositionMode(ctx, direction)
+}
+
 func (w *bitgetWrapper) GetBalance(ctx context.Context, asset string) (float64, error) {
 	return w.adapter.GetBalance(ctx, asset)
 }

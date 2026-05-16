@@ -76,3 +76,18 @@ func TestValidateClampsDefaultRecoveryThresholdToMonitorSymbolCount(t *testing.T
 		t.Fatalf("expected recovery threshold to be clamped to 1, got %d", cfg.RiskControl.RecoveryThreshold)
 	}
 }
+
+func TestValidateRaisesNeutralOrderCleanupThresholdToDualBookCapacity(t *testing.T) {
+	cfg := validConfig()
+	cfg.Trading.Direction = "neutral"
+	cfg.Trading.BuyWindowSize = 4
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 7
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if cfg.Trading.OrderCleanupThreshold != 14 {
+		t.Fatalf("expected neutral cleanup threshold to cover both books, got %d", cfg.Trading.OrderCleanupThreshold)
+	}
+}

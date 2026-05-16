@@ -544,7 +544,7 @@ func (r *RiskMonitor) isAdversePriceMove(currentPrice, avgPrice float64) bool {
 	case "short":
 		return currentPrice > avgPrice
 	case "neutral":
-		return math.Abs(currentPrice-avgPrice) > 0
+		return math.Abs(currentPrice-avgPrice) >= r.neutralDeviationThreshold(avgPrice)
 	default:
 		return currentPrice < avgPrice
 	}
@@ -555,10 +555,20 @@ func (r *RiskMonitor) priceRecovered(currentPrice, avgPrice float64) bool {
 	case "short":
 		return currentPrice < avgPrice
 	case "neutral":
-		return true
+		return math.Abs(currentPrice-avgPrice) < r.neutralDeviationThreshold(avgPrice)
 	default:
 		return currentPrice > avgPrice
 	}
+}
+
+func (r *RiskMonitor) neutralDeviationThreshold(avgPrice float64) float64 {
+	if r.cfg != nil && r.cfg.Trading.PriceInterval > 0 {
+		return r.cfg.Trading.PriceInterval
+	}
+	if avgPrice <= 0 || math.IsNaN(avgPrice) || math.IsInf(avgPrice, 0) {
+		return 0
+	}
+	return avgPrice * 0.003
 }
 
 func (r *RiskMonitor) adversePriceDescription(priceDeviation float64) string {

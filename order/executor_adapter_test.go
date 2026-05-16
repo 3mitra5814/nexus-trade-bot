@@ -184,6 +184,94 @@ func TestPlaceOrderKeepsRequestedClientOrderIDWhenExchangeReturnsBlank(t *testin
 	}
 }
 
+type invalidOrderIDPlaceExchange struct {
+	cancelFailExchange
+	placeCalls int
+	openOrders []*exchange.Order
+}
+
+func (e *invalidOrderIDPlaceExchange) GetName() string { return "Binance" }
+
+func (e *invalidOrderIDPlaceExchange) PlaceOrder(context.Context, *exchange.OrderRequest) (*exchange.Order, error) {
+	e.placeCalls++
+	return &exchange.Order{
+		OrderID:       0,
+		ClientOrderID: "x-zdfVM8vY9900_B_L_abc01",
+		Status:        exchange.OrderStatusNew,
+	}, nil
+}
+
+func (e *invalidOrderIDPlaceExchange) GetOpenOrders(context.Context, string) ([]*exchange.Order, error) {
+	return e.openOrders, nil
+}
+
+func TestPlaceOrderRecoversWhenResponseHasInvalidOrderID(t *testing.T) {
+	ex := &invalidOrderIDPlaceExchange{
+		openOrders: []*exchange.Order{{
+			OrderID:       77,
+			ClientOrderID: "x-zdfVM8vY9900_B_L_abc01",
+			Status:        exchange.OrderStatusNew,
+		}},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 1, 1)
+
+	order, err := executor.PlaceOrder(&OrderRequest{
+		Symbol:        "ETHUSDT",
+		Side:          "BUY",
+		Price:         99,
+		Quantity:      0.3,
+		PriceDecimals: 2,
+		ClientOrderID: "9900_B_L_abc01",
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder() error = %v", err)
+	}
+	if order.OrderID != 77 || order.ClientOrderID != "9900_B_L_abc01" {
+		t.Fatalf("expected recovered canonical order, got %#v", order)
+	}
+	if ex.placeCalls != 1 {
+		t.Fatalf("expected recovery without retry, got %d attempts", ex.placeCalls)
+	}
+}
+
+type wrongClientIDPlaceExchange struct {
+	cancelFailExchange
+	canceled []int64
+}
+
+func (e *wrongClientIDPlaceExchange) PlaceOrder(context.Context, *exchange.OrderRequest) (*exchange.Order, error) {
+	return &exchange.Order{
+		OrderID:       88,
+		ClientOrderID: "someone_else",
+		Status:        exchange.OrderStatusNew,
+	}, nil
+}
+
+func (e *wrongClientIDPlaceExchange) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
+	e.canceled = append(e.canceled, orderID)
+	return nil
+}
+
+func TestPlaceOrderCancelsUnexpectedClientOIDResponse(t *testing.T) {
+	ex := &wrongClientIDPlaceExchange{}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 1, 1)
+
+	_, err := executor.PlaceOrder(&OrderRequest{
+		Symbol:        "ETHUSDT",
+		Side:          "BUY",
+		Price:         99,
+		Quantity:      0.3,
+		PriceDecimals: 2,
+		ClientOrderID: "9900_B_L_abc01",
+	})
+	if err == nil {
+		t.Fatal("expected mismatched ClientOID response to fail")
+	}
+	if len(ex.canceled) != 1 || ex.canceled[0] != 88 {
+		t.Fatalf("expected unexpected remote order 88 to be canceled, got %v", ex.canceled)
+	}
+}
+
 func TestIsRateLimitErrorDetectsBitget429(t *testing.T) {
 	if !isRateLimitError(errors.New("bitget API 错误: code=429, msg=Too Many Requests")) {
 		t.Fatal("expected Bitget 429 to be treated as rate limit")

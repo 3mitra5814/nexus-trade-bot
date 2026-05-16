@@ -13,6 +13,10 @@ const (
 	MaxLeverage = 10 // 最大允许杠杆倍数（硬编码）
 )
 
+type positionModeChecker interface {
+	ValidatePositionMode(ctx context.Context, direction string) error
+}
+
 // CheckAccountSafety 检查账户安全性（支持所有交易所）
 // 参数：
 //   - ex: 交易所接口
@@ -42,20 +46,31 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 		return fmt.Errorf("获取账户信息失败: %w", err)
 	}
 
+	if checker, ok := ex.(positionModeChecker); ok {
+		if err := checker.ValidatePositionMode(ctx, direction); err != nil {
+			return err
+		}
+	}
+
 	// 2. 获取交易对的杠杆倍数和持仓信息
 	var leverage int = 1 // 默认1倍杠杆
 	var positionAmt float64 = 0
+	var existingPositionSlots float64
 
 	// 尝试获取持仓信息
 	positions, err := ex.GetPositions(ctx, symbol)
 	if err == nil && positions != nil {
 		for _, p := range positions {
 			if p.Symbol == symbol {
-				positionAmt = p.Size
-				if p.Leverage > 0 {
-					leverage = p.Leverage
+				positionAmt += p.Size
+				if currentPrice > 0 && orderAmount > 0 && p.Size != 0 {
+					existingPositionSlots += absFloat(p.Size) * currentPrice / orderAmount
 				}
-				break
+				if p.Leverage > 0 {
+					if p.Leverage > leverage {
+						leverage = p.Leverage
+					}
+				}
 			}
 		}
 	}
@@ -97,10 +112,6 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 	maxAvailableMargin := accountBalance * float64(leverage)
 	costPerPosition := orderAmount // 每仓成本就是配置的金额
 	maxPositions := maxAvailableMargin / costPerPosition
-	existingPositionSlots := 0.0
-	if currentPrice > 0 && orderAmount > 0 && positionAmt != 0 {
-		existingPositionSlots = absFloat(positionAmt) * currentPrice / orderAmount
-	}
 	requiredPositionBudget := float64(requiredPositions)
 	if direction == "neutral" {
 		requiredPositionBudget *= 2

@@ -55,6 +55,57 @@ func TestRiskMonitorLongDirectionTriggersOnDownMove(t *testing.T) {
 	}
 }
 
+func TestRiskMonitorNeutralIgnoresSmallDeviation(t *testing.T) {
+	cfg := riskMonitorTestConfig("neutral")
+	cfg.Trading.PriceInterval = 1
+	monitor := NewRiskMonitor(cfg, nil)
+	data := monitor.symbolDataMap["BTCUSDT"]
+	data.candles = appendRiskTestCandles(20, 100, 100)
+	data.candles = append(data.candles, &exchange.Candle{Symbol: "BTCUSDT", Close: 100.5, Volume: 1000, IsClosed: false})
+
+	triggered, reason := monitor.checkSymbol("BTCUSDT")
+	if triggered {
+		t.Fatalf("neutral risk monitor should ignore sub-threshold deviation, reason=%s", reason)
+	}
+}
+
+func TestRiskMonitorNeutralTriggersOnLargeDeviation(t *testing.T) {
+	cfg := riskMonitorTestConfig("neutral")
+	cfg.Trading.PriceInterval = 1
+	monitor := NewRiskMonitor(cfg, nil)
+	data := monitor.symbolDataMap["BTCUSDT"]
+	data.candles = appendRiskTestCandles(20, 100, 100)
+	data.candles = append(data.candles, &exchange.Candle{Symbol: "BTCUSDT", Close: 101.5, Volume: 1000, IsClosed: false})
+
+	triggered, reason := monitor.checkSymbol("BTCUSDT")
+	if !triggered {
+		t.Fatalf("neutral risk monitor should trigger on threshold-sized deviation")
+	}
+	if reason == "" {
+		t.Fatalf("expected trigger reason")
+	}
+}
+
+func TestRiskMonitorNeutralRecoveryRequiresPriceNearAverage(t *testing.T) {
+	cfg := riskMonitorTestConfig("neutral")
+	cfg.Trading.PriceInterval = 1
+	monitor := NewRiskMonitor(cfg, nil)
+	data := monitor.symbolDataMap["BTCUSDT"]
+	data.candles = appendRiskTestCandles(20, 100, 100)
+	data.candles = append(data.candles, &exchange.Candle{Symbol: "BTCUSDT", Close: 101.5, Volume: 100, IsClosed: true})
+
+	recovered, reason := monitor.checkSymbolRecovery("BTCUSDT")
+	if recovered {
+		t.Fatalf("neutral recovery must require price back near average, reason=%s", reason)
+	}
+
+	data.candles[len(data.candles)-1] = &exchange.Candle{Symbol: "BTCUSDT", Close: 100.5, Volume: 100, IsClosed: true}
+	recovered, reason = monitor.checkSymbolRecovery("BTCUSDT")
+	if !recovered {
+		t.Fatalf("expected neutral monitor to recover near average, reason=%s", reason)
+	}
+}
+
 func TestRiskMonitorRefreshesStaleKlinesFromBackupAndRecovers(t *testing.T) {
 	cfg := riskMonitorTestConfig("long")
 	now := time.Now()

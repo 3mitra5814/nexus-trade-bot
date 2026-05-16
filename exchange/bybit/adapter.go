@@ -25,6 +25,8 @@ type BybitAdapter struct {
 	baseAsset        string
 	quoteAsset       string
 	accountLeverage  int
+	positionModeMu   sync.RWMutex
+	hedgeMode        bool
 }
 
 type orderIDMapper struct {
@@ -178,7 +180,7 @@ func (b *BybitAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Orde
 		"side":        sideToBybit(req.Side),
 		"orderType":   orderTypeToBybit(req.Type),
 		"qty":         formatWithDecimals(req.Quantity, b.quantityDecimals),
-		"positionIdx": 0,
+		"positionIdx": b.positionIdxForOrder(req.Side, req.ReduceOnly),
 	}
 	if req.Type == OrderTypeLimit {
 		body["price"] = formatWithDecimals(req.Price, priceDecimals)
@@ -448,6 +450,68 @@ func (b *BybitAdapter) GetPositions(ctx context.Context, symbol string) ([]*Posi
 	}
 
 	return positions, nil
+}
+
+func (b *BybitAdapter) ValidatePositionMode(ctx context.Context, direction string) error {
+	hedgeMode, err := b.fetchHedgeMode(ctx)
+	if err != nil {
+		return err
+	}
+	b.setHedgeMode(hedgeMode)
+	if strings.EqualFold(strings.TrimSpace(direction), "neutral") && !hedgeMode {
+		return fmt.Errorf("Bybit 中性模式需要账户开启双向持仓，当前为单向持仓，已拒绝启动")
+	}
+	return nil
+}
+
+func (b *BybitAdapter) fetchHedgeMode(ctx context.Context) (bool, error) {
+	resp, err := b.client.DoSignedRequest(ctx, "GET", "/v5/position/list", map[string]string{
+		"category": "linear",
+		"symbol":   b.symbol,
+	}, nil)
+	if err != nil {
+		return false, fmt.Errorf("获取 Bybit 持仓模式失败: %w", err)
+	}
+	var result struct {
+		List []struct {
+			PositionIdx int `json:"positionIdx"`
+		} `json:"list"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return false, fmt.Errorf("解析 Bybit 持仓模式失败: %w", err)
+	}
+	for _, item := range result.List {
+		if item.PositionIdx == 1 || item.PositionIdx == 2 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (b *BybitAdapter) setHedgeMode(enabled bool) {
+	b.positionModeMu.Lock()
+	b.hedgeMode = enabled
+	b.positionModeMu.Unlock()
+}
+
+func (b *BybitAdapter) isHedgeMode() bool {
+	b.positionModeMu.RLock()
+	defer b.positionModeMu.RUnlock()
+	return b.hedgeMode
+}
+
+func (b *BybitAdapter) positionIdxForOrder(side Side, reduceOnly bool) int {
+	return positionIdxForBybitOrder(b.isHedgeMode(), side, reduceOnly)
+}
+
+func positionIdxForBybitOrder(hedgeMode bool, side Side, reduceOnly bool) int {
+	if !hedgeMode {
+		return 0
+	}
+	if (side == SideBuy && !reduceOnly) || (side == SideSell && reduceOnly) {
+		return 1
+	}
+	return 2
 }
 
 func (b *BybitAdapter) GetBalance(ctx context.Context, asset string) (float64, error) {

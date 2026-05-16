@@ -200,6 +200,10 @@ func (w *bybitWrapper) GetPositions(ctx context.Context, symbol string) ([]*Posi
 	return result, nil
 }
 
+func (w *bybitWrapper) ValidatePositionMode(ctx context.Context, direction string) error {
+	return w.adapter.ValidatePositionMode(ctx, direction)
+}
+
 func (w *bybitWrapper) GetBalance(ctx context.Context, asset string) (float64, error) {
 	return w.adapter.GetBalance(ctx, asset)
 }

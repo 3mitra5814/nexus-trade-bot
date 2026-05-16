@@ -110,6 +110,18 @@ func (g *GateAdapter) GetName() string {
 	return "Gate.io"
 }
 
+func (g *GateAdapter) ValidatePositionMode(ctx context.Context, direction string) error {
+	account, err := g.GetAccount(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 Gate 持仓模式失败: %w", err)
+	}
+	g.posMode = account.PosMode
+	if strings.EqualFold(strings.TrimSpace(direction), "neutral") && account.PosMode != "dual_long_short" {
+		return fmt.Errorf("Gate 中性模式需要双向持仓 dual_long_short，当前为 %s，请切换双向持仓后再启动", account.PosMode)
+	}
+	return nil
+}
+
 // GetPriceDecimals 获取价格精度
 func (g *GateAdapter) GetPriceDecimals() int {
 	return g.pricePlace

@@ -119,6 +119,10 @@ func (w *okxWrapper) GetPositions(ctx context.Context, symbol string) ([]*Positi
 	return positions, nil
 }
 
+func (w *okxWrapper) ValidatePositionMode(ctx context.Context, direction string) error {
+	return w.adapter.ValidatePositionMode(ctx, direction)
+}
+
 func (w *okxWrapper) GetBalance(ctx context.Context, asset string) (float64, error) {
 	return w.adapter.GetBalance(ctx, asset)
 }

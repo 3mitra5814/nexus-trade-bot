@@ -30,6 +30,10 @@ type binanceAdapter interface {
 	GetQuoteAsset() string
 }
 
+type binancePositionModeValidator interface {
+	ValidatePositionMode(context.Context, string) error
+}
+
 // binanceWrapper 包装 Binance 适配器以实现 IExchange 接口
 type binanceWrapper struct {
 	adapter binanceAdapter
@@ -243,6 +247,14 @@ func (w *binanceWrapper) GetPositions(ctx context.Context, symbol string) ([]*Po
 	}
 
 	return positions, nil
+}
+
+func (w *binanceWrapper) ValidatePositionMode(ctx context.Context, direction string) error {
+	validator, ok := w.adapter.(binancePositionModeValidator)
+	if !ok {
+		return nil
+	}
+	return validator.ValidatePositionMode(ctx, direction)
 }
 
 func (w *binanceWrapper) GetBalance(ctx context.Context, asset string) (float64, error) {

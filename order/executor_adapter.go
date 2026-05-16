@@ -6,6 +6,7 @@ import (
 	"nexus-trade-bot/exchange"
 	"nexus-trade-bot/exchange/ratelimit"
 	"nexus-trade-bot/logger"
+	"nexus-trade-bot/utils"
 	"os"
 	"runtime"
 	"strconv"
@@ -124,20 +125,22 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			err = fmt.Errorf("交易所返回空订单")
 		}
 		if err == nil {
-			clientOrderID := strings.TrimSpace(exchangeOrder.ClientOrderID)
-			if clientOrderID == "" {
-				clientOrderID = req.ClientOrderID
-			}
-			// 转换回 Order 格式
-			order := &Order{
-				OrderID:       exchangeOrder.OrderID,
-				ClientOrderID: clientOrderID,
-				Symbol:        req.Symbol,
-				Side:          req.Side,
-				Price:         req.Price,
-				Quantity:      req.Quantity,
-				Status:        string(exchangeOrder.Status),
-				CreatedAt:     time.Now(),
+			order, validationErr := oe.convertPlacedOrder(req, exchangeOrder)
+			if validationErr != nil {
+				lastErr = validationErr
+				if shouldCancelUnexpectedPlacedOrder(oe.exchange.GetName(), req, exchangeOrder) {
+					oe.cancelUnexpectedPlacedOrder(exchangeOrder.OrderID, validationErr)
+					return nil, validationErr
+				}
+				if recovered, ok := oe.recoverOpenOrder(req, validationErr); ok {
+					return recovered, nil
+				}
+				logger.Warn("⚠️ [%s] 下单响应校验失败: %v", oe.exchange.GetName(), validationErr)
+				if i < maxRetries {
+					time.Sleep(oe.orderRetryDelay)
+					continue
+				}
+				return nil, validationErr
 			}
 
 			// 根据实际使用的订单类型显示日志
@@ -167,7 +170,7 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 		}
 		if strings.Contains(errStr, "-4061") {
 			// 持仓模式不匹配：双向持仓 vs 单向持仓
-			logger.Error("❌ 下单失败，请在交易所将双向持仓改为单向持仓。错误码: -4061")
+			logger.Error("❌ 下单失败，账户持仓模式与策略方向不匹配。请检查单向/双向持仓设置。错误码: -4061")
 			return nil, fmt.Errorf("持仓模式不匹配: %w", err)
 		} else if isRateLimitError(err) {
 			// 速率限制，等待后重试
@@ -183,10 +186,7 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 				continue
 			}
 			return nil, fmt.Errorf("PostOnly连续被拒，已停止该订单以避免吃单: %w", err)
-		} else if strings.Contains(errStr, "-4061") {
-			// 持仓模式不匹配（已在前面处理，这里保留以防万一）
-			return nil, err
-		} else if strings.Contains(errStr, "-2019") || strings.Contains(errStr, "保证金不足") || strings.Contains(errStr, "insufficient") {
+		} else if isInsufficientMarginError(err) {
 			// 保证金不足，不重试
 			return nil, err
 		} else if strings.Contains(errStr, "-1021") {
@@ -203,6 +203,53 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	return nil, fmt.Errorf("下单失败（重试%d次）: %w", maxRetries, lastErr)
 }
 
+func (oe *ExchangeOrderExecutor) convertPlacedOrder(req *OrderRequest, exchangeOrder *exchange.Order) (*Order, error) {
+	clientOrderID := canonicalClientOrderID(oe.exchange.GetName(), exchangeOrder.ClientOrderID, req.ClientOrderID)
+	if strings.TrimSpace(req.ClientOrderID) != "" &&
+		strings.TrimSpace(exchangeOrder.ClientOrderID) != "" &&
+		!clientOrderIDMatches(oe.exchange.GetName(), exchangeOrder.ClientOrderID, req.ClientOrderID) {
+		return nil, fmt.Errorf("交易所返回的 ClientOID 不匹配: want=%s got=%s", req.ClientOrderID, exchangeOrder.ClientOrderID)
+	}
+	if exchangeOrder.OrderID <= 0 {
+		return nil, fmt.Errorf("交易所返回无效 OrderID: %d (clientOID=%s)", exchangeOrder.OrderID, clientOrderID)
+	}
+	return &Order{
+		OrderID:       exchangeOrder.OrderID,
+		ClientOrderID: clientOrderID,
+		Symbol:        req.Symbol,
+		Side:          req.Side,
+		Price:         req.Price,
+		Quantity:      req.Quantity,
+		Status:        string(exchangeOrder.Status),
+		CreatedAt:     time.Now(),
+	}, nil
+}
+
+func shouldCancelUnexpectedPlacedOrder(exchangeName string, req *OrderRequest, exchangeOrder *exchange.Order) bool {
+	if exchangeOrder == nil || exchangeOrder.OrderID <= 0 || strings.TrimSpace(exchangeOrder.ClientOrderID) == "" {
+		return false
+	}
+	return !clientOrderIDMatches(exchangeName, exchangeOrder.ClientOrderID, req.ClientOrderID)
+}
+
+func (oe *ExchangeOrderExecutor) cancelUnexpectedPlacedOrder(orderID int64, cause error) {
+	ctx, cancel := apiContext()
+	err := oe.exchange.CancelOrder(ctx, oe.symbol, orderID)
+	cancel()
+	if err != nil {
+		if isCancelOrderGoneError(err) {
+			logger.Warn("🧹 [%s] 下单响应异常的订单已不在交易所挂单中: orderID=%d, 原因: %v",
+				oe.exchange.GetName(), orderID, cause)
+			return
+		}
+		logger.Error("❌ [%s] 下单响应异常，撤销未跟踪订单失败: orderID=%d, err=%v, 原因: %v",
+			oe.exchange.GetName(), orderID, err, cause)
+		return
+	}
+	logger.Warn("🧹 [%s] 下单响应异常，已撤销未跟踪订单: orderID=%d, 原因: %v",
+		oe.exchange.GetName(), orderID, cause)
+}
+
 func isRateLimitError(err error) bool {
 	if err == nil {
 		return false
@@ -212,6 +259,18 @@ func isRateLimitError(err error) bool {
 		strings.Contains(errStr, "429") ||
 		strings.Contains(errStr, "rate limit") ||
 		strings.Contains(errStr, "too many requests")
+}
+
+func isInsufficientMarginError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "-2019") ||
+		strings.Contains(errStr, "保证金不足") ||
+		strings.Contains(errStr, "insufficient") ||
+		strings.Contains(errStr, "not enough margin") ||
+		strings.Contains(errStr, "not enough balance")
 }
 
 func isDuplicateClientOrderError(err error) bool {
@@ -263,14 +322,15 @@ func (oe *ExchangeOrderExecutor) recoverOpenOrder(req *OrderRequest, cause error
 		return nil, false
 	}
 	for _, exchangeOrder := range openOrders {
-		if exchangeOrder == nil || exchangeOrder.ClientOrderID != req.ClientOrderID {
+		if exchangeOrder == nil || exchangeOrder.OrderID <= 0 ||
+			!clientOrderIDMatches(oe.exchange.GetName(), exchangeOrder.ClientOrderID, req.ClientOrderID) {
 			continue
 		}
 		logger.Warn("🧩 [%s] 下单返回异常但已通过 ClientOID 找回挂单: clientOID=%s, orderID=%d, 原因: %v",
 			oe.exchange.GetName(), req.ClientOrderID, exchangeOrder.OrderID, cause)
 		return &Order{
 			OrderID:       exchangeOrder.OrderID,
-			ClientOrderID: firstNonEmpty(exchangeOrder.ClientOrderID, req.ClientOrderID),
+			ClientOrderID: canonicalClientOrderID(oe.exchange.GetName(), exchangeOrder.ClientOrderID, req.ClientOrderID),
 			Symbol:        req.Symbol,
 			Side:          req.Side,
 			Price:         req.Price,
@@ -282,13 +342,55 @@ func (oe *ExchangeOrderExecutor) recoverOpenOrder(req *OrderRequest, cause error
 	return nil, false
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
+func clientOrderIDMatches(exchangeName, actual, expected string) bool {
+	actual = strings.TrimSpace(actual)
+	expected = strings.TrimSpace(expected)
+	if actual == "" || expected == "" {
+		return false
+	}
+	if actual == expected {
+		return true
+	}
+	return normalizeExchangeClientOrderID(exchangeName, actual) == normalizeExchangeClientOrderID(exchangeName, expected)
+}
+
+func canonicalClientOrderID(exchangeName, actual, requested string) string {
+	actual = strings.TrimSpace(actual)
+	requested = strings.TrimSpace(requested)
+	if requested != "" && (actual == "" || clientOrderIDMatches(exchangeName, actual, requested)) {
+		return requested
+	}
+	return normalizeExchangeClientOrderID(exchangeName, actual)
+}
+
+func normalizeExchangeClientOrderID(exchangeName, clientOrderID string) string {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return ""
+	}
+	exchangeNames := []string{strings.ToLower(strings.TrimSpace(exchangeName)), "binance", "gate"}
+	for _, name := range exchangeNames {
+		if name == "" {
+			continue
+		}
+		cleaned := utils.RemoveBrokerPrefix(name, clientOrderID)
+		if cleaned != clientOrderID {
+			return cleaned
 		}
 	}
-	return ""
+	return clientOrderID
+}
+
+func isCancelOrderGoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "-2011") ||
+		strings.Contains(errStr, "unknown order") ||
+		strings.Contains(errStr, "does not exist") ||
+		strings.Contains(errStr, "not exist") ||
+		strings.Contains(errStr, "not found")
 }
 
 // BatchPlaceOrders 批量下单
@@ -319,8 +421,7 @@ func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Or
 					oe.exchange.GetName(), req.Price, req.Side, err)
 
 				// 检查是否是保证金不足错误
-				errStr := err.Error()
-				if strings.Contains(errStr, "保证金不足") || strings.Contains(errStr, "-2019") || strings.Contains(errStr, "insufficient") {
+				if isInsufficientMarginError(err) {
 					mu.Lock()
 					hasMarginError = true
 					mu.Unlock()
@@ -328,7 +429,9 @@ func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Or
 				}
 				return
 			}
+			mu.Lock()
 			placedByIndex[index] = order
+			mu.Unlock()
 		}(i, orderReq)
 	}
 	wg.Wait()
@@ -405,8 +508,7 @@ func (oe *ExchangeOrderExecutor) CancelOrder(orderID int64) error {
 	cancel()
 	if err != nil {
 		// 如果是"Unknown order"错误，说明订单已经不存在（可能已成交或已取消），不算错误
-		errStr := err.Error()
-		if strings.Contains(errStr, "-2011") || strings.Contains(errStr, "Unknown order") || strings.Contains(errStr, "does not exist") {
+		if isCancelOrderGoneError(err) {
 			logger.Info("ℹ️ [%s] 订单 %d 已不存在（可能已成交或已取消），跳过取消", oe.exchange.GetName(), orderID)
 			return nil
 		}

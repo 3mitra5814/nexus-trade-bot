@@ -235,6 +235,10 @@ func (w *gateWrapper) GetPositions(ctx context.Context, symbol string) ([]*Posit
 	return positions, nil
 }
 
+func (w *gateWrapper) ValidatePositionMode(ctx context.Context, direction string) error {
+	return w.adapter.ValidatePositionMode(ctx, direction)
+}
+
 func (w *gateWrapper) GetBalance(ctx context.Context, asset string) (float64, error) {
 	return w.adapter.GetBalance(ctx, asset)
 }

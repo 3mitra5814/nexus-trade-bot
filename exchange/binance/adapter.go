@@ -115,6 +115,7 @@ type BinanceAdapter struct {
 	quantityDecimals int    // 数量精度（小数位数）
 	baseAsset        string // 基础资产（交易币种），如 BTC
 	quoteAsset       string // 计价资产（结算币种），如 USDT、USD
+	dualSidePosition bool
 }
 
 // NewBinanceAdapter 创建币安适配器
@@ -202,6 +203,9 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Or
 		TimeInForce(timeInForce).
 		Quantity(quantityStr).
 		Price(priceStr)
+	if b.dualSidePosition {
+		orderService = orderService.PositionSide(binancePositionSide(req.Side, req.ReduceOnly))
+	}
 
 	// 设置自定义订单ID（添加返佣标识）
 	clientOrderID := req.ClientOrderID
@@ -213,7 +217,7 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Or
 
 	// 币安单向持仓模式：如果是平仓单，需要设置 ReduceOnly
 	// 注意：币安的 ReduceOnly 仅在单向持仓模式下有效
-	if req.ReduceOnly {
+	if req.ReduceOnly && !b.dualSidePosition {
 		orderService = orderService.ReduceOnly(true)
 	}
 
@@ -400,6 +404,25 @@ func (b *BinanceAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*O
 	}
 
 	return result, nil
+}
+
+func (b *BinanceAdapter) ValidatePositionMode(ctx context.Context, direction string) error {
+	mode, err := b.client.NewGetPositionModeService().Do(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 Binance 持仓模式失败: %w", err)
+	}
+	b.dualSidePosition = mode.DualSidePosition
+	if strings.EqualFold(strings.TrimSpace(direction), "neutral") && !mode.DualSidePosition {
+		return fmt.Errorf("Binance 中性模式需要双向持仓模式，请先开启 Hedge Mode 后再启动")
+	}
+	return nil
+}
+
+func binancePositionSide(side Side, reduceOnly bool) futures.PositionSideType {
+	if (side == SideBuy && !reduceOnly) || (side == SideSell && reduceOnly) {
+		return futures.PositionSideTypeLong
+	}
+	return futures.PositionSideTypeShort
 }
 
 // GetAccount 获取账户信息（合约账户）

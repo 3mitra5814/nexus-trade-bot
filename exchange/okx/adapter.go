@@ -139,6 +139,8 @@ type OKXAdapter struct {
 	contractValue    float64
 	lotSize          float64
 	accountLeverage  int
+	mu               sync.RWMutex
+	posMode          string
 }
 
 type orderIDMapper struct {
@@ -301,6 +303,9 @@ func (o *OKXAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Order,
 	}
 	if req.ClientOrderID != "" {
 		body["clOrdId"] = encodeClientOrderID(req.ClientOrderID)
+	}
+	if o.isLongShortMode() {
+		body["posSide"] = posSideForOKXOrder(req.Side, req.ReduceOnly)
 	}
 
 	resp, err := o.client.DoSignedRequest(ctx, http.MethodPost, "/api/v5/trade/order", nil, body)
@@ -563,6 +568,47 @@ func (o *OKXAdapter) GetPositions(ctx context.Context, symbol string) ([]*Positi
 		})
 	}
 	return positions, nil
+}
+
+func (o *OKXAdapter) ValidatePositionMode(ctx context.Context, direction string) error {
+	posMode, err := o.fetchPositionMode(ctx)
+	if err != nil {
+		return err
+	}
+	o.setPositionMode(posMode)
+	if strings.EqualFold(strings.TrimSpace(direction), "neutral") && posMode != "long_short_mode" {
+		return fmt.Errorf("OKX 中性模式需要账户持仓模式为 long_short_mode，当前为 %s，请切换双向持仓后再启动", posMode)
+	}
+	return nil
+}
+
+func (o *OKXAdapter) fetchPositionMode(ctx context.Context) (string, error) {
+	resp, err := o.client.DoSignedRequest(ctx, http.MethodGet, "/api/v5/account/config", nil, nil)
+	if err != nil {
+		return "", fmt.Errorf("获取 OKX 账户持仓模式失败: %w", err)
+	}
+	var result []struct {
+		PosMode string `json:"posMode"`
+	}
+	if err := json.Unmarshal(resp.Data, &result); err != nil {
+		return "", fmt.Errorf("解析 OKX 账户持仓模式失败: %w", err)
+	}
+	if len(result) == 0 || strings.TrimSpace(result[0].PosMode) == "" {
+		return "", fmt.Errorf("OKX 账户持仓模式为空")
+	}
+	return strings.TrimSpace(result[0].PosMode), nil
+}
+
+func (o *OKXAdapter) setPositionMode(posMode string) {
+	o.mu.Lock()
+	o.posMode = strings.TrimSpace(posMode)
+	o.mu.Unlock()
+}
+
+func (o *OKXAdapter) isLongShortMode() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.posMode == "long_short_mode"
 }
 
 func (o *OKXAdapter) GetBalance(ctx context.Context, asset string) (float64, error) {
@@ -846,6 +892,13 @@ func sideToOKX(side Side) string {
 		return "sell"
 	}
 	return "buy"
+}
+
+func posSideForOKXOrder(side Side, reduceOnly bool) string {
+	if (side == SideBuy && !reduceOnly) || (side == SideSell && reduceOnly) {
+		return "long"
+	}
+	return "short"
 }
 
 func mapSideFromOKX(side string) Side {

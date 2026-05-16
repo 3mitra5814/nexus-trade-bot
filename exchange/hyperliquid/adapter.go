@@ -277,6 +277,13 @@ func (h *HyperliquidAdapter) GetName() string {
 	return "Hyperliquid"
 }
 
+func (h *HyperliquidAdapter) ValidatePositionMode(ctx context.Context, direction string) error {
+	if h.marketType != "spot" && strings.EqualFold(strings.TrimSpace(direction), "neutral") {
+		return fmt.Errorf("Hyperliquid 适配器当前为净仓位模型，不支持中性双向持仓，已拒绝启动")
+	}
+	return nil
+}
+
 func (h *HyperliquidAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error) {
 	orderType := hl.OrderType{Limit: &hl.LimitOrderType{Tif: tifToHyperliquid(req.TimeInForce, req.PostOnly)}}
 	clientOrderID := h.encodeCloid(req.ClientOrderID)

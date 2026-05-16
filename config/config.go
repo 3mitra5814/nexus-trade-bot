@@ -83,6 +83,29 @@ type ExchangeConfig struct {
 	FeeRate    float64 `yaml:"fee_rate" json:"fee_rate"`     // 手续费率（例如 0.0002 表示 0.02%）
 }
 
+// TargetOrderCapacity 返回当前方向下策略满配时应允许存在的订单数量。
+func TargetOrderCapacity(c *Config) int {
+	if c == nil {
+		return 0
+	}
+	buyWindowSize := c.Trading.BuyWindowSize
+	if buyWindowSize < 0 {
+		buyWindowSize = 0
+	}
+	sellWindowSize := c.Trading.SellWindowSize
+	if sellWindowSize <= 0 {
+		sellWindowSize = buyWindowSize
+	}
+	baseCapacity := buyWindowSize + sellWindowSize
+	if strings.EqualFold(strings.TrimSpace(c.App.MarketType), "spot") {
+		return baseCapacity
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Trading.Direction), "neutral") {
+		return baseCapacity * 2
+	}
+	return baseCapacity
+}
+
 // LoadConfig 加载配置文件
 func LoadConfig(configPath string) (*Config, error) {
 	data, err := os.ReadFile(configPath)
@@ -201,6 +224,10 @@ func (c *Config) Validate() error {
 	}
 	if c.Trading.CleanupBatchSize <= 0 {
 		c.Trading.CleanupBatchSize = 10 // 默认10
+	}
+	targetOrderCapacity := TargetOrderCapacity(c)
+	if c.Trading.OrderCleanupThreshold <= 0 || c.Trading.OrderCleanupThreshold < targetOrderCapacity {
+		c.Trading.OrderCleanupThreshold = targetOrderCapacity
 	}
 	// 注意：price_decimals 和 quantity_decimals 已从配置中移除，现在从交易所自动获取
 	if c.Trading.MinOrderValue <= 0 {
