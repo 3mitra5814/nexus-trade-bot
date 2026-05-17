@@ -27,6 +27,67 @@ import (
 // Version 版本号
 var Version = "v3.4.4"
 
+type adjustRequest struct {
+	reason               string
+	allowWindowRebalance bool
+}
+
+type adjustRequestScheduler struct {
+	signals chan struct{}
+	mu      sync.Mutex
+	pending adjustRequest
+	hasWork bool
+}
+
+func newAdjustRequestScheduler() *adjustRequestScheduler {
+	return &adjustRequestScheduler{signals: make(chan struct{}, 1)}
+}
+
+func (s *adjustRequestScheduler) Schedule(reason string, allowWindowRebalance bool) {
+	s.mu.Lock()
+	if s.hasWork {
+		s.pending.reason = mergeAdjustReason(s.pending.reason, reason)
+		s.pending.allowWindowRebalance = s.pending.allowWindowRebalance || allowWindowRebalance
+	} else {
+		s.pending = adjustRequest{reason: reason, allowWindowRebalance: allowWindowRebalance}
+		s.hasWork = true
+	}
+	s.mu.Unlock()
+
+	select {
+	case s.signals <- struct{}{}:
+	default:
+	}
+}
+
+func (s *adjustRequestScheduler) Signals() <-chan struct{} {
+	return s.signals
+}
+
+func (s *adjustRequestScheduler) Pop() (adjustRequest, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasWork {
+		return adjustRequest{}, false
+	}
+	req := s.pending
+	s.pending = adjustRequest{}
+	s.hasWork = false
+	return req, true
+}
+
+func mergeAdjustReason(current, next string) string {
+	current = strings.TrimSpace(current)
+	next = strings.TrimSpace(next)
+	if current == "" {
+		return next
+	}
+	if next == "" || strings.Contains(current, next) {
+		return current
+	}
+	return current + "+" + next
+}
+
 func main() {
 	logger.SetConsoleOutput(os.Stdout)
 	logger.SetLogDir(filepath.Join(appRootDir(), "logs"))
@@ -246,21 +307,14 @@ func runTrader(configPath string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	type adjustRequest struct {
-		reason               string
-		allowWindowRebalance bool
-	}
-	adjustRequests := make(chan adjustRequest, 1)
+	adjustScheduler := newAdjustRequestScheduler()
 	var acceptingAdjust atomic.Bool
 	acceptingAdjust.Store(true)
 	scheduleAdjust := func(reason string, allowWindowRebalance bool) {
 		if !acceptingAdjust.Load() {
 			return
 		}
-		select {
-		case adjustRequests <- adjustRequest{reason: reason, allowWindowRebalance: allowWindowRebalance}:
-		default:
-		}
+		adjustScheduler.Schedule(reason, allowWindowRebalance)
 	}
 	go func() {
 		defer recoverAndLog("订单调整调度")
@@ -268,7 +322,11 @@ func runTrader(configPath string) {
 			select {
 			case <-ctx.Done():
 				return
-			case req := <-adjustRequests:
+			case <-adjustScheduler.Signals():
+				req, ok := adjustScheduler.Pop()
+				if !ok {
+					continue
+				}
 				runProtected("订单调整", func() {
 					if !acceptingAdjust.Load() {
 						return

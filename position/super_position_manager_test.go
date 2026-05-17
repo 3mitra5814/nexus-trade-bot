@@ -860,6 +860,116 @@ func TestDirectionalInventoryGridPlacesExitOnlyAfterEntryFill(t *testing.T) {
 	}
 }
 
+func TestShortGridPlacesReduceOnlyBuyAfterShortEntryFill(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(86.79, "86.79"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.79); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	var shortEntry *OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "BUY" {
+			t.Fatalf("short mode must not place BUY exits before a short entry fills: %+v", order)
+		}
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price == 86.80 {
+			shortEntry = order
+		}
+	}
+	if shortEntry == nil {
+		t.Fatalf("expected initial short entry SELL at 86.80, orders=%v", executor.orders)
+	}
+
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1001, ClientOrderID: shortEntry.ClientOrderID, Status: "NEW", Side: "SELL", Price: 86.80})
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1001, ClientOrderID: shortEntry.ClientOrderID, Status: "FILLED", ExecutedQty: shortEntry.Quantity, AvgPrice: 86.80, Side: "SELL"})
+
+	if err := spm.AdjustOrders(86.79); err != nil {
+		t.Fatalf("post-fill AdjustOrders() error = %v", err)
+	}
+
+	var matchingExit *OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "BUY" && order.ReduceOnly && order.Price == 86.78 {
+			matchingExit = order
+		}
+	}
+	if matchingExit == nil {
+		t.Fatalf("expected filled short slot 86.80 to place reduce-only BUY at 86.78, orders=%v", executor.orders)
+	}
+	if matchingExit.Quantity != shortEntry.Quantity {
+		t.Fatalf("short exit qty must match the filled slot qty, got %.8f want %.8f", matchingExit.Quantity, shortEntry.Quantity)
+	}
+}
+
+func TestLongGridPlacesReduceOnlySellAfterLongEntryFill(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "ANYUSDC"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(86.79, "86.79"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.79); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	var longEntry *OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "SELL" {
+			t.Fatalf("long mode must not place SELL exits before a long entry fills: %+v", order)
+		}
+		if order.Side == "BUY" && !order.ReduceOnly && order.Price == 86.78 {
+			longEntry = order
+		}
+	}
+	if longEntry == nil {
+		t.Fatalf("expected initial long entry BUY at 86.78, orders=%v", executor.orders)
+	}
+
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1001, ClientOrderID: longEntry.ClientOrderID, Status: "NEW", Side: "BUY", Price: 86.78})
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 1001, ClientOrderID: longEntry.ClientOrderID, Status: "FILLED", ExecutedQty: longEntry.Quantity, AvgPrice: 86.78, Side: "BUY"})
+
+	if err := spm.AdjustOrders(86.79); err != nil {
+		t.Fatalf("post-fill AdjustOrders() error = %v", err)
+	}
+
+	var matchingExit *OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && order.ReduceOnly && order.Price == 86.80 {
+			matchingExit = order
+		}
+	}
+	if matchingExit == nil {
+		t.Fatalf("expected filled long slot 86.78 to place reduce-only SELL at maker-safe 86.80, orders=%v", executor.orders)
+	}
+	if matchingExit.Quantity != longEntry.Quantity {
+		t.Fatalf("long exit qty must match the filled slot qty, got %.8f want %.8f", matchingExit.Quantity, longEntry.Quantity)
+	}
+}
+
 func TestDirectionalFuturesPlacesOnlyDirectionalEntryOrders(t *testing.T) {
 	for _, direction := range []string{"long", "short"} {
 		t.Run(direction, func(t *testing.T) {
