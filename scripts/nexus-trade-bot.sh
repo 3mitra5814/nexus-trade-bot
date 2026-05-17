@@ -45,6 +45,7 @@ WEB_LOG="${LOG_DIR}/web-console.log"
 WEB_ERR_LOG="${LOG_DIR}/web-console-error.log"
 WEB_LEGACY_ERR_LOG="${LOG_DIR}/web-console.err.log"
 PID_FILE="${APP_DIR}/nexus-trade-bot.pid"
+OS_PACKAGES=(ca-certificates curl wget git tar gzip build-essential lsof procps)
 
 say() { printf "%s\n" "$*"; }
 info() { say "==> $*"; }
@@ -71,10 +72,22 @@ install_os_deps() {
   if ! command -v apt-get >/dev/null 2>&1; then
     return
   fi
-  info "Installing server dependencies"
+
+  local missing=() pkg
+  for pkg in "${OS_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      missing+=("$pkg")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    ok "Server dependencies already installed"
+    return
+  fi
+
+  info "Installing missing server dependencies: ${missing[*]}"
   sudo_cmd apt-get update -y
-  sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    ca-certificates curl wget git tar gzip build-essential lsof procps
+  sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
 }
 
 download() {
@@ -130,11 +143,19 @@ restore_managed_data() {
 }
 
 install_go() {
-  local installed=""
+  local installed="" go_bin=""
   if command -v go >/dev/null 2>&1; then
-    installed="$(go version | awk '{print $3}' | sed 's/^go//')"
+    go_bin="$(command -v go)"
+  elif [[ -x /usr/local/go/bin/go ]]; then
+    go_bin="/usr/local/go/bin/go"
   fi
+  if [[ -n "$go_bin" ]]; then
+    installed="$("$go_bin" version | awk '{print $3}' | sed 's/^go//')"
+  fi
+
   if [[ -n "$installed" ]] && version_ge "$installed" "$GO_VERSION"; then
+    export PATH="$(dirname "$go_bin"):${PATH}"
+    ok "Go already installed: go${installed}"
     return
   fi
 
