@@ -288,9 +288,10 @@ func (spm *SuperPositionManager) entrySlotDirection(bookSide string) string {
 }
 
 func (spm *SuperPositionManager) exitPrice(slotPrice float64, bookSide string) float64 {
-	price := slotPrice + spm.config.Trading.PriceInterval
+	exitGap := spm.config.Trading.PriceInterval * 2
+	price := slotPrice + exitGap
 	if bookSide == BookSideShort {
-		price = slotPrice - spm.config.Trading.PriceInterval
+		price = slotPrice - exitGap
 	}
 	return roundPrice(price, spm.priceDecimals)
 }
@@ -683,7 +684,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	for _, bookSide := range enabledBookSides {
 		desiredEntryPrices[bookSide] = make(map[float64]bool)
-		slotPrices := spm.calculateEntrySlotPrices(currentGridPrice, currentPrice, spm.entryWindowSize(bookSide), bookSide)
+		slotPrices := spm.calculateAvailableEntrySlotPrices(currentGridPrice, currentPrice, spm.entryWindowSize(bookSide), bookSide)
 		for _, price := range slotPrices {
 			desiredEntryPrices[bookSide][price] = true
 			desiredEntrySlots[bookSide] = append(desiredEntrySlots[bookSide], price)
@@ -705,7 +706,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 			return spm.adjustOrders(currentPrice, false)
 		}
 		if !spm.isAggressiveMode() {
-			if rebalanced, err := spm.rebalanceEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
+			if rebalanced, err := spm.syncEntryWindow(currentPrice, desiredEntryPrices, desiredEntrySlots); err != nil {
 				spm.mu.Unlock()
 				return err
 			} else if rebalanced {
@@ -1145,7 +1146,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 	return nil
 }
 
-func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desiredEntryPrices map[string]map[float64]bool, desiredEntrySlots map[string][]float64) (bool, error) {
+func (spm *SuperPositionManager) syncEntryWindow(currentPrice float64, desiredEntryPrices map[string]map[float64]bool, desiredEntrySlots map[string][]float64) (bool, error) {
 	staleByBook := make(map[string][]staleEntryCandidate, len(desiredEntryPrices))
 
 	spm.slots.Range(func(key, value interface{}) bool {
@@ -1204,13 +1205,13 @@ func (spm *SuperPositionManager) rebalanceEntryWindow(currentPrice float64, desi
 	for _, candidate := range candidates {
 		orderIDs = append(orderIDs, candidate.OrderID)
 	}
-	logger.Info("🧭 [网格自检] 发现开仓挂单偏离最新价格窗口，撤销 %d 个远端开仓单后补回现价周边", len(orderIDs))
+	logger.Info("🧭 [开仓窗口同步] 撤销 %d 个不属于当前目标窗口的开仓单，随后由主挂单流程补齐", len(orderIDs))
 
 	spm.mu.Unlock()
 	err := spm.executor.BatchCancelOrders(orderIDs)
 	spm.mu.Lock()
 	if err != nil {
-		logger.Warn("⚠️ [网格自检] 撤销远端开仓单失败: %v", err)
+		logger.Warn("⚠️ [开仓窗口同步] 撤销远端开仓单失败: %v", err)
 		return false, nil
 	}
 	for _, candidate := range candidates {
@@ -1942,6 +1943,42 @@ func (spm *SuperPositionManager) calculateEntrySlotPrices(gridPrice, currentPric
 	return prices
 }
 
+func (spm *SuperPositionManager) calculateAvailableEntrySlotPrices(gridPrice, currentPrice float64, count int, bookSide string) []float64 {
+	if count <= 0 {
+		return nil
+	}
+	maxCandidates := count*4 + 20
+	if maxCandidates < count {
+		maxCandidates = count
+	}
+	raw := spm.calculateEntrySlotPrices(gridPrice, currentPrice, maxCandidates, bookSide)
+	prices := make([]float64, 0, count)
+	for _, price := range raw {
+		if !spm.entrySlotCanHostWindowOrder(price, bookSide) {
+			continue
+		}
+		prices = append(prices, price)
+		if len(prices) >= count {
+			break
+		}
+	}
+	return prices
+}
+
+func (spm *SuperPositionManager) entrySlotCanHostWindowOrder(price float64, bookSide string) bool {
+	value, ok := spm.slots.Load(spm.slotKey(price, bookSide))
+	if !ok {
+		return true
+	}
+	slot := value.(*InventorySlot)
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if spm.slotHasActiveOrder(slot) {
+		return spm.isEntryOrder(slot.OrderSide, slot.BookSide)
+	}
+	return slot.PositionStatus == PositionStatusEmpty && slot.SlotStatus == SlotStatusFree
+}
+
 func (spm *SuperPositionManager) calculateExitSlotPrices(gridPrice, currentPrice float64, count int, bookSide string) []float64 {
 	if count <= 0 {
 		return nil
@@ -1957,7 +1994,7 @@ func (spm *SuperPositionManager) calculateExitSlotPrices(gridPrice, currentPrice
 		direction = "down"
 	}
 	maxAttempts := count*4 + 20
-	for i := 1; len(prices) < count && i <= maxAttempts; i++ {
+	for i := 2; len(prices) < count && i <= maxAttempts+1; i++ {
 		price := gridPrice
 		if direction == "down" {
 			price = gridPrice - float64(i)*priceInterval
@@ -3102,12 +3139,13 @@ func (spm *SuperPositionManager) PrintPositionsWithMarkPrice(markPrice float64) 
 		SlotStatus     string
 	}
 	var allSlots []slotInfo
+	slotByKey := make(map[string]slotInfo)
 
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
 		price := slot.Price
 		slot.mu.RLock()
-		allSlots = append(allSlots, slotInfo{
+		info := slotInfo{
 			Price:          price,
 			PositionStatus: slot.PositionStatus,
 			PositionQty:    slot.PositionQty,
@@ -3117,7 +3155,9 @@ func (spm *SuperPositionManager) PrintPositionsWithMarkPrice(markPrice float64) 
 			OrderID:        slot.OrderID,
 			ClientOID:      slot.ClientOID,
 			SlotStatus:     slot.SlotStatus,
-		})
+		}
+		allSlots = append(allSlots, info)
+		slotByKey[spm.slotKey(price, slot.BookSide)] = info
 		slot.mu.RUnlock()
 		return true
 	})
@@ -3133,17 +3173,32 @@ func (spm *SuperPositionManager) PrintPositionsWithMarkPrice(markPrice float64) 
 	// 计算开仓窗口范围；多头在当前价下方，空头在当前价上方。
 	buyWindowSize := spm.config.Trading.BuyWindowSize
 	sellWindowSize := spm.config.Trading.SellWindowSize
-	windowSlotMap := make(map[string]bool)
 	exitWindowPriceMap := make(map[string]bool)
 	enabledBookSides := spm.enabledBookSides()
 	entryWindowSize := 0
+	var windowSlots []slotInfo
+	windowSeen := make(map[string]bool)
 	for _, bookSide := range enabledBookSides {
 		bookEntryWindowSize := spm.entryWindowSize(bookSide)
 		if bookEntryWindowSize > entryWindowSize {
 			entryWindowSize = bookEntryWindowSize
 		}
-		for _, p := range spm.calculateEntrySlotPrices(currentGridPrice, lastPrice, bookEntryWindowSize, bookSide) {
-			windowSlotMap[spm.slotKey(p, bookSide)] = true
+		for _, p := range spm.calculateAvailableEntrySlotPrices(currentGridPrice, lastPrice, bookEntryWindowSize, bookSide) {
+			key := spm.slotKey(p, bookSide)
+			if windowSeen[key] {
+				continue
+			}
+			windowSeen[key] = true
+			if info, ok := slotByKey[key]; ok {
+				windowSlots = append(windowSlots, info)
+			} else {
+				windowSlots = append(windowSlots, slotInfo{
+					Price:          p,
+					PositionStatus: PositionStatusEmpty,
+					BookSide:       bookSide,
+					SlotStatus:     SlotStatusFree,
+				})
+			}
 		}
 		bookExitWindowSize := sellWindowSize
 		if spm.exitOrderSide(bookSide) == "BUY" {
@@ -3153,6 +3208,9 @@ func (spm *SuperPositionManager) PrintPositionsWithMarkPrice(markPrice float64) 
 			exitWindowPriceMap[formatPrice(p, spm.priceDecimals)] = true
 		}
 	}
+	sort.Slice(windowSlots, func(i, j int) bool {
+		return windowSlots[i].Price > windowSlots[j].Price
+	})
 
 	// 打印开仓窗口内的所有槽位
 	logger.Info("开仓窗口大小: %d 个槽位", entryWindowSize)
@@ -3160,43 +3218,40 @@ func (spm *SuperPositionManager) PrintPositionsWithMarkPrice(markPrice float64) 
 	emptySlotCount := 0
 	filledSlotCount := 0
 
-	for _, slot := range allSlots {
+	for _, slot := range windowSlots {
 		priceStr := formatPrice(slot.Price, spm.priceDecimals)
-		// 只打印当前交易方向启用的开仓窗口槽位
-		if windowSlotMap[spm.slotKey(slot.Price, slot.BookSide)] {
-			statusIcon := "⚪" // 空槽位
-			statusDesc := ""
+		statusIcon := "⚪" // 空槽位
+		statusDesc := ""
 
-			if slot.PositionStatus == PositionStatusFilled {
-				statusIcon = "🟢" // 有持仓
-				statusDesc = fmt.Sprintf("%s持仓: %.4f %s", slot.BookSide, slot.PositionQty, baseCurrency)
-				filledSlotCount++
-			} else {
-				statusDesc = "无持仓"
-			}
-
-			orderInfo := ""
-			if spm.slotHasActiveOrder(&InventorySlot{OrderID: slot.OrderID, ClientOID: slot.ClientOID, OrderStatus: slot.OrderStatus, SlotStatus: slot.SlotStatus}) {
-				orderInfo = fmt.Sprintf(", 订单: %s/%s (ID:%d)", slot.OrderSide, slot.OrderStatus, slot.OrderID)
-				if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
-					entryOrderCount++
-				}
-			}
-			if slot.PositionStatus != PositionStatusFilled && orderInfo == "" && slot.SlotStatus == SlotStatusFree {
-				emptySlotCount++
-			}
-
-			// 🔥 总是显示槽位状态,便于调试
-			slotStatusInfo := ""
-			if slot.SlotStatus != "" {
-				slotStatusInfo = fmt.Sprintf(" [槽位:%s]", slot.SlotStatus)
-			} else {
-				slotStatusInfo = " [槽位:空]"
-			}
-
-			logger.Info("  %s %s: %s%s%s",
-				statusIcon, priceStr, statusDesc, orderInfo, slotStatusInfo)
+		if slot.PositionStatus == PositionStatusFilled {
+			statusIcon = "🟢" // 有持仓
+			statusDesc = fmt.Sprintf("%s持仓: %.4f %s", slot.BookSide, slot.PositionQty, baseCurrency)
+			filledSlotCount++
+		} else {
+			statusDesc = "无持仓"
 		}
+
+		orderInfo := ""
+		if spm.slotHasActiveOrder(&InventorySlot{OrderID: slot.OrderID, ClientOID: slot.ClientOID, OrderStatus: slot.OrderStatus, SlotStatus: slot.SlotStatus}) {
+			orderInfo = fmt.Sprintf(", 订单: %s/%s (ID:%d)", slot.OrderSide, slot.OrderStatus, slot.OrderID)
+			if spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
+				entryOrderCount++
+			}
+		}
+		if slot.PositionStatus != PositionStatusFilled && orderInfo == "" && slot.SlotStatus == SlotStatusFree {
+			emptySlotCount++
+		}
+
+		// 🔥 总是显示槽位状态,便于调试
+		slotStatusInfo := ""
+		if slot.SlotStatus != "" {
+			slotStatusInfo = fmt.Sprintf(" [槽位:%s]", slot.SlotStatus)
+		} else {
+			slotStatusInfo = " [槽位:空]"
+		}
+
+		logger.Info("  %s %s: %s%s%s",
+			statusIcon, priceStr, statusDesc, orderInfo, slotStatusInfo)
 	}
 
 	logger.Info("窗口统计: %d 个开仓单活跃, %d 个已持仓, %d 个空槽位",

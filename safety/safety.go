@@ -155,12 +155,13 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 
 	// 计算每笔交易的利润和手续费
 	entryPrice := currentPrice
-	exitPrice := currentPrice + priceInterval
+	exitGap := priceInterval * 2
+	exitPrice := currentPrice + exitGap
 	actionDesc := "买入后卖出"
 	entrySide := "买入"
 	exitSide := "卖出"
 	if direction == "short" {
-		exitPrice = currentPrice - priceInterval
+		exitPrice = currentPrice - exitGap
 		actionDesc = "卖出后买回"
 		entrySide = "卖出"
 		exitSide = "买回"
@@ -172,7 +173,7 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 	exitQuantity := entryQuantity
 	entryAmount := orderAmount
 	exitAmount := exitPrice * exitQuantity
-	profitPerTrade := priceInterval * entryQuantity
+	profitPerTrade := exitGap * entryQuantity
 
 	// 手续费 = 买入手续费 + 卖出手续费
 	buyFee := entryAmount * buyFeeRate
@@ -183,14 +184,14 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 	totalFeeRate := buyFeeRate + sellFeeRate
 
 	// 计算利润占入场价的比例（利润率）
-	profitRate := priceInterval / entryPrice
+	profitRate := exitGap / entryPrice
 
 	logger.Info("💰 每笔交易分析 (固定金额模式, %s):", actionDesc)
-	logger.Info("   %s价: %.*f, %s价: %.*f, 价格差: %.*f", entrySide, priceDecimals, entryPrice, exitSide, priceDecimals, exitPrice, priceDecimals, priceInterval)
+	logger.Info("   %s价: %.*f, %s价: %.*f, 价格差: %.*f", entrySide, priceDecimals, entryPrice, exitSide, priceDecimals, exitPrice, priceDecimals, exitGap)
 	logger.Info("   %s金额: %.2f %s, %s数量: %.4f", entrySide, entryAmount, quoteCurrency, entrySide, entryQuantity)
 	logger.Info("   %s金额: %.2f %s, %s数量: %.4f", exitSide, exitAmount, quoteCurrency, exitSide, exitQuantity)
 	logger.Info("   每笔利润: %.4f %s", profitPerTrade, quoteCurrency)
-	logger.Info("   利润率: %.4f%% (价格差 %.*f / 入场价 %.*f)", profitRate*100, priceDecimals, priceInterval, priceDecimals, entryPrice)
+	logger.Info("   利润率: %.4f%% (价格差 %.*f / 入场价 %.*f)", profitRate*100, priceDecimals, exitGap, priceDecimals, entryPrice)
 	logger.Info("   入场手续费: %.4f %s (金额 %.2f × 费率 %.4f%%)", buyFee, quoteCurrency, entryAmount, buyFeeRate*100)
 	logger.Info("   出场手续费: %.4f %s (金额 %.2f × 费率 %.4f%%)", sellFee, quoteCurrency, exitAmount, sellFeeRate*100)
 	logger.Info("   总手续费: %.4f %s (费率: %.4f%%)", totalFee, quoteCurrency, totalFeeRate*100)

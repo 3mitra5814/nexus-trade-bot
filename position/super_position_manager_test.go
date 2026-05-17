@@ -802,8 +802,8 @@ func TestDirectionalInventoryGridPlacesExitOnlyAfterEntryFill(t *testing.T) {
 		exit      float64
 		current   float64
 	}{
-		{direction: "long", bookSide: BookSideLong, entrySide: "BUY", exitSide: "SELL", entry: 99, exit: 100, current: 99},
-		{direction: "short", bookSide: BookSideShort, entrySide: "SELL", exitSide: "BUY", entry: 101, exit: 100, current: 101},
+		{direction: "long", bookSide: BookSideLong, entrySide: "BUY", exitSide: "SELL", entry: 99, exit: 101, current: 99},
+		{direction: "short", bookSide: BookSideShort, entrySide: "SELL", exitSide: "BUY", entry: 101, exit: 99, current: 101},
 	}
 	for _, tt := range tests {
 		t.Run(tt.direction, func(t *testing.T) {
@@ -995,6 +995,113 @@ func TestShortExitQuotaProtectsEveryFilledSlot(t *testing.T) {
 	}
 	if len(executor.canceled) != 0 {
 		t.Fatalf("protective short exits must not be canceled to fit a fixed window, canceled=%v", executor.canceled)
+	}
+}
+
+func TestShortEntryWindowBackfillsPastFilledSlots(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(86.68, "86.68"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	for _, price := range []float64{86.69, 86.70} {
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		slot.BookSide = BookSideShort
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = 0.23
+		slot.EntryPrice = price
+		slot.SlotStatus = SlotStatusFree
+		slot.mu.Unlock()
+	}
+
+	if err := spm.AdjustOrders(86.68); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	wantSells := map[float64]bool{}
+	for price := 86.71; price <= 86.80+1e-9; price += 0.01 {
+		wantSells[roundPrice(price, 2)] = false
+	}
+	for _, order := range executor.orders {
+		if order.Side != "SELL" || order.ReduceOnly {
+			continue
+		}
+		if order.Price == 86.69 || order.Price == 86.70 {
+			t.Fatalf("filled short slots must not receive new entry SELL orders, got %+v", order)
+		}
+		if _, ok := wantSells[order.Price]; ok {
+			wantSells[order.Price] = true
+		}
+	}
+	for price, seen := range wantSells {
+		if !seen {
+			t.Fatalf("short entry window should extend past filled slots and include %.2f, got orders=%v", price, executor.orders)
+		}
+	}
+}
+
+func TestEntryWindowSyncKeepsExtendedShortWindow(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(86.68, "86.68"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	for _, price := range []float64{86.69, 86.70} {
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		slot.BookSide = BookSideShort
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = 0.23
+		slot.EntryPrice = price
+		slot.SlotStatus = SlotStatusFree
+		slot.mu.Unlock()
+	}
+	var orderID int64 = 100
+	for price := 86.71; price <= 86.80+1e-9; price += 0.01 {
+		price = roundPrice(price, 2)
+		orderID++
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		slot.BookSide = BookSideShort
+		slot.PositionStatus = PositionStatusEmpty
+		slot.OrderID = orderID
+		slot.ClientOID = spm.generateClientOrderID(price, "SELL", BookSideShort)
+		slot.OrderSide = "SELL"
+		slot.OrderStatus = OrderStatusConfirmed
+		slot.OrderPrice = price
+		slot.SlotStatus = SlotStatusLocked
+		slot.mu.Unlock()
+	}
+
+	if err := spm.AdjustOrdersWithRebalance(86.68, true); err != nil {
+		t.Fatalf("AdjustOrdersWithRebalance() error = %v", err)
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("extended short entry window should be kept by the main window sync, canceled=%v", executor.canceled)
 	}
 }
 
@@ -1800,7 +1907,7 @@ func TestRestoredShortPositionUsesAnchorAlignedGrid(t *testing.T) {
 		}
 		gotExitPrices[order.Price] = true
 	}
-	for _, price := range []float64{2281.60, 2280.60, 2279.60} {
+	for _, price := range []float64{2280.60, 2279.60, 2278.60} {
 		if !gotExitPrices[price] {
 			t.Fatalf("expected restored short exits to spread across aligned grid prices, missing %.2f got=%v orders=%+v",
 				price, gotExitPrices, executor.orders)
@@ -1848,7 +1955,7 @@ func TestRestoredLongPositionUsesAnchorAlignedGrid(t *testing.T) {
 		}
 		gotExitPrices[order.Price] = true
 	}
-	for _, price := range []float64{2283.60, 2284.60, 2285.60} {
+	for _, price := range []float64{2284.60, 2285.60, 2286.60} {
 		if !gotExitPrices[price] {
 			t.Fatalf("expected restored long exits to spread across aligned grid prices, missing %.2f got=%v orders=%+v",
 				price, gotExitPrices, executor.orders)
@@ -1950,13 +2057,13 @@ func TestPositionSnapshotAddsRemoteShortDeltaNearCurrentGrid(t *testing.T) {
 	}
 	foundNearExit := false
 	for _, order := range executor.orders {
-		if order.Side == "BUY" && order.ReduceOnly && order.Price == 45.227 {
+		if order.Side == "BUY" && order.ReduceOnly && order.Price == 45.177 {
 			foundNearExit = true
 			break
 		}
 	}
 	if !foundNearExit {
-		t.Fatalf("expected newly adopted short delta to get a near-market BUY exit at 45.227, orders=%+v", executor.orders)
+		t.Fatalf("expected newly adopted short delta to get a profitable BUY exit two intervals below entry at 45.177, orders=%+v", executor.orders)
 	}
 }
 
@@ -2494,15 +2601,15 @@ func TestAdjustOrdersAllowsSamePriceReduceOnlyExitsWhenTargetsCollapse(t *testin
 		slot.mu.Unlock()
 	}
 
-	if err := spm.AdjustOrders(100); err != nil {
+	if err := spm.AdjustOrders(101); err != nil {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
 	var exitCountAtTarget int
 	for _, order := range executor.orders {
 		if order.ReduceOnly && order.Side == "SELL" {
-			if order.Price != 101 {
-				t.Fatalf("expected collapsed maker-safe exits to stay at nearest target 101.00, got %.2f orders=%v", order.Price, executor.orders)
+			if order.Price != 102 {
+				t.Fatalf("expected collapsed maker-safe exits to stay at nearest target 102.00, got %.2f orders=%v", order.Price, executor.orders)
 			}
 			exitCountAtTarget++
 		}
