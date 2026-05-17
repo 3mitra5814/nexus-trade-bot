@@ -337,6 +337,30 @@ func (spm *SuperPositionManager) desiredOrderQuotas(enabledBookSides []string) m
 	return quotas
 }
 
+func (spm *SuperPositionManager) ensureExitQuotasCoverFilledSlots(quotas map[string]*orderQuota) {
+	filledByQuota := make(map[string]int)
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
+			return true
+		}
+		exitSide := spm.exitOrderSide(slot.BookSide)
+		quotaKey := spm.orderQuotaKey(slot.BookSide, exitSide)
+		if quotas[quotaKey] == nil {
+			return true
+		}
+		filledByQuota[quotaKey]++
+		return true
+	})
+	for quotaKey, filledCount := range filledByQuota {
+		if quota := quotas[quotaKey]; quota != nil && quota.Limit < filledCount {
+			quota.Limit = filledCount
+		}
+	}
+}
+
 func remainingQuota(quotas map[string]*orderQuota, key string) int {
 	quota := quotas[key]
 	if quota == nil {
@@ -644,6 +668,7 @@ func (spm *SuperPositionManager) adjustOrders(currentPrice float64, allowWindowR
 
 	enabledBookSides := spm.enabledBookSides()
 	orderQuotas := spm.desiredOrderQuotas(enabledBookSides)
+	spm.ensureExitQuotasCoverFilledSlots(orderQuotas)
 
 	// 计算允许创建的订单数量上限。中性模式下，多头开/平仓与空头开/平仓独立占用额度。
 	threshold := spm.config.Trading.OrderCleanupThreshold
@@ -2151,6 +2176,7 @@ type exchangePositionSnapshot struct {
 type staleOrderRef struct {
 	OrderID       int64
 	ClientOrderID string
+	CreatedAt     time.Time
 }
 
 type staleEntryCandidate struct {
@@ -2265,6 +2291,7 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 
 	staleActive := 0
 	var staleOrders []staleOrderRef
+	now := time.Now()
 	spm.slots.Range(func(key, value interface{}) bool {
 		slot := value.(*InventorySlot)
 		slot.mu.Lock()
@@ -2275,8 +2302,13 @@ func (spm *SuperPositionManager) ApplyExchangeSnapshot(positionsRaw interface{},
 		_, hasID := openOrderIDs[slot.OrderID]
 		_, hasClientOID := openClientOIDs[slot.ClientOID]
 		if !hasID && !hasClientOID {
+			if slot.OrderID == 0 && slot.ClientOID != "" && !slot.OrderCreatedAt.IsZero() && now.Sub(slot.OrderCreatedAt) <= pendingOrderIdentityGrace {
+				logger.Debug("⏳ [对账] 新建订单仍在等待远端 OrderID，同步保护期内暂不清理: slot=%s, clientOID=%s, status=%s",
+					formatPrice(slot.Price, spm.priceDecimals), slot.ClientOID, slot.OrderStatus)
+				return true
+			}
 			staleActive++
-			staleOrders = append(staleOrders, staleOrderRef{OrderID: slot.OrderID, ClientOrderID: slot.ClientOID})
+			staleOrders = append(staleOrders, staleOrderRef{OrderID: slot.OrderID, ClientOrderID: slot.ClientOID, CreatedAt: slot.OrderCreatedAt})
 			logger.Warn("⚠️ [对账] 本地订单不在交易所挂单中，等待订单详情/WS确认: slot=%s, orderID=%d, clientOID=%s, status=%s",
 				formatPrice(slot.Price, spm.priceDecimals), slot.OrderID, slot.ClientOID, slot.OrderStatus)
 		}
@@ -2388,9 +2420,14 @@ func (spm *SuperPositionManager) applySnapshotFillDelta(slot *InventorySlot, sid
 }
 
 func (spm *SuperPositionManager) refreshStaleOrders(ordersToRefresh []staleOrderRef) {
+	now := time.Now()
 	for _, ref := range ordersToRefresh {
 		if ref.OrderID == 0 {
 			if ref.ClientOrderID != "" {
+				if !ref.CreatedAt.IsZero() && now.Sub(ref.CreatedAt) <= pendingOrderIdentityGrace {
+					logger.Debug("⏳ [对账] ClientOID-only 订单仍在保护期内，暂不清理: clientOID=%s", ref.ClientOrderID)
+					continue
+				}
 				logger.Warn("🧹 [对账] 本地订单缺少远端 OrderID 且不在交易所挂单中，清理本地槽位: clientOID=%s", ref.ClientOrderID)
 				spm.OnOrderUpdate(OrderUpdate{
 					ClientOrderID: ref.ClientOrderID,

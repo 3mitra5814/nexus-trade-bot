@@ -45,6 +45,7 @@ WEB_LOG="${LOG_DIR}/web-console.log"
 WEB_ERR_LOG="${LOG_DIR}/web-console-error.log"
 WEB_LEGACY_ERR_LOG="${LOG_DIR}/web-console.err.log"
 PID_FILE="${APP_DIR}/nexus-trade-bot.pid"
+BUILD_STAMP="${APP_DIR}/.nexus-trade-bot.build"
 OS_PACKAGES=(ca-certificates curl wget git tar gzip build-essential lsof procps)
 
 say() { printf "%s\n" "$*"; }
@@ -66,6 +67,16 @@ sudo_cmd() {
 version_ge() {
   local have="$1" want="$2"
   [[ "$(printf '%s\n' "$want" "$have" | sort -V | head -n1)" == "$want" ]]
+}
+
+hash_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    cat
+  fi
 }
 
 install_os_deps() {
@@ -143,14 +154,22 @@ restore_managed_data() {
 }
 
 install_go() {
-  local installed="" go_bin=""
+  local installed="" go_bin="" candidate version
   if command -v go >/dev/null 2>&1; then
-    go_bin="$(command -v go)"
-  elif [[ -x /usr/local/go/bin/go ]]; then
-    go_bin="/usr/local/go/bin/go"
+    candidate="$(command -v go)"
+    version="$("$candidate" version | awk '{print $3}' | sed 's/^go//')"
+    if [[ -n "$version" ]] && version_ge "$version" "$GO_VERSION"; then
+      go_bin="$candidate"
+      installed="$version"
+    fi
   fi
-  if [[ -n "$go_bin" ]]; then
-    installed="$("$go_bin" version | awk '{print $3}' | sed 's/^go//')"
+  if [[ -z "$go_bin" && -x /usr/local/go/bin/go ]]; then
+    candidate="/usr/local/go/bin/go"
+    version="$("$candidate" version | awk '{print $3}' | sed 's/^go//')"
+    if [[ -n "$version" ]] && version_ge "$version" "$GO_VERSION"; then
+      go_bin="$candidate"
+      installed="$version"
+    fi
   fi
 
   if [[ -n "$installed" ]] && version_ge "$installed" "$GO_VERSION"; then
@@ -177,6 +196,49 @@ install_go() {
   rm -rf "$tmp"
   export PATH="/usr/local/go/bin:${PATH}"
   ok "Go installed: $(go version | awk '{print $3}')"
+}
+
+source_signature() {
+  if [[ -d "${APP_DIR}/.git" ]] && command -v git >/dev/null 2>&1; then
+    {
+      git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || true
+      git -C "$APP_DIR" status --porcelain -- ':(glob)**/*.go' go.mod go.sum 2>/dev/null || true
+      git -C "$APP_DIR" diff -- ':(glob)**/*.go' go.mod go.sum 2>/dev/null || true
+    } | hash_stream
+    return
+  fi
+
+  (
+    cd "$APP_DIR"
+    find . \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' \) -type f -print0 |
+      sort -z |
+      xargs -0 ${SHA_SUM_CMD:-sha256sum} 2>/dev/null
+  ) | hash_stream
+}
+
+build_signature() {
+  printf "go=%s\nsource=%s\n" "$GO_VERSION" "$(source_signature)"
+}
+
+binary_is_current() {
+  [[ -x "$BIN_PATH" && -f "$BUILD_STAMP" ]] || return 1
+  [[ "$(cat "$BUILD_STAMP" 2>/dev/null)" == "$(build_signature)" ]]
+}
+
+refresh_invoked_script() {
+  local repo_script="${APP_DIR}/scripts/nexus-trade-bot.sh"
+  local invoked="${BASH_SOURCE[0]}"
+  local invoked_abs repo_abs
+  [[ -f "$repo_script" && -f "$invoked" ]] || return
+  invoked_abs="$(cd "$(dirname "$invoked")" && pwd)/$(basename "$invoked")"
+  repo_abs="$(cd "$(dirname "$repo_script")" && pwd)/$(basename "$repo_script")"
+  [[ "$invoked_abs" != "$repo_abs" ]] || return
+  if cmp -s "$repo_abs" "$invoked_abs"; then
+    return
+  fi
+  cp "$repo_abs" "$invoked_abs"
+  chmod +x "$invoked_abs" 2>/dev/null || true
+  ok "Updated launcher script: ${invoked_abs}"
 }
 
 prepare_app_dir() {
@@ -220,6 +282,10 @@ build_if_source() {
     [[ -x "$BIN_PATH" ]] || fail "binary not found: ${BIN_PATH}"
     return
   fi
+  if binary_is_current; then
+    ok "Binary already current: ${BIN_PATH}"
+    return
+  fi
   install_go
   cd "$APP_DIR"
   info "Downloading Go modules"
@@ -227,6 +293,7 @@ build_if_source() {
   info "Building ${BIN_NAME}"
   go build -o "$BIN_PATH" .
   chmod +x "$BIN_PATH"
+  build_signature > "$BUILD_STAMP"
 }
 
 ensure_config() {
@@ -500,6 +567,7 @@ update_source() {
   backup_managed_data "$backup_dir"
   stop_web
   sync_source
+  refresh_invoked_script
   restore_managed_data "$backup_dir"
   rm -rf "$backup_dir"
   build_if_source

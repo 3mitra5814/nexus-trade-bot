@@ -915,6 +915,89 @@ func TestShortGridPlacesReduceOnlyBuyAfterShortEntryFill(t *testing.T) {
 	}
 }
 
+func TestShortExitQuotaProtectsEveryFilledSlot(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(86.74, "86.74"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		price := roundPrice(86.74-float64(i)*cfg.Trading.PriceInterval, 2)
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		slot.BookSide = BookSideShort
+		slot.PositionStatus = PositionStatusFilled
+		slot.PositionQty = 0.23
+		slot.EntryPrice = price
+		slot.SlotStatus = SlotStatusFree
+		slot.mu.Unlock()
+	}
+
+	if err := spm.AdjustOrders(86.74); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	var filledEntries []*OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price >= 86.75 && order.Price <= 86.78 {
+			filledEntries = append(filledEntries, order)
+		}
+	}
+	if len(filledEntries) != 4 {
+		t.Fatalf("expected four short entries to fill in the test setup, got %d orders=%v", len(filledEntries), executor.orders)
+	}
+	for i, entry := range filledEntries {
+		orderID := int64(1000 + i)
+		spm.OnOrderUpdate(OrderUpdate{OrderID: orderID, ClientOrderID: entry.ClientOrderID, Status: "NEW", Side: "SELL", Price: entry.Price})
+		spm.OnOrderUpdate(OrderUpdate{OrderID: orderID, ClientOrderID: entry.ClientOrderID, Status: "FILLED", ExecutedQty: entry.Quantity, AvgPrice: entry.Price, Side: "SELL"})
+	}
+
+	if err := spm.AdjustOrders(86.76); err != nil {
+		t.Fatalf("post-fill AdjustOrders() error = %v", err)
+	}
+
+	var filledSlots int
+	var protectedSlots int
+	var missing []float64
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if slot.BookSide != BookSideShort || slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
+			return true
+		}
+		filledSlots++
+		if spm.slotHasActiveOrder(slot) && slot.OrderSide == "BUY" && !spm.isEntryOrder(slot.OrderSide, slot.BookSide) && slot.OrderPrice < spm.slotEntryPrice(slot) {
+			protectedSlots++
+			return true
+		}
+		missing = append(missing, slot.Price)
+		return true
+	})
+	if filledSlots != 14 {
+		t.Fatalf("expected 14 filled short slots after four entry fills, got %d", filledSlots)
+	}
+	if protectedSlots != filledSlots {
+		t.Fatalf("every filled short slot needs its own profitable reduce-only BUY, protected=%d filled=%d missing=%v orders=%v",
+			protectedSlots, filledSlots, missing, executor.orders)
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("protective short exits must not be canceled to fit a fixed window, canceled=%v", executor.canceled)
+	}
+}
+
 func TestLongGridPlacesReduceOnlySellAfterLongEntryFill(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"
@@ -1617,16 +1700,16 @@ func TestLargeRestoredShortPositionIsSplitAndExitOrdersAreCapped(t *testing.T) {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 
-	maxQty := spm.maxConfiguredOrderQuantity(2999)
-	if maxQty <= 0 {
-		t.Fatalf("max configured quantity should be positive")
-	}
 	var reduceOnlyBuys int
 	for _, order := range executor.orders {
 		if order.Side != "BUY" || !order.ReduceOnly {
 			continue
 		}
 		reduceOnlyBuys++
+		maxQty := spm.maxConfiguredOrderQuantity(order.Price)
+		if maxQty <= 0 {
+			t.Fatalf("max configured quantity should be positive for order price %.2f", order.Price)
+		}
 		if order.Quantity > maxQty {
 			t.Fatalf("restored short exit order was oversized: qty=%.8f max=%.8f order=%+v", order.Quantity, maxQty, order)
 		}
@@ -2661,7 +2744,7 @@ func TestApplyExchangeSnapshotClearsGoneClientOnlyOrder(t *testing.T) {
 	slot.OrderSide = "BUY"
 	slot.OrderStatus = OrderStatusPlaced
 	slot.OrderPrice = 99
-	slot.OrderCreatedAt = time.Now()
+	slot.OrderCreatedAt = time.Now().Add(-pendingOrderIdentityGrace - time.Second)
 	slot.SlotStatus = SlotStatusLocked
 	slot.BookSide = BookSideLong
 	slot.mu.Unlock()
@@ -2674,6 +2757,39 @@ func TestApplyExchangeSnapshotClearsGoneClientOnlyOrder(t *testing.T) {
 		!slot.OrderCreatedAt.IsZero() || slot.SlotStatus != SlotStatusFree || slot.OrderStatus != OrderStatusCanceled {
 		t.Fatalf("expected client-only stale order to be fully cleared, orderID=%d clientOID=%q side=%q price=%.2f created=%v slot=%s status=%s",
 			slot.OrderID, slot.ClientOID, slot.OrderSide, slot.OrderPrice, slot.OrderCreatedAt, slot.SlotStatus, slot.OrderStatus)
+	}
+}
+
+func TestApplyExchangeSnapshotKeepsRecentClientOnlyOrder(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 2
+
+	spm := NewSuperPositionManager(cfg, noopExecutor{}, noopExchange{}, 2, 3)
+	clientOID := spm.generateClientOrderID(99, "BUY", BookSideLong)
+	slot := spm.getOrCreateSlot(99, BookSideLong)
+	slot.mu.Lock()
+	slot.ClientOID = clientOID
+	slot.OrderSide = "BUY"
+	slot.OrderStatus = OrderStatusPlaced
+	slot.OrderPrice = 99
+	slot.OrderCreatedAt = time.Now()
+	slot.SlotStatus = SlotStatusLocked
+	slot.BookSide = BookSideLong
+	slot.mu.Unlock()
+
+	spm.ApplyExchangeSnapshot(nil, []*Order{})
+
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.ClientOID != clientOID || slot.OrderSide != "BUY" || slot.OrderPrice != 99 ||
+		slot.SlotStatus != SlotStatusLocked || slot.OrderStatus != OrderStatusPlaced {
+		t.Fatalf("recent client-only order should be kept during identity grace, clientOID=%q side=%q price=%.2f slot=%s status=%s",
+			slot.ClientOID, slot.OrderSide, slot.OrderPrice, slot.SlotStatus, slot.OrderStatus)
 	}
 }
 
