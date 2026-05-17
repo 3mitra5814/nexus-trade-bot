@@ -1002,6 +1002,96 @@ func TestShortExitKeepsFixedTargetAndWaitsWhenTargetWouldCross(t *testing.T) {
 	}
 }
 
+func TestExitOrderQuantityAbsorbsDustRemainder(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 6
+
+	spm := NewSuperPositionManager(cfg, &captureExecutor{}, noopExchange{}, 4, 2)
+
+	qty, ok := spm.exitOrderQuantity(0.27, 86.34)
+	if !ok {
+		t.Fatalf("expected dust-absorbing exit quantity")
+	}
+	if math.Abs(qty-0.27) > 1e-9 {
+		t.Fatalf("expected full 0.27 exit to avoid unprotected dust, got %.8f", qty)
+	}
+
+	qty, ok = spm.exitOrderQuantity(0.36, 86.34)
+	if !ok {
+		t.Fatalf("expected capped exit quantity")
+	}
+	if math.Abs(qty-0.23) > 1e-9 {
+		t.Fatalf("expected regular cap 0.23 when remainder is orderable, got %.8f", qty)
+	}
+}
+
+func TestRestorePositionMergesDustTailIntoProtectedSlot(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 6
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	spm.initializeSlotsFromPositionAtReference(16.37, BookSideShort, 86.4775, 86.36)
+
+	var restoredSlots int
+	restoredQty := 0.0
+	minSlotValue := math.MaxFloat64
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if slot.BookSide != BookSideShort || slot.PositionStatus != PositionStatusFilled || slot.PositionQty <= 0 {
+			return true
+		}
+		restoredSlots++
+		restoredQty += slot.PositionQty
+		if value := slot.Price * slot.PositionQty; value < minSlotValue {
+			minSlotValue = value
+		}
+		return true
+	})
+	if restoredSlots != 71 {
+		t.Fatalf("expected dust tail to be merged into 71 protected slots, got %d", restoredSlots)
+	}
+	if math.Abs(restoredQty-16.37) > 1e-9 {
+		t.Fatalf("expected restored qty 16.37, got %.8f", restoredQty)
+	}
+	if minSlotValue < cfg.Trading.MinOrderValue {
+		t.Fatalf("restored slot below min order value: %.8f", minSlotValue)
+	}
+
+	if err := spm.AdjustOrders(86.35); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	var exitCount int
+	exitQty := 0.0
+	for _, order := range executor.orders {
+		if order.Side == "BUY" && order.ReduceOnly {
+			exitCount++
+			exitQty += order.Quantity
+		}
+	}
+	if exitCount != restoredSlots {
+		t.Fatalf("expected every restored slot to have a reduce-only BUY, exits=%d slots=%d orders=%v",
+			exitCount, restoredSlots, executor.orders)
+	}
+	if math.Abs(exitQty-16.37) > 1e-9 {
+		t.Fatalf("expected protected exit qty 16.37, got %.8f", exitQty)
+	}
+}
+
 func TestShortExitQuotaProtectsEveryFilledSlot(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"

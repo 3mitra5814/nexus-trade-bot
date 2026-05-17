@@ -1302,17 +1302,17 @@ func (spm *SuperPositionManager) repairEntryWindowHoles(currentPrice float64, ta
 			}
 			return bookCandidates[i].Distance > bookCandidates[j].Distance
 		})
-			for i := 0; i < len(holes) && i < len(bookCandidates); i++ {
-				// Holes closer to the market are repaired quickly. Holes farther away
-				// are just window extension, so they wait longer to avoid edge churn.
-				recentSingleStepRoll := !spm.lastEntryWindowSync.IsZero() &&
-					now.Sub(spm.lastEntryWindowSync) < entryWindowFarStableDuration &&
-					spm.isSingleStepEntryWindowRoll(holes, bookCandidates[i], len(targetByBook[bookSide]))
-				if bookCandidates[i].Distance <= holes[i].Distance+priceDistanceEpsilon ||
-					recentSingleStepRoll {
-					requiredStableDuration = maxDuration(requiredStableDuration, entryWindowFarStableDuration)
-				}
-				candidates = append(candidates, bookCandidates[i])
+		for i := 0; i < len(holes) && i < len(bookCandidates); i++ {
+			// Holes closer to the market are repaired quickly. Holes farther away
+			// are just window extension, so they wait longer to avoid edge churn.
+			recentSingleStepRoll := !spm.lastEntryWindowSync.IsZero() &&
+				now.Sub(spm.lastEntryWindowSync) < entryWindowFarStableDuration &&
+				spm.isSingleStepEntryWindowRoll(holes, bookCandidates[i], len(targetByBook[bookSide]))
+			if bookCandidates[i].Distance <= holes[i].Distance+priceDistanceEpsilon ||
+				recentSingleStepRoll {
+				requiredStableDuration = maxDuration(requiredStableDuration, entryWindowFarStableDuration)
+			}
+			candidates = append(candidates, bookCandidates[i])
 			selectedHolePrices = append(selectedHolePrices, holes[i].Price)
 		}
 	}
@@ -2318,6 +2318,13 @@ func (spm *SuperPositionManager) exitOrderQuantity(positionQty, price float64) (
 	if quantity <= 0 {
 		return 0, false
 	}
+	remainingAfterOrder := roundQuantity(positionQty-quantity, spm.quantityDecimals)
+	if remainingAfterOrder > 0 && remainingAfterOrder*price < spm.minOrderValue() {
+		quantity = roundQuantity(positionQty, spm.quantityDecimals)
+		if quantity <= 0 {
+			return 0, false
+		}
+	}
 	return quantity, true
 }
 
@@ -3277,6 +3284,11 @@ func (spm *SuperPositionManager) initializeSlotsFromPositionAtReference(totalPos
 			slotQty = remaining
 		}
 		slotQty = roundQuantity(slotQty, spm.quantityDecimals)
+		nextRemaining := roundQuantity(remaining-slotQty, spm.quantityDecimals)
+		if nextRemaining > 0 && nextRemaining*price < spm.minOrderValue() {
+			slotQty = roundQuantity(remaining, spm.quantityDecimals)
+			nextRemaining = 0
+		}
 
 		slot := spm.getOrCreateSlot(price, bookSide)
 		slot.mu.Lock()
@@ -3293,7 +3305,7 @@ func (spm *SuperPositionManager) initializeSlotsFromPositionAtReference(totalPos
 		slot.mu.Unlock()
 
 		allocatedQty += slotQty
-		remaining = roundQuantity(remaining-slotQty, spm.quantityDecimals)
+		remaining = nextRemaining
 		created++
 		if i < 10 {
 			logger.Info("✅ [持仓恢复] 槽位 %s: 分配持仓 %.4f", formatPrice(price, spm.priceDecimals), slotQty)
