@@ -6,6 +6,7 @@ import (
 	"nexus-trade-bot/logger"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -96,6 +97,8 @@ func (oc *OrderCleaner) CleanupOrders() {
 		OrderID   int64
 		ClientOID string
 	}
+	activeExitOrders := 0
+	filledSlotsNeedingExit := 0
 
 	oc.pm.IterateSlots(func(price float64, slotRaw interface{}) bool {
 		// 使用反射提取槽位字段
@@ -120,23 +123,38 @@ func (oc *OrderCleaner) CleanupOrders() {
 			}
 			return 0
 		}
+		getFloat64Field := func(name string) float64 {
+			field := v.FieldByName(name)
+			if field.IsValid() && field.CanFloat() {
+				return field.Float()
+			}
+			return 0
+		}
 
 		orderID := getInt64Field("OrderID")
 		clientOID := getStringField("ClientOID")
 		orderSide := getStringField("OrderSide")
 		orderStatus := getStringField("OrderStatus")
+		positionStatus := getStringField("PositionStatus")
+		positionQty := getFloat64Field("PositionQty")
 		bookSide := getStringField("BookSide")
 		if bookSide == "" {
 			bookSide = "LONG"
 		}
+		isEntry := (bookSide == "SHORT" && orderSide == "SELL") || (bookSide != "SHORT" && orderSide == "BUY")
 
 		isActive := orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed || orderStatus == OrderStatusPartiallyFilled
 		if isActive {
 			totalOrders++
+			if !isEntry {
+				activeExitOrders++
+			}
+		}
+		if positionStatus == "FILLED" && positionQty > 0 {
+			filledSlotsNeedingExit++
 		}
 		// 部分成交订单和所有平仓单都计入阈值，但不主动撤销，避免有仓位时失去保护。
 		if orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed {
-			isEntry := (bookSide == "SHORT" && orderSide == "SELL") || (bookSide != "SHORT" && orderSide == "BUY")
 			if isEntry && orderID == 0 {
 				logger.Debug("ℹ️ [订单清理] 跳过尚无远端 OrderID 的开仓单: price=%.8f book=%s side=%s clientOID=%s",
 					price, bookSide, orderSide, clientOID)
@@ -165,6 +183,16 @@ func (oc *OrderCleaner) CleanupOrders() {
 	if threshold <= 0 {
 		threshold = 100
 	}
+	rawThreshold := threshold
+	longEntryCapacity, shortEntryCapacity := oc.desiredEntryCapacityByBook()
+	protectedExitCapacity := activeExitOrders
+	if protectedExitCapacity < filledSlotsNeedingExit {
+		protectedExitCapacity = filledSlotsNeedingExit
+	}
+	strategyCapacity := protectedExitCapacity + longEntryCapacity + shortEntryCapacity
+	if threshold < strategyCapacity {
+		threshold = strategyCapacity
+	}
 
 	batchSize := oc.cfg.Trading.CleanupBatchSize
 	if batchSize <= 0 {
@@ -180,22 +208,47 @@ func (oc *OrderCleaner) CleanupOrders() {
 			cleanupBudget = batchSize
 		}
 
-		logger.Info("🧹 [订单清理] 当前订单数: %d (多头开仓单: %d, 空头开仓单: %d), 阈值: %d, 批次大小: %d",
-			totalOrders, len(longEntryOrders), len(shortEntryOrders), threshold, batchSize)
+		logger.Info("🧹 [订单清理] 当前订单数: %d (多头开仓单: %d/%d, 空头开仓单: %d/%d, 平仓保护: %d/%d), 阈值: %d, 有效阈值: %d, 批次大小: %d",
+			totalOrders, len(longEntryOrders), longEntryCapacity, len(shortEntryOrders), shortEntryCapacity,
+			activeExitOrders, protectedExitCapacity, rawThreshold, threshold, batchSize)
 
 		longOrdersToCancel := 0
 		shortOrdersToCancel := 0
+		longExcessEntries := len(longEntryOrders) - longEntryCapacity
+		if longExcessEntries < 0 {
+			longExcessEntries = 0
+		}
+		shortExcessEntries := len(shortEntryOrders) - shortEntryCapacity
+		if shortExcessEntries < 0 {
+			shortExcessEntries = 0
+		}
 
-		if len(longEntryOrders) > len(shortEntryOrders) {
+		if longExcessEntries > shortExcessEntries {
 			longOrdersToCancel = cleanupBudget
+			if longOrdersToCancel > longExcessEntries {
+				longOrdersToCancel = longExcessEntries
+			}
 			logger.Info("📊 [清理策略] 多头开仓单较多，清理 %d 个多头开仓单", longOrdersToCancel)
-		} else if len(shortEntryOrders) > len(longEntryOrders) {
+		} else if shortExcessEntries > longExcessEntries {
 			shortOrdersToCancel = cleanupBudget
+			if shortOrdersToCancel > shortExcessEntries {
+				shortOrdersToCancel = shortExcessEntries
+			}
 			logger.Info("📊 [清理策略] 空头开仓单较多，清理 %d 个空头开仓单", shortOrdersToCancel)
 		} else {
 			longOrdersToCancel = cleanupBudget / 2
+			if longOrdersToCancel > longExcessEntries {
+				longOrdersToCancel = longExcessEntries
+			}
 			shortOrdersToCancel = cleanupBudget - longOrdersToCancel
+			if shortOrdersToCancel > shortExcessEntries {
+				shortOrdersToCancel = shortExcessEntries
+			}
 			logger.Info("📊 [清理策略] 多空开仓单数量相等，平均清理 (多头: %d, 空头: %d)", longOrdersToCancel, shortOrdersToCancel)
+		}
+		if longOrdersToCancel+shortOrdersToCancel == 0 {
+			logger.Info("🧹 [订单清理] 超出阈值但开仓单未超过窗口容量，跳过清理以避免和主挂单流程互相撤补")
+			return
 		}
 
 		// 清理多头开仓单：清理价格最低的（离当前价格最远）
@@ -303,6 +356,32 @@ func (oc *OrderCleaner) CleanupOrders() {
 		logger.Info("✅ [订单清理完成] 清理了 %d 个订单，剩余: %d", canceledCount, totalOrders-canceledCount)
 	} else {
 		logger.Debug("ℹ️ [订单清理] 总订单数: %d (阈值: %d，无需清理)", totalOrders, threshold)
+	}
+}
+
+func (oc *OrderCleaner) desiredEntryCapacityByBook() (longCapacity, shortCapacity int) {
+	buyWindowSize := oc.cfg.Trading.BuyWindowSize
+	if buyWindowSize < 0 {
+		buyWindowSize = 0
+	}
+	sellWindowSize := oc.cfg.Trading.SellWindowSize
+	if sellWindowSize <= 0 {
+		sellWindowSize = buyWindowSize
+	}
+	if sellWindowSize < 0 {
+		sellWindowSize = 0
+	}
+
+	if strings.EqualFold(strings.TrimSpace(oc.cfg.App.MarketType), "spot") {
+		return buyWindowSize, 0
+	}
+	switch strings.ToLower(strings.TrimSpace(oc.cfg.Trading.Direction)) {
+	case "short":
+		return 0, sellWindowSize
+	case "neutral":
+		return buyWindowSize, sellWindowSize
+	default:
+		return buyWindowSize, 0
 	}
 }
 

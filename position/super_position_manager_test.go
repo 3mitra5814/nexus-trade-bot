@@ -230,6 +230,41 @@ func (e *cancelHookExecutor) BatchCancelOrders(orderIDs []int64) error {
 	return nil
 }
 
+func ageActiveEntryOrders(spm *SuperPositionManager, bookSide string) {
+	oldCreatedAt := time.Now().Add(-entryWindowSyncMinAge - time.Second)
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.Lock()
+		if slot.BookSide == bookSide && spm.isEntryOrder(slot.OrderSide, slot.BookSide) && spm.slotHasActiveOrder(slot) {
+			slot.OrderCreatedAt = oldCreatedAt
+		}
+		slot.mu.Unlock()
+		return true
+	})
+}
+
+func primeStableEntryWindowSync(t *testing.T, spm *SuperPositionManager, currentPrice float64) {
+	primeEntryWindowSync(t, spm, currentPrice, entryWindowStableDuration)
+}
+
+func primeFarStableEntryWindowSync(t *testing.T, spm *SuperPositionManager, currentPrice float64) {
+	primeEntryWindowSync(t, spm, currentPrice, entryWindowFarStableDuration)
+}
+
+func primeEntryWindowSync(t *testing.T, spm *SuperPositionManager, currentPrice float64, stableDuration time.Duration) {
+	t.Helper()
+	if err := spm.AdjustOrdersWithRebalance(currentPrice, true); err != nil {
+		t.Fatalf("prime AdjustOrdersWithRebalance() error = %v", err)
+	}
+	spm.mu.Lock()
+	if spm.pendingEntryWindowSyncKey == "" {
+		spm.mu.Unlock()
+		t.Fatalf("expected pending entry window sync key to be recorded")
+	}
+	spm.pendingEntryWindowSyncSeen = time.Now().Add(-stableDuration - time.Second)
+	spm.mu.Unlock()
+}
+
 func TestTerminalCanceledUpdateAppliesFilledDelta(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -786,8 +821,8 @@ func TestNeutralEntryCapacityNotBlockedByOppositeBookExits(t *testing.T) {
 			shortEntrySells++
 		}
 	}
-	if longExitSells != cfg.Trading.SellWindowSize || shortEntrySells != cfg.Trading.SellWindowSize {
-		t.Fatalf("neutral SELL capacity must be split by book/role, got long exits=%d short entries=%d orders=%v",
+	if longExitSells != 1 || shortEntrySells != cfg.Trading.SellWindowSize {
+		t.Fatalf("neutral SELL capacity must keep safe fixed-target exits separate from short entries, got long exits=%d short entries=%d orders=%v",
 			longExitSells, shortEntrySells, executor.orders)
 	}
 }
@@ -915,6 +950,58 @@ func TestShortGridPlacesReduceOnlyBuyAfterShortEntryFill(t *testing.T) {
 	}
 }
 
+func TestShortExitKeepsFixedTargetAndWaitsWhenTargetWouldCross(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 5
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(86.86, "86.86"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	slot := spm.getOrCreateSlot(86.87, BookSideShort)
+	slot.mu.Lock()
+	slot.BookSide = BookSideShort
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.23
+	slot.EntryPrice = 86.87
+	slot.SlotStatus = SlotStatusFree
+	slot.mu.Unlock()
+
+	if err := spm.AdjustOrders(86.84); err != nil {
+		t.Fatalf("unsafe AdjustOrders() error = %v", err)
+	}
+	for _, order := range executor.orders {
+		if order.Side == "BUY" && order.ReduceOnly {
+			t.Fatalf("unsafe fixed target should wait instead of moving farther, got BUY %.2f orders=%v", order.Price, executor.orders)
+		}
+	}
+
+	if err := spm.AdjustOrders(86.86); err != nil {
+		t.Fatalf("safe AdjustOrders() error = %v", err)
+	}
+	var matchingExit *OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "BUY" && order.ReduceOnly {
+			if order.Price != 86.85 {
+				t.Fatalf("expected fixed short exit target 86.85, got %.2f orders=%v", order.Price, executor.orders)
+			}
+			matchingExit = order
+		}
+	}
+	if matchingExit == nil {
+		t.Fatalf("expected fixed short exit BUY at 86.85 after target is maker-safe, orders=%v", executor.orders)
+	}
+}
+
 func TestShortExitQuotaProtectsEveryFilledSlot(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.App.MarketType = "futures"
@@ -964,7 +1051,7 @@ func TestShortExitQuotaProtectsEveryFilledSlot(t *testing.T) {
 		spm.OnOrderUpdate(OrderUpdate{OrderID: orderID, ClientOrderID: entry.ClientOrderID, Status: "FILLED", ExecutedQty: entry.Quantity, AvgPrice: entry.Price, Side: "SELL"})
 	}
 
-	if err := spm.AdjustOrders(86.76); err != nil {
+	if err := spm.AdjustOrders(86.79); err != nil {
 		t.Fatalf("post-fill AdjustOrders() error = %v", err)
 	}
 
@@ -1744,7 +1831,7 @@ func TestAdjustOrdersDoesNotPlaceNonPositiveEntryPrices(t *testing.T) {
 	}
 }
 
-func TestExitOrderMovesToMakerSafeGridWhenTargetWasCrossed(t *testing.T) {
+func TestExitOrderKeepsFixedTargetAndWaitsWhenCrossed(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "long"
@@ -1772,13 +1859,22 @@ func TestExitOrderMovesToMakerSafeGridWhenTargetWasCrossed(t *testing.T) {
 	}
 	for _, order := range executor.orders {
 		if order.Side == "SELL" && order.ReduceOnly {
-			if order.Price != 102 {
-				t.Fatalf("expected crossed exit target to move to maker-safe grid 102, got %.2f", order.Price)
+			t.Fatalf("crossed fixed target should wait instead of moving farther, got exit %.2f orders=%v", order.Price, executor.orders)
+		}
+	}
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("retry AdjustOrders() error = %v", err)
+	}
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && order.ReduceOnly {
+			if order.Price != 101 {
+				t.Fatalf("expected fixed exit target 101 after it becomes maker-safe, got %.2f orders=%v", order.Price, executor.orders)
 			}
 			return
 		}
 	}
-	t.Fatalf("expected reduce-only sell exit order, orders=%v", executor.orders)
+	t.Fatalf("expected reduce-only sell exit order at fixed target, orders=%v", executor.orders)
 }
 
 func TestLargeRestoredShortPositionIsSplitAndExitOrdersAreCapped(t *testing.T) {
@@ -2067,6 +2163,72 @@ func TestPositionSnapshotAddsRemoteShortDeltaNearCurrentGrid(t *testing.T) {
 	}
 }
 
+func TestSnapshotOpenShortExitAdoptsSlotBeforePositionRedistribution(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 100
+	cfg.Trading.MinOrderValue = 20
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 100
+
+	executor := &captureExecutor{}
+	exchange := seededExchange{positions: []*PositionInfo{{
+		Symbol:     "ETHUSDT",
+		Size:       -2,
+		EntryPrice: 100,
+		MarkPrice:  100,
+	}}}
+	spm := NewSuperPositionManager(cfg, executor, exchange, 2, 2)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	exitOID := spm.generateClientOrderID(101, "BUY", BookSideShort)
+	spm.ApplyExchangeSnapshot([]*PositionInfo{{
+		Symbol:     "ETHUSDT",
+		Size:       -2,
+		EntryPrice: 100,
+		MarkPrice:  100,
+	}}, []*Order{{
+		OrderID:       501,
+		ClientOrderID: exitOID,
+		Symbol:        "ETHUSDT",
+		Side:          "BUY",
+		Price:         99,
+		Quantity:      1,
+		Status:        OrderStatusConfirmed,
+	}})
+
+	localLong, localShort := spm.localPositionTotals()
+	if localLong != 0 || math.Abs(localShort-2) > 0.000001 {
+		t.Fatalf("expected snapshot reconcile to keep total short at remote size 2, got long=%.8f short=%.8f", localLong, localShort)
+	}
+
+	slot := spm.getOrCreateSlot(101, BookSideShort)
+	slot.mu.RLock()
+	status := slot.PositionStatus
+	qty := slot.PositionQty
+	orderID := slot.OrderID
+	orderSide := slot.OrderSide
+	slot.mu.RUnlock()
+	if status != PositionStatusFilled || math.Abs(qty-1) > 0.000001 || orderID != 501 || orderSide != "BUY" {
+		t.Fatalf("expected open reduce-only BUY snapshot to restore its encoded short slot, status=%s qty=%.8f orderID=%d side=%s",
+			status, qty, orderID, orderSide)
+	}
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	for _, order := range executor.orders {
+		if order.ClientOrderID == exitOID {
+			t.Fatalf("existing snapshot exit must not be duplicated, orders=%+v", executor.orders)
+		}
+	}
+}
+
 func TestAdjustOrdersPrioritizesExitOrdersOverEntries(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -2148,6 +2310,60 @@ func TestAdjustOrdersPlacesExitEvenWhenEntryThresholdIsFull(t *testing.T) {
 	}
 	if !exitSeen {
 		t.Fatalf("expected protective exit order, orders=%v", executor.orders)
+	}
+}
+
+func TestAdjustOrdersCancelsOrphanExitBeforeUsingExitQuota(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 100
+	cfg.Trading.BuyWindowSize = 1
+	cfg.Trading.SellWindowSize = 1
+	cfg.Trading.OrderCleanupThreshold = 100
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 2)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	orphan := spm.getOrCreateSlot(98, BookSideShort)
+	orphan.mu.Lock()
+	orphan.BookSide = BookSideShort
+	orphan.PositionStatus = PositionStatusEmpty
+	orphan.OrderID = 77
+	orphan.ClientOID = spm.generateClientOrderID(98, "BUY", BookSideShort)
+	orphan.OrderSide = "BUY"
+	orphan.OrderPrice = 96
+	orphan.OrderStatus = OrderStatusConfirmed
+	orphan.SlotStatus = SlotStatusLocked
+	orphan.mu.Unlock()
+
+	filled := spm.getOrCreateSlot(101, BookSideShort)
+	filled.mu.Lock()
+	filled.BookSide = BookSideShort
+	filled.PositionStatus = PositionStatusFilled
+	filled.PositionQty = 1
+	filled.SlotStatus = SlotStatusFree
+	filled.mu.Unlock()
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) != 1 || executor.canceled[0] != 77 {
+		t.Fatalf("expected orphan exit order 77 to be canceled before consuming quota, canceled=%v", executor.canceled)
+	}
+	foundProtectiveExit := false
+	for _, order := range executor.orders {
+		if order.Side == "BUY" && order.ReduceOnly && order.ClientOrderID != orphan.ClientOID {
+			foundProtectiveExit = true
+			break
+		}
+	}
+	if !foundProtectiveExit {
+		t.Fatalf("expected real filled short slot to get a reduce-only BUY after orphan cleanup, orders=%+v", executor.orders)
 	}
 }
 
@@ -2255,15 +2471,18 @@ func TestDirectionalPriceGridShiftRebalancesEntryWindow(t *testing.T) {
 	if err := spm.AdjustOrders(100); err != nil {
 		t.Fatalf("first AdjustOrders() error = %v", err)
 	}
+	ageActiveEntryOrders(spm, BookSideShort)
+	primeStableEntryWindowSync(t, spm, 95)
+	ordersBefore := len(executor.orders)
 	if err := spm.AdjustOrdersWithRebalance(95, true); err != nil {
 		t.Fatalf("price shift AdjustOrders() error = %v", err)
 	}
-	if len(executor.canceled) == 0 {
-		t.Fatalf("expected price-grid shift to cancel stale far entry orders, got none")
+	if len(executor.canceled) != 3 {
+		t.Fatalf("expected price-grid shift to cancel far entry orders, canceled=%v", executor.canceled)
 	}
 
 	wantSells := map[float64]bool{96: false, 97: false, 98: false}
-	for _, order := range executor.orders {
+	for _, order := range executor.orders[ordersBefore:] {
 		if order.Side != "SELL" || order.ReduceOnly {
 			continue
 		}
@@ -2273,12 +2492,156 @@ func TestDirectionalPriceGridShiftRebalancesEntryWindow(t *testing.T) {
 	}
 	for price, seen := range wantSells {
 		if !seen {
-			t.Fatalf("expected current short entry window to include %.2f, orders=%v", price, executor.orders)
+			t.Fatalf("expected shifted short entry order %.2f to be posted, new orders=%v", price, executor.orders[ordersBefore:])
 		}
 	}
 }
 
-func TestPriceGridShiftDoesNotChurnOnSubIntervalAnchoredTicks(t *testing.T) {
+func TestEntryWindowHoleCancelsOldFarEntryAndBackfillsNearSlot(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.OrderCleanupThreshold = 6
+	cfg.Trading.CleanupBatchSize = 10
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	slot101 := spm.getOrCreateSlot(101, BookSideShort)
+	slot101.mu.Lock()
+	slot101.PositionStatus = PositionStatusFilled
+	slot101.PositionQty = 0.3
+	slot101.SlotStatus = SlotStatusFree
+	clearSlotOrderTracking(slot101, OrderStatusFilled)
+	slot101.mu.Unlock()
+
+	if err := spm.AdjustOrdersWithRebalance(100, false); err != nil {
+		t.Fatalf("post-fill AdjustOrders() error = %v", err)
+	}
+
+	slot101.mu.Lock()
+	slot101.PositionStatus = PositionStatusEmpty
+	slot101.PositionQty = 0
+	slot101.SlotStatus = SlotStatusFree
+	clearSlotOrderTracking(slot101, OrderStatusFilled)
+	slot101.mu.Unlock()
+
+	slot104 := spm.getOrCreateSlot(104, BookSideShort)
+	slot104.mu.Lock()
+	farOrderID := slot104.OrderID
+	slot104.OrderCreatedAt = time.Now().Add(-entryWindowSyncMinAge - time.Second)
+	slot104.mu.Unlock()
+	if farOrderID == 0 {
+		t.Fatalf("expected far entry order at 104, orders=%v", executor.orders)
+	}
+
+	primeStableEntryWindowSync(t, spm, 100)
+	ordersBefore := len(executor.orders)
+	if err := spm.AdjustOrdersWithRebalance(100, true); err != nil {
+		t.Fatalf("hole repair AdjustOrders() error = %v", err)
+	}
+
+	foundCancel := false
+	for _, orderID := range executor.canceled {
+		if orderID == farOrderID {
+			foundCancel = true
+			break
+		}
+	}
+	if !foundCancel {
+		t.Fatalf("expected far entry order %d to be canceled, canceled=%v", farOrderID, executor.canceled)
+	}
+	foundBackfill := false
+	for _, order := range executor.orders[ordersBefore:] {
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price == 101 {
+			foundBackfill = true
+			break
+		}
+	}
+	if !foundBackfill {
+		t.Fatalf("expected near entry hole at 101 to be backfilled, new orders=%v", executor.orders[ordersBefore:])
+	}
+}
+
+func TestEntryWindowHoleRepairCancelsAllAvailableFarEntriesInOnePass(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 1
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	farOrderIDs := make(map[int64]bool)
+	for _, price := range []float64{104, 105} {
+		slot := spm.getOrCreateSlot(price, BookSideShort)
+		slot.mu.Lock()
+		if slot.OrderID == 0 {
+			slot.mu.Unlock()
+			t.Fatalf("expected far entry order at %.2f, orders=%v", price, executor.orders)
+		}
+		farOrderIDs[slot.OrderID] = false
+		slot.OrderCreatedAt = time.Now().Add(-entryWindowSyncMinAge - time.Second)
+		slot.mu.Unlock()
+	}
+
+	primeStableEntryWindowSync(t, spm, 98)
+	ordersBefore := len(executor.orders)
+	if err := spm.AdjustOrdersWithRebalance(98, true); err != nil {
+		t.Fatalf("hole repair AdjustOrders() error = %v", err)
+	}
+
+	if len(executor.canceled) != len(farOrderIDs) {
+		t.Fatalf("expected all far entries to be canceled in one pass despite cleanup batch size, canceled=%v", executor.canceled)
+	}
+	for _, orderID := range executor.canceled {
+		if _, ok := farOrderIDs[orderID]; ok {
+			farOrderIDs[orderID] = true
+		}
+	}
+	for orderID, seen := range farOrderIDs {
+		if !seen {
+			t.Fatalf("expected far entry order %d to be canceled, canceled=%v", orderID, executor.canceled)
+		}
+	}
+
+	backfilled := map[float64]bool{99: false, 100: false}
+	for _, order := range executor.orders[ordersBefore:] {
+		if order.Side == "SELL" && !order.ReduceOnly {
+			if _, ok := backfilled[order.Price]; ok {
+				backfilled[order.Price] = true
+			}
+		}
+	}
+	for price, seen := range backfilled {
+		if !seen {
+			t.Fatalf("expected near entry hole %.2f to be backfilled, new orders=%v", price, executor.orders[ordersBefore:])
+		}
+	}
+}
+
+func TestPriceGridShiftBackfillsNearestEntrySlot(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -2297,32 +2660,188 @@ func TestPriceGridShiftDoesNotChurnOnSubIntervalAnchoredTicks(t *testing.T) {
 	if err := spm.AdjustOrders(2266.32); err != nil {
 		t.Fatalf("initial AdjustOrders() error = %v", err)
 	}
+	ageActiveEntryOrders(spm, BookSideShort)
 
+	primeStableEntryWindowSync(t, spm, 2265.30)
+	ordersBefore := len(executor.orders)
 	if err := spm.AdjustOrdersWithRebalance(2265.30, true); err != nil {
 		t.Fatalf("first grid shift AdjustOrders() error = %v", err)
 	}
-	firstCancelCount := len(executor.canceled)
-	firstOrderCount := len(executor.orders)
-	if firstCancelCount == 0 {
-		t.Fatalf("expected full interval price shift to rebalance stale entry orders")
+	if len(executor.canceled) != 1 {
+		t.Fatalf("expected one far entry to be canceled on grid shift, canceled=%v", executor.canceled)
 	}
-
-	for _, price := range []float64{2265.55, 2265.44, 2265.37, 2265.24} {
-		if err := spm.AdjustOrdersWithRebalance(price, true); err != nil {
-			t.Fatalf("sub-interval AdjustOrders(%.2f) error = %v", price, err)
+	found := false
+	for _, order := range executor.orders[ordersBefore:] {
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price == 2266.32 {
+			found = true
+			break
 		}
 	}
-	if len(executor.canceled) != firstCancelCount {
-		t.Fatalf("expected anchored sub-interval ticks not to trigger more cancels, got before=%d after=%d canceled=%v",
-			firstCancelCount, len(executor.canceled), executor.canceled)
-	}
-	if len(executor.orders) != firstOrderCount {
-		t.Fatalf("expected anchored sub-interval ticks not to repost entries, got before=%d after=%d",
-			firstOrderCount, len(executor.orders))
+	if !found {
+		t.Fatalf("expected short entry window to backfill nearest slot 2266.32, new orders=%v", executor.orders[ordersBefore:])
 	}
 }
 
-func TestPriceGridShiftFollowsNearestGridBeforeRebalancing(t *testing.T) {
+func TestEntryWindowSyncWaitsForStableTargetBeforeCanceling(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+	ageActiveEntryOrders(spm, BookSideShort)
+
+	if err := spm.AdjustOrdersWithRebalance(110, true); err != nil {
+		t.Fatalf("first upward shift AdjustOrders() error = %v", err)
+	}
+	if err := spm.AdjustOrdersWithRebalance(100, true); err != nil {
+		t.Fatalf("oscillating back AdjustOrders() error = %v", err)
+	}
+	if err := spm.AdjustOrdersWithRebalance(110, true); err != nil {
+		t.Fatalf("second upward shift AdjustOrders() error = %v", err)
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("unstable entry window must not churn cancel/repost, canceled=%v", executor.canceled)
+	}
+}
+
+func TestShortEntryWindowDoesNotCancelCloserOrderForFarEdgeHole(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	if err := spm.Initialize(86.25, "86.2500"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.25); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+	ageActiveEntryOrders(spm, BookSideShort)
+
+	for i := 0; i < 3; i++ {
+		if err := spm.AdjustOrdersWithRebalance(86.26, true); err != nil {
+			t.Fatalf("up one tick AdjustOrdersWithRebalance() error = %v", err)
+		}
+		spm.mu.Lock()
+		spm.pendingEntryWindowSyncSeen = time.Now().Add(-entryWindowStableDuration - time.Second)
+		spm.mu.Unlock()
+	}
+	if len(executor.canceled) != 0 {
+		t.Fatalf("one-tick short rise must not cancel closer 86.26 order to fill far edge, canceled=%v", executor.canceled)
+	}
+}
+
+func TestShortEntryWindowSingleTickRollBackWaitsForFarStability(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 20
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	if err := spm.Initialize(86.46, "86.4600"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.46); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+	ageActiveEntryOrders(spm, BookSideShort)
+
+	primeFarStableEntryWindowSync(t, spm, 86.47)
+	if err := spm.AdjustOrdersWithRebalance(86.47, true); err != nil {
+		t.Fatalf("up one tick AdjustOrdersWithRebalance() error = %v", err)
+	}
+	if len(executor.canceled) != 1 {
+		t.Fatalf("expected one old edge entry to be canceled after far-stable upward roll, canceled=%v", executor.canceled)
+	}
+	firstCancelCount := len(executor.canceled)
+	ageActiveEntryOrders(spm, BookSideShort)
+	spm.mu.Lock()
+	spm.lastEntryWindowSync = time.Now().Add(-entryWindowSyncCooldown - time.Second)
+	spm.mu.Unlock()
+
+	if err := spm.AdjustOrdersWithRebalance(86.46, true); err != nil {
+		t.Fatalf("first roll-back AdjustOrdersWithRebalance() error = %v", err)
+	}
+	spm.mu.Lock()
+	spm.pendingEntryWindowSyncSeen = time.Now().Add(-entryWindowStableDuration - time.Second)
+	spm.mu.Unlock()
+	if err := spm.AdjustOrdersWithRebalance(86.46, true); err != nil {
+		t.Fatalf("second roll-back AdjustOrdersWithRebalance() error = %v", err)
+	}
+	if len(executor.canceled) != firstCancelCount {
+		t.Fatalf("single-tick rollback should wait for far stability before reversing edge order, canceled=%v", executor.canceled)
+	}
+}
+
+func TestEntryWindowStableRepairRunsDuringRegularAdjust(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 5
+	cfg.Trading.SellWindowSize = 5
+	cfg.Trading.OrderCleanupThreshold = 10
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 2, 3)
+	if err := spm.Initialize(100, "100.00"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+	ageActiveEntryOrders(spm, BookSideShort)
+
+	primeStableEntryWindowSync(t, spm, 98)
+	ordersBefore := len(executor.orders)
+	if err := spm.AdjustOrdersWithRebalance(98, false); err != nil {
+		t.Fatalf("regular AdjustOrdersWithRebalance() error = %v", err)
+	}
+
+	if len(executor.canceled) == 0 {
+		t.Fatalf("stable entry repair should run even on regular adjust")
+	}
+	foundBackfill := false
+	for _, order := range executor.orders[ordersBefore:] {
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price == 99 {
+			foundBackfill = true
+			break
+		}
+	}
+	if !foundBackfill {
+		t.Fatalf("expected regular adjust to backfill nearest short entry slot, new orders=%v", executor.orders[ordersBefore:])
+	}
+}
+
+func TestPriceGridShiftTracksNearestEntrySlotUpward(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "short"
@@ -2341,33 +2860,25 @@ func TestPriceGridShiftFollowsNearestGridBeforeRebalancing(t *testing.T) {
 	if err := spm.AdjustOrders(2273.41); err != nil {
 		t.Fatalf("initial AdjustOrders() error = %v", err)
 	}
+	ageActiveEntryOrders(spm, BookSideShort)
 
+	primeFarStableEntryWindowSync(t, spm, 2274.70)
+	ordersBefore := len(executor.orders)
 	if err := spm.AdjustOrdersWithRebalance(2274.70, true); err != nil {
 		t.Fatalf("full interval AdjustOrders() error = %v", err)
 	}
-	if len(executor.canceled) == 0 {
-		t.Fatalf("expected move from 2273.41 to 2274.41 to rebalance old window")
+	if len(executor.canceled) != 1 {
+		t.Fatalf("expected one old near entry to be canceled when grid moves upward, canceled=%v", executor.canceled)
 	}
-
-	cancelCount := len(executor.canceled)
-	orderCount := len(executor.orders)
-	if err := spm.AdjustOrdersWithRebalance(2274.83, true); err != nil {
-		t.Fatalf("same-grid AdjustOrders() error = %v", err)
+	found := false
+	for _, order := range executor.orders[ordersBefore:] {
+		if order.Side == "SELL" && !order.ReduceOnly && order.Price == 2279.41 {
+			found = true
+			break
+		}
 	}
-	if len(executor.canceled) != cancelCount {
-		t.Fatalf("expected same nearest grid not to cancel far entries, got before=%d after=%d canceled=%v",
-			cancelCount, len(executor.canceled), executor.canceled)
-	}
-	if len(executor.orders) != orderCount {
-		t.Fatalf("expected same nearest grid not to repost entries, got before=%d after=%d",
-			orderCount, len(executor.orders))
-	}
-
-	if err := spm.AdjustOrdersWithRebalance(2274.92, true); err != nil {
-		t.Fatalf("nearest-grid shift AdjustOrders() error = %v", err)
-	}
-	if len(executor.canceled) == cancelCount {
-		t.Fatalf("expected nearest-grid shift to rebalance stale entries")
+	if !found {
+		t.Fatalf("expected short entry window to extend to 2279.41, new orders=%v", executor.orders[ordersBefore:])
 	}
 }
 
@@ -2574,7 +3085,7 @@ func TestCleanupGhostOrderStatesClearsStalePendingWithoutIdentity(t *testing.T) 
 	}
 }
 
-func TestAdjustOrdersAllowsSamePriceReduceOnlyExitsWhenTargetsCollapse(t *testing.T) {
+func TestAdjustOrdersWaitsForUnsafeFixedExitTargets(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.Direction = "long"
@@ -2609,13 +3120,13 @@ func TestAdjustOrdersAllowsSamePriceReduceOnlyExitsWhenTargetsCollapse(t *testin
 	for _, order := range executor.orders {
 		if order.ReduceOnly && order.Side == "SELL" {
 			if order.Price != 102 {
-				t.Fatalf("expected collapsed maker-safe exits to stay at nearest target 102.00, got %.2f orders=%v", order.Price, executor.orders)
+				t.Fatalf("expected only maker-safe fixed target 102.00, got %.2f orders=%v", order.Price, executor.orders)
 			}
 			exitCountAtTarget++
 		}
 	}
-	if exitCountAtTarget != 3 {
-		t.Fatalf("expected all 3 reduce-only exits at the nearest maker-safe price, got %d orders=%v", exitCountAtTarget, executor.orders)
+	if exitCountAtTarget != 1 {
+		t.Fatalf("expected unsafe fixed targets to wait, got %d reduce-only exits orders=%v", exitCountAtTarget, executor.orders)
 	}
 }
 

@@ -234,6 +234,55 @@ func TestStopRobotKillsPidfileWorker(t *testing.T) {
 	}
 }
 
+func TestWorkerCommandUsesConfigOnlyMatchesDirectWorker(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	relConfig := filepath.Join("web_console_robots", "solusdc-----23cdab46.yaml")
+	targetConfig := filepath.Join(cwd, relConfig)
+
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "direct worker executable",
+			args: []string{"nexus-trade-bot", "worker", relConfig},
+			want: true,
+		},
+		{
+			name: "direct worker executable path",
+			args: []string{"./nexus-trade-bot", "worker", relConfig},
+			want: true,
+		},
+		{
+			name: "screen wrapper is not the worker process",
+			args: []string{"SCREEN", "-dmS", "nexus-solusdc", "./nexus-trade-bot", "worker", relConfig},
+			want: false,
+		},
+		{
+			name: "login wrapper is not the worker process",
+			args: []string{"login", "-pflq", "hu", "./nexus-trade-bot", "worker", relConfig},
+			want: false,
+		},
+		{
+			name: "wrong config",
+			args: []string{"nexus-trade-bot", "worker", filepath.Join("web_console_robots", "other.yaml")},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := workerCommandUsesConfig(tt.args, targetConfig); got != tt.want {
+				t.Fatalf("workerCommandUsesConfig(%q) = %v, want %v", strings.Join(tt.args, " "), got, tt.want)
+			}
+		})
+	}
+}
+
 type clearOpenOrdersExchange struct {
 	getCalls    int
 	cancelIDs   []int64

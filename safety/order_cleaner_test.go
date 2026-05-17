@@ -140,3 +140,89 @@ func TestCleanupOrdersDoesNotCancelPendingEntryWithoutOrderID(t *testing.T) {
 		t.Fatalf("expected cleaner to skip zero orderID and cancel real order only, got %v", executor.canceled)
 	}
 }
+
+func TestCleanupOrdersDoesNotCancelProtectedShortEntryWindowWhenExitOrdersRaiseQuota(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+	cfg.Trading.CleanupBatchSize = 20
+
+	slots := make([]cleanerSlot, 0, 54)
+	for i := 0; i < 44; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:          86 - float64(i)*0.01,
+			BookSide:       "SHORT",
+			OrderID:        int64(i + 1),
+			OrderSide:      "BUY",
+			OrderStatus:    "PLACED",
+			PositionStatus: "FILLED",
+			PositionQty:    0.34,
+		})
+	}
+	for i := 0; i < 10; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:       86.43 + float64(i)*0.01,
+			BookSide:    "SHORT",
+			OrderID:     int64(100 + i),
+			OrderSide:   "SELL",
+			OrderStatus: "PLACED",
+		})
+	}
+	pm := &fakeCleanerPM{slots: slots}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	if len(executor.canceled) != 0 {
+		t.Fatalf("expected protected 10-slot short entry window to remain intact, canceled %v", executor.canceled)
+	}
+}
+
+func TestCleanupOrdersCancelsOnlyExcessShortEntriesAboveProtectedCapacity(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 50
+	cfg.Trading.CleanupBatchSize = 20
+
+	slots := make([]cleanerSlot, 0, 56)
+	for i := 0; i < 44; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:          86 - float64(i)*0.01,
+			BookSide:       "SHORT",
+			OrderID:        int64(i + 1),
+			OrderSide:      "BUY",
+			OrderStatus:    "PLACED",
+			PositionStatus: "FILLED",
+			PositionQty:    0.34,
+		})
+	}
+	for i := 0; i < 12; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:       86.43 + float64(i)*0.01,
+			BookSide:    "SHORT",
+			OrderID:     int64(100 + i),
+			OrderSide:   "SELL",
+			OrderStatus: "PLACED",
+		})
+	}
+	pm := &fakeCleanerPM{slots: slots}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	want := []int64{111, 110}
+	if len(executor.canceled) != len(want) {
+		t.Fatalf("expected to cancel %d excess short entries, got %v", len(want), executor.canceled)
+	}
+	for i := range want {
+		if executor.canceled[i] != want[i] {
+			t.Fatalf("expected to cancel farthest excess short entries %v, got %v", want, executor.canceled)
+		}
+	}
+}

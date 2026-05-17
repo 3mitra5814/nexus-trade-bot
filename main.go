@@ -43,6 +43,75 @@ func newAdjustRequestScheduler() *adjustRequestScheduler {
 	return &adjustRequestScheduler{signals: make(chan struct{}, 1)}
 }
 
+func nearestGridPrice(currentPrice, anchorPrice, priceInterval float64, priceDecimals int) float64 {
+	if currentPrice <= 0 {
+		return 0
+	}
+	currentPrice = roundToDecimals(currentPrice, priceDecimals)
+	if priceInterval <= 0 || anchorPrice <= 0 {
+		return currentPrice
+	}
+	intervals := math.Round((currentPrice - anchorPrice) / priceInterval)
+	gridPrice := anchorPrice + intervals*priceInterval
+	return roundToDecimals(gridPrice, priceDecimals)
+}
+
+func roundToDecimals(value float64, decimals int) float64 {
+	if decimals < 0 {
+		decimals = 0
+	}
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Round(value*multiplier) / multiplier
+}
+
+func acquireWorkerConfigLock(configPath string) (*os.File, string, error) {
+	lockPath, err := workerConfigLockPath(configPath)
+	if err != nil {
+		return nil, "", err
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, "", fmt.Errorf("打开 worker 锁文件失败: %w", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		return nil, "", fmt.Errorf("锁文件 %s 已被占用", lockPath)
+	}
+	if err := lockFile.Truncate(0); err != nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		return nil, "", fmt.Errorf("清空 worker 锁文件失败: %w", err)
+	}
+	if _, err := lockFile.WriteString(fmt.Sprintf("%d\n", os.Getpid())); err != nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		return nil, "", fmt.Errorf("写入 worker 锁文件失败: %w", err)
+	}
+	return lockFile, lockPath, nil
+}
+
+func workerConfigLockPath(configPath string) (string, error) {
+	absPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", err
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = resolvedPath
+	}
+	return absPath + ".lock", nil
+}
+
+func releaseWorkerConfigLock(lockFile *os.File, lockPath string) {
+	if lockFile == nil {
+		return
+	}
+	_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	_ = lockFile.Close()
+	if lockPath != "" {
+		_ = os.Remove(lockPath)
+	}
+}
+
 func (s *adjustRequestScheduler) Schedule(reason string, allowWindowRebalance bool) {
 	s.mu.Lock()
 	if s.hasWork {
@@ -101,6 +170,11 @@ func main() {
 		if len(os.Args) > 2 {
 			configPath = os.Args[2]
 		}
+		lockFile, lockPath, err := acquireWorkerConfigLock(configPath)
+		if err != nil {
+			logger.Fatalf("❌ 同一配置已有 worker 正在运行，拒绝重复启动: %v", err)
+		}
+		defer releaseWorkerConfigLock(lockFile, lockPath)
 		runTrader(configPath)
 		return
 	}
@@ -316,6 +390,31 @@ func runTrader(configPath string) {
 		}
 		adjustScheduler.Schedule(reason, allowWindowRebalance)
 	}
+	var delayedRebalanceMu sync.Mutex
+	var delayedRebalanceTimer *time.Timer
+	var delayedRebalanceSettleTimer *time.Timer
+	var delayedRebalanceRetryTimer *time.Timer
+	var delayedRebalanceFinalTimer *time.Timer
+	scheduleDelayedRebalance := func(reason string) {
+		delayedRebalanceMu.Lock()
+		scheduleTimer := func(timer **time.Timer, delay time.Duration, suffix string) {
+			if *timer != nil {
+				return
+			}
+			*timer = time.AfterFunc(delay, func() {
+				delayedRebalanceMu.Lock()
+				*timer = nil
+				delayedRebalanceMu.Unlock()
+				scheduleAdjust(reason+suffix, true)
+			})
+		}
+		scheduleTimer(&delayedRebalanceTimer, 1*time.Second, "")
+		// 开仓窗口同步需要短暂确认目标窗口；连续价格跳动不能把复查无限推后。
+		scheduleTimer(&delayedRebalanceSettleTimer, 3*time.Second, "-stable")
+		scheduleTimer(&delayedRebalanceRetryTimer, 6*time.Second, "-stable-retry")
+		scheduleTimer(&delayedRebalanceFinalTimer, 15*time.Second, "-stable-final")
+		delayedRebalanceMu.Unlock()
+	}
 	go func() {
 		defer recoverAndLog("订单调整调度")
 		for {
@@ -464,8 +563,10 @@ func runTrader(configPath string) {
 	riskMonitor.Start(ctx)
 	if !riskMonitor.IsTriggered() {
 		scheduleAdjust("initial", true)
+		scheduleDelayedRebalance("initial-followup")
 	}
-	lastGridAdjustPrice := currentPrice
+	priceAnchor := currentPrice
+	lastGridAdjustPrice := nearestGridPrice(currentPrice, priceAnchor, cfg.Trading.PriceInterval, priceDecimals)
 
 	// 启动持仓对账（使用独立的 Reconciler）
 	reconciler.Start(ctx)
@@ -516,15 +617,20 @@ func runTrader(configPath string) {
 				if lastTriggered {
 					logger.Info("✅ [风控解除] 市场恢复正常，恢复自动交易")
 					lastTriggered = false
-					lastGridAdjustPrice = priceEvent.NewPrice
+					lastGridAdjustPrice = nearestGridPrice(priceEvent.NewPrice, priceAnchor, priceInterval, priceDecimals)
 					scheduleAdjust("risk-recovered", true)
+					scheduleDelayedRebalance("risk-recovered-followup")
 					return
 				}
 
-				// 价格流只在跨过完整网格间隔时触发补单；跨格时允许重平衡，把远端旧窗口撤掉再补新窗口。
-				if priceInterval > 0 && priceEvent.NewPrice > 0 && math.Abs(priceEvent.NewPrice-lastGridAdjustPrice) >= priceInterval {
-					lastGridAdjustPrice = priceEvent.NewPrice
-					scheduleAdjust("price-grid-shift", true)
+				// 价格流按网格价换档触发补单；这样 86.9401 这类贴近边界的价格也会立即换到 86.94 网格。
+				if priceInterval > 0 && priceEvent.NewPrice > 0 {
+					currentGridPrice := nearestGridPrice(priceEvent.NewPrice, priceAnchor, priceInterval, priceDecimals)
+					if currentGridPrice != lastGridAdjustPrice {
+						lastGridAdjustPrice = currentGridPrice
+						scheduleAdjust("price-grid-shift", true)
+						scheduleDelayedRebalance("price-grid-shift-followup")
+					}
 				}
 			})
 		}

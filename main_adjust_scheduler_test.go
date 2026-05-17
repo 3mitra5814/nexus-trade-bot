@@ -49,3 +49,18 @@ func TestAdjustRequestSchedulerSignalsAgainAfterPop(t *testing.T) {
 		t.Fatalf("unexpected second request: %+v", req)
 	}
 }
+
+func TestNearestGridPriceTriggersOnRoundedGridBoundary(t *testing.T) {
+	anchor := 86.95
+	interval := 0.01
+
+	got := nearestGridPrice(86.9401, anchor, interval, 4)
+	if got != 86.94 {
+		t.Fatalf("expected rounded grid 86.94, got %.4f", got)
+	}
+
+	got = nearestGridPrice(86.9499, anchor, interval, 4)
+	if got != 86.95 {
+		t.Fatalf("expected rounded grid 86.95, got %.4f", got)
+	}
+}

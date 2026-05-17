@@ -1750,9 +1750,12 @@ func findWorkerPIDsForConfig(configPath string) []int {
 	if configPath == "" {
 		return nil
 	}
-	absPath, err := filepath.Abs(configPath)
+	targetAbsPath, err := filepath.Abs(configPath)
 	if err == nil {
-		configPath = absPath
+		configPath = targetAbsPath
+		if resolvedPath, err := filepath.EvalSymlinks(targetAbsPath); err == nil {
+			configPath = resolvedPath
+		}
 	}
 	out, err := exec.Command("ps", "ax", "-o", "pid=,command=").Output()
 	if err != nil {
@@ -1774,8 +1777,7 @@ func findWorkerPIDsForConfig(configPath string) []int {
 		if err != nil || pid <= 0 || pid == currentPID {
 			continue
 		}
-		cmdline := strings.Join(fields[1:], " ")
-		if !strings.Contains(cmdline, "worker") || !strings.Contains(cmdline, configPath) {
+		if !workerCommandUsesConfig(fields[1:], configPath) {
 			continue
 		}
 		if processAlive(pid) {
@@ -1784,6 +1786,40 @@ func findWorkerPIDsForConfig(configPath string) []int {
 	}
 	sort.Ints(pids)
 	return pids
+}
+
+func workerCommandUsesConfig(args []string, targetConfigPath string) bool {
+	if len(args) < 3 || !isNexusWorkerExecutable(args[0]) || args[1] != "worker" {
+		return false
+	}
+	return workerConfigArgMatches(args[2], targetConfigPath)
+}
+
+func isNexusWorkerExecutable(arg string) bool {
+	arg = strings.Trim(strings.TrimSpace(arg), `"'`)
+	if arg == "" {
+		return false
+	}
+	base := filepath.Base(arg)
+	return base == "nexus-trade-bot" || base == "nexus-trade-bot.exe"
+}
+
+func workerConfigArgMatches(arg, targetConfigPath string) bool {
+	arg = strings.Trim(strings.TrimSpace(arg), `"'`)
+	if arg == "" || targetConfigPath == "" {
+		return false
+	}
+	if filepath.Clean(arg) == filepath.Clean(targetConfigPath) {
+		return true
+	}
+	argAbsPath, err := filepath.Abs(arg)
+	if err != nil {
+		return false
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(argAbsPath); err == nil {
+		argAbsPath = resolvedPath
+	}
+	return filepath.Clean(argAbsPath) == filepath.Clean(targetConfigPath)
 }
 
 func appendMissingPIDs(dst []int, src []int, exclude ...int) []int {
