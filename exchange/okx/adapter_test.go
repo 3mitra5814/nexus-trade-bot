@@ -47,3 +47,15 @@ func TestPosSideForOKXOrder(t *testing.T) {
 		})
 	}
 }
+
+func TestOKXCancelOrderGoneErrorClassification(t *testing.T) {
+	if !isOKXCancelOrderGoneError("51603", "Order does not exist") {
+		t.Fatal("expected OKX 51603 to be treated as cancel already complete")
+	}
+	if !isOKXCancelOrderGoneError("", "The order has been filled or canceled") {
+		t.Fatal("expected filled/canceled message to be treated as cancel already complete")
+	}
+	if isOKXCancelOrderGoneError("50011", "Too many requests") {
+		t.Fatal("rate limit error must not be treated as cancel success")
+	}
+}

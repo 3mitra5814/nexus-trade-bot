@@ -265,6 +265,49 @@ func primeEntryWindowSync(t *testing.T, spm *SuperPositionManager, currentPrice 
 	spm.mu.Unlock()
 }
 
+func countActiveOrdersBySide(spm *SuperPositionManager) (total, buy, sell int) {
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if !spm.slotHasActiveOrder(slot) {
+			return true
+		}
+		total++
+		switch slot.OrderSide {
+		case "BUY":
+			buy++
+		case "SELL":
+			sell++
+		}
+		return true
+	})
+	return total, buy, sell
+}
+
+func closestEntryPrices(spm *SuperPositionManager) (bestBuy, bestSell float64) {
+	spm.slots.Range(func(key, value interface{}) bool {
+		slot := value.(*InventorySlot)
+		slot.mu.RLock()
+		defer slot.mu.RUnlock()
+		if !spm.slotHasActiveOrder(slot) || !spm.isEntryOrder(slot.OrderSide, slot.BookSide) {
+			return true
+		}
+		switch slot.OrderSide {
+		case "BUY":
+			if bestBuy == 0 || slot.OrderPrice > bestBuy {
+				bestBuy = slot.OrderPrice
+			}
+		case "SELL":
+			if bestSell == 0 || slot.OrderPrice < bestSell {
+				bestSell = slot.OrderPrice
+			}
+		}
+		return true
+	})
+	return bestBuy, bestSell
+}
+
 func TestTerminalCanceledUpdateAppliesFilledDelta(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.Symbol = "ETHUSDT"
@@ -2997,6 +3040,152 @@ func TestAggressiveModeKeepsDirectionalEntryOrdersOnGridShift(t *testing.T) {
 	}
 	if len(executor.canceled) != 0 {
 		t.Fatalf("aggressive mode should keep old directional entry orders, got canceled=%v", executor.canceled)
+	}
+}
+
+func TestClassicModeSkipsEntryWindowStableWait(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "classic"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.01
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 100
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	if err := spm.Initialize(86.46, "86.4600"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.46); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+	ageActiveEntryOrders(spm, BookSideShort)
+
+	if err := spm.AdjustOrdersWithRebalance(86.47, true); err != nil {
+		t.Fatalf("classic mode AdjustOrdersWithRebalance() error = %v", err)
+	}
+	if len(executor.canceled) == 0 {
+		t.Fatalf("classic mode should not wait entry window stability before repairing holes, canceled=%v", executor.canceled)
+	}
+}
+
+func TestClassicModeIgnoresLegacyWindowConfigAndKeepsHundredOrders(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "classic"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.02
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 200
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	if err := spm.Initialize(86.36, "86.3600"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.36); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	total, buys, sells := countActiveOrdersBySide(spm)
+	if total != 100 || buys != 50 || sells != 50 {
+		t.Fatalf("classic grid must ignore legacy 10/10 windows and keep BUY=50 SELL=50, got total=%d buy=%d sell=%d", total, buys, sells)
+	}
+}
+
+func TestClassicModeKeepsHundredOrdersAndBalancedSides(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "classic"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.PriceInterval = 0.02
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 50
+	cfg.Trading.SellWindowSize = 50
+	cfg.Trading.OrderCleanupThreshold = 200
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	if err := spm.Initialize(86.36, "86.3600"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.36); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+
+	total, buys, sells := countActiveOrdersBySide(spm)
+	if total != 100 || buys != 50 || sells != 50 {
+		t.Fatalf("classic grid must keep exactly 100 active orders with BUY=50 SELL=50, got total=%d buy=%d sell=%d", total, buys, sells)
+	}
+	bestBuy, bestSell := closestEntryPrices(spm)
+	if math.Abs((bestSell-bestBuy)-0.04) > 1e-9 {
+		t.Fatalf("expected first BUY/SELL gap to remain 0.04, got buy=%.4f sell=%.4f gap=%.4f", bestBuy, bestSell, bestSell-bestBuy)
+	}
+}
+
+func TestClassicModeRefillsOppositeOrderAfterEntryFillWithinHundredOrderBudget(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "classic"
+	cfg.Trading.Symbol = "SOLUSDC"
+	cfg.Trading.Direction = "neutral"
+	cfg.Trading.PriceInterval = 0.02
+	cfg.Trading.OrderQuantity = 30
+	cfg.Trading.BuyWindowSize = 50
+	cfg.Trading.SellWindowSize = 50
+	cfg.Trading.OrderCleanupThreshold = 200
+	cfg.Trading.CleanupBatchSize = 20
+
+	executor := &captureExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, noopExchange{}, 4, 2)
+	if err := spm.Initialize(86.36, "86.3600"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := spm.AdjustOrders(86.36); err != nil {
+		t.Fatalf("initial AdjustOrders() error = %v", err)
+	}
+
+	var shortEntry *OrderRequest
+	for _, order := range executor.orders {
+		if order.Side == "SELL" && !order.ReduceOnly {
+			shortEntry = order
+			break
+		}
+	}
+	if shortEntry == nil {
+		t.Fatalf("expected initial short entry order, got %v", executor.orders)
+	}
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 7001, ClientOrderID: shortEntry.ClientOrderID, Status: "NEW", Side: "SELL", Price: shortEntry.Price})
+	if !spm.OnOrderUpdate(OrderUpdate{OrderID: 7001, ClientOrderID: shortEntry.ClientOrderID, Status: "FILLED", ExecutedQty: shortEntry.Quantity, AvgPrice: shortEntry.Price, Side: "SELL"}) {
+		t.Fatalf("expected FILLED update to request adjust")
+	}
+
+	ordersBefore := len(executor.orders)
+	if err := spm.AdjustOrdersWithRebalance(86.36, true); err != nil {
+		t.Fatalf("post-fill AdjustOrdersWithRebalance() error = %v", err)
+	}
+	total, buys, sells := countActiveOrdersBySide(spm)
+	if total > 100 || buys > 50 || sells > 50 {
+		t.Fatalf("classic post-fill budget exceeded: total=%d buy=%d sell=%d", total, buys, sells)
+	}
+	var matchingExit, replacementEntry bool
+	for _, order := range executor.orders[ordersBefore:] {
+		if order.Side == "BUY" && order.ReduceOnly && math.Abs(order.Price-(shortEntry.Price-0.04)) <= 1e-9 {
+			matchingExit = true
+		}
+		if order.Side == "SELL" && !order.ReduceOnly {
+			replacementEntry = true
+		}
+	}
+	if !matchingExit || !replacementEntry {
+		t.Fatalf("expected immediate reduce-only BUY exit and SELL replacement entry, matchingExit=%v replacementEntry=%v newOrders=%v", matchingExit, replacementEntry, executor.orders[ordersBefore:])
 	}
 }
 

@@ -80,14 +80,20 @@ type Order struct {
 }
 
 type Position struct {
-	Symbol         string
-	Size           float64
-	EntryPrice     float64
-	MarkPrice      float64
-	UnrealizedPNL  float64
-	Leverage       int
-	MarginType     string
-	IsolatedMargin float64
+	Symbol           string
+	Size             float64
+	EntryPrice       float64
+	MarkPrice        float64
+	UnrealizedPNL    float64
+	HasUnrealizedPNL bool
+	RealizedPNL      float64
+	HasRealizedPNL   bool
+	ClosedPNL        float64
+	FundingFee       float64
+	TradingFee       float64
+	Leverage         int
+	MarginType       string
+	IsolatedMargin   float64
 }
 
 type Account struct {
@@ -375,6 +381,10 @@ func (o *OKXAdapter) CancelOrder(ctx context.Context, symbol string, orderID int
 
 	resp, err := o.client.DoSignedRequest(ctx, http.MethodPost, "/api/v5/trade/cancel-order", nil, body)
 	if err != nil {
+		if isOKXCancelOrderGoneError("", err.Error()) {
+			logger.Info("ℹ️ [OKX] 订单 %d 已不存在或已完成，跳过取消", orderID)
+			return nil
+		}
 		return err
 	}
 	var result []struct {
@@ -385,6 +395,10 @@ func (o *OKXAdapter) CancelOrder(ctx context.Context, symbol string, orderID int
 		return fmt.Errorf("解析 OKX 撤单响应失败: %w", err)
 	}
 	if len(result) > 0 && result[0].SCode != "" && result[0].SCode != "0" {
+		if isOKXCancelOrderGoneError(result[0].SCode, result[0].SMsg) {
+			logger.Info("ℹ️ [OKX] 订单 %d 已不存在或已完成，跳过取消", orderID)
+			return nil
+		}
 		return fmt.Errorf("OKX 撤单失败: code=%s, msg=%s", result[0].SCode, result[0].SMsg)
 	}
 	return nil
@@ -533,15 +547,16 @@ func (o *OKXAdapter) GetPositions(ctx context.Context, symbol string) ([]*Positi
 	}
 
 	var result []struct {
-		InstID  string `json:"instId"`
-		Pos     string `json:"pos"`
-		PosSide string `json:"posSide"`
-		AvgPx   string `json:"avgPx"`
-		MarkPx  string `json:"markPx"`
-		Upl     string `json:"upl"`
-		Lever   string `json:"lever"`
-		MgnMode string `json:"mgnMode"`
-		Imr     string `json:"imr"`
+		InstID      string `json:"instId"`
+		Pos         string `json:"pos"`
+		PosSide     string `json:"posSide"`
+		AvgPx       string `json:"avgPx"`
+		MarkPx      string `json:"markPx"`
+		Upl         string `json:"upl"`
+		RealizedPnl string `json:"realizedPnl"`
+		Lever       string `json:"lever"`
+		MgnMode     string `json:"mgnMode"`
+		Imr         string `json:"imr"`
 	}
 	if err := json.Unmarshal(resp.Data, &result); err != nil {
 		return nil, fmt.Errorf("解析 OKX 持仓失败: %w", err)
@@ -557,14 +572,18 @@ func (o *OKXAdapter) GetPositions(ctx context.Context, symbol string) ([]*Positi
 			continue
 		}
 		positions = append(positions, &Position{
-			Symbol:         fromOKXInstrument(item.InstID),
-			Size:           size,
-			EntryPrice:     parseFloat(item.AvgPx),
-			MarkPrice:      parseFloat(item.MarkPx),
-			UnrealizedPNL:  parseFloat(item.Upl),
-			Leverage:       parseInt(item.Lever),
-			MarginType:     item.MgnMode,
-			IsolatedMargin: parseFloat(item.Imr),
+			Symbol:           fromOKXInstrument(item.InstID),
+			Size:             size,
+			EntryPrice:       parseFloat(item.AvgPx),
+			MarkPrice:        parseFloat(item.MarkPx),
+			UnrealizedPNL:    parseFloat(item.Upl),
+			HasUnrealizedPNL: true,
+			RealizedPNL:      parseFloat(item.RealizedPnl),
+			HasRealizedPNL:   item.RealizedPnl != "",
+			ClosedPNL:        parseFloat(item.RealizedPnl),
+			Leverage:         parseInt(item.Lever),
+			MarginType:       item.MgnMode,
+			IsolatedMargin:   parseFloat(item.Imr),
 		})
 	}
 	return positions, nil
@@ -923,6 +942,24 @@ func orderTypeToOKX(orderType OrderType, timeInForce TimeInForce, postOnly bool)
 	default:
 		return "limit"
 	}
+}
+
+func isOKXCancelOrderGoneError(code, msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	if strings.TrimSpace(code) == "51603" {
+		return true
+	}
+	return strings.Contains(lower, "order does not exist") ||
+		strings.Contains(lower, "order doesn't exist") ||
+		strings.Contains(lower, "not exist") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "already canceled") ||
+		strings.Contains(lower, "already cancelled") ||
+		strings.Contains(lower, "has been canceled") ||
+		strings.Contains(lower, "has been cancelled") ||
+		strings.Contains(lower, "has been filled") ||
+		strings.Contains(lower, "filled or canceled") ||
+		strings.Contains(lower, "filled or cancelled")
 }
 
 func mapOrderTypeFromOKX(orderType string) OrderType {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"nexus-trade-bot/exchange/binance"
 	"nexus-trade-bot/utils"
+	"time"
 )
 
 type binanceAdapter interface {
@@ -207,14 +208,20 @@ func (w *binanceWrapper) GetAccount(ctx context.Context) (*Account, error) {
 	positions := make([]*Position, len(binanceAccount.Positions))
 	for i, pos := range binanceAccount.Positions {
 		positions[i] = &Position{
-			Symbol:         pos.Symbol,
-			Size:           pos.Size,
-			EntryPrice:     pos.EntryPrice,
-			MarkPrice:      pos.MarkPrice,
-			UnrealizedPNL:  pos.UnrealizedPNL,
-			Leverage:       pos.Leverage,
-			MarginType:     pos.MarginType,
-			IsolatedMargin: pos.IsolatedMargin,
+			Symbol:           pos.Symbol,
+			Size:             pos.Size,
+			EntryPrice:       pos.EntryPrice,
+			MarkPrice:        pos.MarkPrice,
+			UnrealizedPNL:    pos.UnrealizedPNL,
+			HasUnrealizedPNL: pos.HasUnrealizedPNL,
+			RealizedPNL:      pos.RealizedPNL,
+			HasRealizedPNL:   pos.HasRealizedPNL,
+			ClosedPNL:        pos.ClosedPNL,
+			FundingFee:       pos.FundingFee,
+			TradingFee:       pos.TradingFee,
+			Leverage:         pos.Leverage,
+			MarginType:       pos.MarginType,
+			IsolatedMargin:   pos.IsolatedMargin,
 		}
 	}
 
@@ -235,18 +242,46 @@ func (w *binanceWrapper) GetPositions(ctx context.Context, symbol string) ([]*Po
 	positions := make([]*Position, len(binancePositions))
 	for i, pos := range binancePositions {
 		positions[i] = &Position{
-			Symbol:         pos.Symbol,
-			Size:           pos.Size,
-			EntryPrice:     pos.EntryPrice,
-			MarkPrice:      pos.MarkPrice,
-			UnrealizedPNL:  pos.UnrealizedPNL,
-			Leverage:       pos.Leverage,
-			MarginType:     pos.MarginType,
-			IsolatedMargin: pos.IsolatedMargin,
+			Symbol:           pos.Symbol,
+			Size:             pos.Size,
+			EntryPrice:       pos.EntryPrice,
+			MarkPrice:        pos.MarkPrice,
+			UnrealizedPNL:    pos.UnrealizedPNL,
+			HasUnrealizedPNL: pos.HasUnrealizedPNL,
+			RealizedPNL:      pos.RealizedPNL,
+			HasRealizedPNL:   pos.HasRealizedPNL,
+			ClosedPNL:        pos.ClosedPNL,
+			FundingFee:       pos.FundingFee,
+			TradingFee:       pos.TradingFee,
+			Leverage:         pos.Leverage,
+			MarginType:       pos.MarginType,
+			IsolatedMargin:   pos.IsolatedMargin,
 		}
 	}
 
 	return positions, nil
+}
+
+func (w *binanceWrapper) GetPNLSummary(ctx context.Context, symbol string, startTime, endTime, todayStart time.Time) (*PNLSummary, error) {
+	provider, ok := w.adapter.(interface {
+		GetPNLSummary(context.Context, string, time.Time, time.Time, time.Time) (*binance.PNLSummary, error)
+	})
+	if !ok {
+		return nil, nil
+	}
+	summary, err := provider.GetPNLSummary(ctx, symbol, startTime, endTime, todayStart)
+	if err != nil || summary == nil {
+		return nil, err
+	}
+	return &PNLSummary{
+		TotalRealizedPNL:    summary.TotalRealizedPNL,
+		TodayRealizedPNL:    summary.TodayRealizedPNL,
+		ClosedPNL:           summary.ClosedPNL,
+		FundingFee:          summary.FundingFee,
+		TradingFee:          summary.TradingFee,
+		HasTotalRealizedPNL: summary.HasTotalRealizedPNL,
+		HasTodayRealizedPNL: summary.HasTodayRealizedPNL,
+	}, nil
 }
 
 func (w *binanceWrapper) ValidatePositionMode(ctx context.Context, direction string) error {

@@ -52,6 +52,10 @@ func NewOrderCleaner(cfg *config.Config, executor IOrderExecutor, pm IOrderClean
 	}
 }
 
+func (oc *OrderCleaner) isClassicMode() bool {
+	return oc != nil && oc.cfg != nil && strings.EqualFold(strings.TrimSpace(oc.cfg.Trading.Mode), "classic")
+}
+
 // Start 启动订单清理协程
 func (oc *OrderCleaner) Start(ctx context.Context) {
 	go func() {
@@ -189,9 +193,16 @@ func (oc *OrderCleaner) CleanupOrders() {
 	if protectedExitCapacity < filledSlotsNeedingExit {
 		protectedExitCapacity = filledSlotsNeedingExit
 	}
-	strategyCapacity := protectedExitCapacity + longEntryCapacity + shortEntryCapacity
-	if threshold < strategyCapacity {
-		threshold = strategyCapacity
+	if oc.isClassicMode() {
+		threshold = config.TargetOrderCapacity(oc.cfg)
+		if threshold <= 0 {
+			threshold = rawThreshold
+		}
+	} else {
+		strategyCapacity := protectedExitCapacity + longEntryCapacity + shortEntryCapacity
+		if threshold < strategyCapacity {
+			threshold = strategyCapacity
+		}
 	}
 
 	batchSize := oc.cfg.Trading.CleanupBatchSize
@@ -214,37 +225,42 @@ func (oc *OrderCleaner) CleanupOrders() {
 
 		longOrdersToCancel := 0
 		shortOrdersToCancel := 0
-		longExcessEntries := len(longEntryOrders) - longEntryCapacity
-		if longExcessEntries < 0 {
-			longExcessEntries = 0
-		}
-		shortExcessEntries := len(shortEntryOrders) - shortEntryCapacity
-		if shortExcessEntries < 0 {
-			shortExcessEntries = 0
-		}
-
-		if longExcessEntries > shortExcessEntries {
-			longOrdersToCancel = cleanupBudget
-			if longOrdersToCancel > longExcessEntries {
-				longOrdersToCancel = longExcessEntries
-			}
-			logger.Info("📊 [清理策略] 多头开仓单较多，清理 %d 个多头开仓单", longOrdersToCancel)
-		} else if shortExcessEntries > longExcessEntries {
-			shortOrdersToCancel = cleanupBudget
-			if shortOrdersToCancel > shortExcessEntries {
-				shortOrdersToCancel = shortExcessEntries
-			}
-			logger.Info("📊 [清理策略] 空头开仓单较多，清理 %d 个空头开仓单", shortOrdersToCancel)
+		if oc.isClassicMode() {
+			longOrdersToCancel, shortOrdersToCancel = classicCleanupSplit(cleanupBudget, len(longEntryOrders), len(shortEntryOrders), longEntryCapacity, shortEntryCapacity)
+			logger.Info("📊 [经典网格清理策略] 固定总阈值 %d，清理远端开仓单 (多头: %d, 空头: %d)，平仓保护不撤", threshold, longOrdersToCancel, shortOrdersToCancel)
 		} else {
-			longOrdersToCancel = cleanupBudget / 2
-			if longOrdersToCancel > longExcessEntries {
-				longOrdersToCancel = longExcessEntries
+			longExcessEntries := len(longEntryOrders) - longEntryCapacity
+			if longExcessEntries < 0 {
+				longExcessEntries = 0
 			}
-			shortOrdersToCancel = cleanupBudget - longOrdersToCancel
-			if shortOrdersToCancel > shortExcessEntries {
-				shortOrdersToCancel = shortExcessEntries
+			shortExcessEntries := len(shortEntryOrders) - shortEntryCapacity
+			if shortExcessEntries < 0 {
+				shortExcessEntries = 0
 			}
-			logger.Info("📊 [清理策略] 多空开仓单数量相等，平均清理 (多头: %d, 空头: %d)", longOrdersToCancel, shortOrdersToCancel)
+
+			if longExcessEntries > shortExcessEntries {
+				longOrdersToCancel = cleanupBudget
+				if longOrdersToCancel > longExcessEntries {
+					longOrdersToCancel = longExcessEntries
+				}
+				logger.Info("📊 [清理策略] 多头开仓单较多，清理 %d 个多头开仓单", longOrdersToCancel)
+			} else if shortExcessEntries > longExcessEntries {
+				shortOrdersToCancel = cleanupBudget
+				if shortOrdersToCancel > shortExcessEntries {
+					shortOrdersToCancel = shortExcessEntries
+				}
+				logger.Info("📊 [清理策略] 空头开仓单较多，清理 %d 个空头开仓单", shortOrdersToCancel)
+			} else {
+				longOrdersToCancel = cleanupBudget / 2
+				if longOrdersToCancel > longExcessEntries {
+					longOrdersToCancel = longExcessEntries
+				}
+				shortOrdersToCancel = cleanupBudget - longOrdersToCancel
+				if shortOrdersToCancel > shortExcessEntries {
+					shortOrdersToCancel = shortExcessEntries
+				}
+				logger.Info("📊 [清理策略] 多空开仓单数量相等，平均清理 (多头: %d, 空头: %d)", longOrdersToCancel, shortOrdersToCancel)
+			}
 		}
 		if longOrdersToCancel+shortOrdersToCancel == 0 {
 			logger.Info("🧹 [订单清理] 超出阈值但开仓单未超过窗口容量，跳过清理以避免和主挂单流程互相撤补")
@@ -360,6 +376,9 @@ func (oc *OrderCleaner) CleanupOrders() {
 }
 
 func (oc *OrderCleaner) desiredEntryCapacityByBook() (longCapacity, shortCapacity int) {
+	if oc.isClassicMode() {
+		return config.ClassicGridWindowSize, config.ClassicGridWindowSize
+	}
 	buyWindowSize := oc.cfg.Trading.BuyWindowSize
 	if buyWindowSize < 0 {
 		buyWindowSize = 0
@@ -383,6 +402,48 @@ func (oc *OrderCleaner) desiredEntryCapacityByBook() (longCapacity, shortCapacit
 	default:
 		return buyWindowSize, 0
 	}
+}
+
+func classicCleanupSplit(cleanupBudget, longEntries, shortEntries, longCapacity, shortCapacity int) (int, int) {
+	if cleanupBudget <= 0 {
+		return 0, 0
+	}
+	longOverSide := longEntries - longCapacity
+	if longOverSide < 0 {
+		longOverSide = 0
+	}
+	shortOverSide := shortEntries - shortCapacity
+	if shortOverSide < 0 {
+		shortOverSide = 0
+	}
+	longCancel := minInt(cleanupBudget, longOverSide)
+	cleanupBudget -= longCancel
+	shortCancel := minInt(cleanupBudget, shortOverSide)
+	cleanupBudget -= shortCancel
+
+	for cleanupBudget > 0 && (longCancel < longEntries || shortCancel < shortEntries) {
+		longRemaining := longEntries - longCancel
+		shortRemaining := shortEntries - shortCancel
+		if longRemaining <= 0 && shortRemaining <= 0 {
+			break
+		}
+		if longRemaining >= shortRemaining && longRemaining > 0 {
+			longCancel++
+		} else if shortRemaining > 0 {
+			shortCancel++
+		} else {
+			longCancel++
+		}
+		cleanupBudget--
+	}
+	return longCancel, shortCancel
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (oc *OrderCleaner) remainingOpenOrderIDs() (map[int64]struct{}, bool) {

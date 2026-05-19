@@ -13,10 +13,24 @@ import (
 
 // NewExchange 创建交易所实例
 func NewExchange(cfg *config.Config) (IExchange, error) {
-	exchangeName := cfg.App.CurrentExchange
+	exchangeName := config.NormalizeExchangeName(cfg.App.CurrentExchange)
+	if exchangeName == "" {
+		return nil, fmt.Errorf("不支持的交易所: %s", cfg.App.CurrentExchange)
+	}
 	marketType := cfg.App.MarketType
 	if marketType == "" {
 		marketType = "futures"
+	}
+	cfg.App.CurrentExchange = exchangeName
+	if cfg.Exchanges != nil {
+		if _, exists := cfg.Exchanges[exchangeName]; !exists {
+			for name, exchangeCfg := range cfg.Exchanges {
+				if config.NormalizeExchangeName(name) == exchangeName {
+					cfg.Exchanges[exchangeName] = exchangeCfg
+					break
+				}
+			}
+		}
 	}
 
 	switch exchangeName {

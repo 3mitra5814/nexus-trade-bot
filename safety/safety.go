@@ -28,12 +28,17 @@ type positionModeChecker interface {
 //   - requiredPositions: 要求的最少可承受仓位数量（默认100）
 //   - priceDecimals: 价格小数位数（用于格式化显示）
 //   - direction: 交易方向（long / short / neutral）
-func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orderAmount, priceInterval, feeRate float64, requiredPositions, priceDecimals int, direction string) error {
+func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orderAmount, priceInterval, feeRate float64, requiredPositions, priceDecimals int, direction string, modes ...string) error {
 	logger.Info("🔒 ===== 开始持仓安全性检查 =====")
 	direction = strings.ToLower(direction)
 	if direction == "" {
 		direction = "long"
 	}
+	mode := ""
+	if len(modes) > 0 {
+		mode = strings.ToLower(strings.TrimSpace(modes[0]))
+	}
+	classicMode := mode == "classic"
 
 	// 从交易所接口获取计价币种（支持U本位和币本位合约）
 	quoteCurrency := ex.GetQuoteAsset()
@@ -61,7 +66,7 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 	positions, err := ex.GetPositions(ctx, symbol)
 	if err == nil && positions != nil {
 		for _, p := range positions {
-			if p.Symbol == symbol {
+			if sameTradingSymbol(p.Symbol, symbol) {
 				positionAmt += p.Size
 				if currentPrice > 0 && orderAmount > 0 && p.Size != 0 {
 					existingPositionSlots += absFloat(p.Size) * currentPrice / orderAmount
@@ -113,7 +118,7 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 	costPerPosition := orderAmount // 每仓成本就是配置的金额
 	maxPositions := maxAvailableMargin / costPerPosition
 	requiredPositionBudget := float64(requiredPositions)
-	if direction == "neutral" {
+	if direction == "neutral" && !classicMode {
 		requiredPositionBudget *= 2
 	}
 	requiredPositionBudget += existingPositionSlots
@@ -130,7 +135,9 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 	logger.Info("💵 最大可用保证金: %.2f %s (余额 %.2f × 杠杆 %dx)", maxAvailableMargin, quoteCurrency, accountBalance, leverage)
 	logger.Info("📦 每仓成本: %.2f %s (固定金额模式)", costPerPosition, quoteCurrency)
 	logger.Info("🎯 最大可持有仓位: %.0f 仓", maxPositions)
-	if direction == "neutral" {
+	if direction == "neutral" && classicMode {
+		logger.Info("✅ 要求最少持有: %d 仓 (经典网格固定 100 单口径，不按 neutral 双层预算翻倍)", requiredPositions)
+	} else if direction == "neutral" {
 		logger.Info("✅ 要求最少持有: %d 仓 × 双向预算 = %.0f 仓", requiredPositions, float64(requiredPositions)*2)
 	} else {
 		logger.Info("✅ 要求最少持有: %d 仓", requiredPositions)
@@ -165,6 +172,8 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 		actionDesc = "卖出后买回"
 		entrySide = "卖出"
 		exitSide = "买回"
+	} else if classicMode {
+		actionDesc = "经典网格双向（按单边 long 模型校验）"
 	} else if direction == "neutral" {
 		actionDesc = "中性双向（按单边 long 模型校验）"
 	}
@@ -230,4 +239,14 @@ func absFloat(value float64) float64 {
 		return -value
 	}
 	return value
+}
+
+func sameTradingSymbol(a, b string) bool {
+	return normalizeComparableSymbol(a) == normalizeComparableSymbol(b)
+}
+
+func normalizeComparableSymbol(symbol string) string {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	replacer := strings.NewReplacer("/", "", "_", "", "-", "", " ", "")
+	return replacer.Replace(symbol)
 }

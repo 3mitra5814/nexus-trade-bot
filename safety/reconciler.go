@@ -6,6 +6,7 @@ import (
 	"nexus-trade-bot/config"
 	"nexus-trade-bot/logger"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -269,6 +270,9 @@ func (r *Reconciler) Reconcile() error {
 }
 
 func (r *Reconciler) reconciledUnrealizedPNL(positionsRaw interface{}) float64 {
+	if total, ok := sumExchangeUnrealizedPNL(positionsRaw); ok {
+		return total
+	}
 	markPrice := 0.0
 	if r.markPriceProvider != nil {
 		markPrice = r.markPriceProvider()
@@ -278,6 +282,10 @@ func (r *Reconciler) reconciledUnrealizedPNL(positionsRaw interface{}) float64 {
 		return provider.EstimateUnrealizedPNL(markPrice)
 	}
 	return sumPositionUnrealizedPNL(positionsRaw)
+}
+
+func sumExchangeUnrealizedPNL(raw interface{}) (float64, bool) {
+	return sumPositionFieldWhenFlagged(raw, "UnrealizedPNL", "HasUnrealizedPNL")
 }
 
 func firstPositive(values ...float64) float64 {
@@ -325,17 +333,23 @@ func firstPositivePositionField(raw interface{}, fieldName string) float64 {
 }
 
 func sumPositionField(raw interface{}, fieldName string) float64 {
+	total, _ := sumPositionFieldWhenFlagged(raw, fieldName, "")
+	return total
+}
+
+func sumPositionFieldWhenFlagged(raw interface{}, fieldName, flagName string) (float64, bool) {
 	v := reflect.ValueOf(raw)
 	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
 		if v.IsNil() {
-			return 0
+			return 0, false
 		}
 		v = v.Elem()
 	}
 	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
-		return 0
+		return 0, false
 	}
 	total := 0.0
+	found := false
 	for i := 0; i < v.Len(); i++ {
 		item := v.Index(i)
 		for item.Kind() == reflect.Pointer || item.Kind() == reflect.Interface {
@@ -348,10 +362,17 @@ func sumPositionField(raw interface{}, fieldName string) float64 {
 		if !item.IsValid() || item.Kind() != reflect.Struct {
 			continue
 		}
+		if strings.TrimSpace(flagName) != "" {
+			flag := item.FieldByName(flagName)
+			if !flag.IsValid() || flag.Kind() != reflect.Bool || !flag.Bool() {
+				continue
+			}
+		}
 		field := item.FieldByName(fieldName)
 		if field.IsValid() && field.CanFloat() {
 			total += field.Float()
+			found = true
 		}
 	}
-	return total
+	return total, found
 }

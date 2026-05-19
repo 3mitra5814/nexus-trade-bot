@@ -72,14 +72,20 @@ type Order struct {
 }
 
 type Position struct {
-	Symbol         string
-	Size           float64
-	EntryPrice     float64
-	MarkPrice      float64
-	UnrealizedPNL  float64
-	Leverage       int
-	MarginType     string
-	IsolatedMargin float64
+	Symbol           string
+	Size             float64
+	EntryPrice       float64
+	MarkPrice        float64
+	UnrealizedPNL    float64
+	HasUnrealizedPNL bool
+	RealizedPNL      float64
+	HasRealizedPNL   bool
+	ClosedPNL        float64
+	FundingFee       float64
+	TradingFee       float64
+	Leverage         int
+	MarginType       string
+	IsolatedMargin   float64
 }
 
 type Account struct {
@@ -87,6 +93,16 @@ type Account struct {
 	TotalMarginBalance float64
 	AvailableBalance   float64
 	Positions          []*Position
+}
+
+type PNLSummary struct {
+	TotalRealizedPNL    float64
+	TodayRealizedPNL    float64
+	ClosedPNL           float64
+	FundingFee          float64
+	TradingFee          float64
+	HasTotalRealizedPNL bool
+	HasTodayRealizedPNL bool
 }
 
 type OrderUpdate struct {
@@ -467,14 +483,15 @@ func (b *BinanceAdapter) GetAccount(ctx context.Context) (*Account, error) {
 		leverage, _ := strconv.Atoi(pos.Leverage)
 
 		positions = append(positions, &Position{
-			Symbol:         pos.Symbol,
-			Size:           posAmt,
-			EntryPrice:     entryPrice,
-			MarkPrice:      0, // 币安 AccountPosition 没有 MarkPrice
-			UnrealizedPNL:  unrealizedPNL,
-			Leverage:       leverage,
-			MarginType:     "", // 币安 AccountPosition 没有 MarginType
-			IsolatedMargin: 0,  // 币安 AccountPosition 没有 IsolatedMargin
+			Symbol:           pos.Symbol,
+			Size:             posAmt,
+			EntryPrice:       entryPrice,
+			MarkPrice:        0, // 币安 AccountPosition 没有 MarkPrice
+			UnrealizedPNL:    unrealizedPNL,
+			HasUnrealizedPNL: true,
+			Leverage:         leverage,
+			MarginType:       "", // 币安 AccountPosition 没有 MarginType
+			IsolatedMargin:   0,  // 币安 AccountPosition 没有 IsolatedMargin
 		})
 	}
 
@@ -504,18 +521,93 @@ func (b *BinanceAdapter) GetPositions(ctx context.Context, symbol string) ([]*Po
 		leverage, _ := strconv.Atoi(pos.Leverage)
 
 		result = append(result, &Position{
-			Symbol:         pos.Symbol,
-			Size:           posAmt,
-			EntryPrice:     entryPrice,
-			MarkPrice:      markPrice,
-			UnrealizedPNL:  unrealizedPNL,
-			Leverage:       leverage,
-			MarginType:     pos.MarginType,
-			IsolatedMargin: isolatedMargin,
+			Symbol:           pos.Symbol,
+			Size:             posAmt,
+			EntryPrice:       entryPrice,
+			MarkPrice:        markPrice,
+			UnrealizedPNL:    unrealizedPNL,
+			HasUnrealizedPNL: true,
+			Leverage:         leverage,
+			MarginType:       pos.MarginType,
+			IsolatedMargin:   isolatedMargin,
 		})
 	}
 
 	return result, nil
+}
+
+// GetPNLSummary 读取 Binance 合约收益流水。
+// Binance 持仓接口只给未实现盈亏；已实现盈亏需要从 income history 汇总。
+func (b *BinanceAdapter) GetPNLSummary(ctx context.Context, symbol string, startTime, endTime, todayStart time.Time) (*PNLSummary, error) {
+	if endTime.IsZero() {
+		endTime = time.Now()
+	}
+	if startTime.IsZero() || startTime.After(endTime) {
+		startTime = endTime.AddDate(0, 0, -89)
+	}
+	summary := &PNLSummary{}
+	startMS := startTime.UnixMilli()
+	endMS := endTime.UnixMilli()
+	todayMS := todayStart.UnixMilli()
+	cursor := startMS
+	for {
+		rows, err := b.client.NewGetIncomeHistoryService().
+			Symbol(symbol).
+			StartTime(cursor).
+			EndTime(endMS).
+			Limit(1000).
+			Do(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		maxTime := cursor
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			amount, err := strconv.ParseFloat(strings.TrimSpace(row.Income), 64)
+			if err != nil {
+				continue
+			}
+			applyBinanceIncome(summary, strings.ToUpper(strings.TrimSpace(row.IncomeType)), amount, row.Time, todayMS)
+			if row.Time > maxTime {
+				maxTime = row.Time
+			}
+		}
+		if len(rows) < 1000 || maxTime >= endMS {
+			break
+		}
+		if maxTime < cursor {
+			break
+		}
+		cursor = maxTime + 1
+	}
+	return summary, nil
+}
+
+func applyBinanceIncome(summary *PNLSummary, incomeType string, amount float64, ts int64, todayStartMS int64) {
+	if summary == nil {
+		return
+	}
+	switch incomeType {
+	case "REALIZED_PNL":
+		summary.ClosedPNL += amount
+	case "FUNDING_FEE":
+		summary.FundingFee += amount
+	case "COMMISSION", "COMMISSION_REBATE":
+		summary.TradingFee += amount
+	default:
+		return
+	}
+	summary.TotalRealizedPNL += amount
+	summary.HasTotalRealizedPNL = true
+	if todayStartMS > 0 && ts >= todayStartMS {
+		summary.TodayRealizedPNL += amount
+		summary.HasTodayRealizedPNL = true
+	}
 }
 
 // GetBalance 获取余额

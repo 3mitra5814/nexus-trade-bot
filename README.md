@@ -7,13 +7,13 @@
 **A grid bot control center built for traders who want volume, automation, and risk visibility without babysitting every order. Futures is the default mode; spot grids are supported on major centralized exchanges.**
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
 [![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
 [![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
 
-## Join the User Community
+## Community
 
-Questions, deployment notes, exchange-specific fixes, and live trading lessons are easier when users are in one place. Join the Nexus Trade Bot user group: [https://t.me/nexustradebot8](https://t.me/nexustradebot8).
+Questions, deployment notes, exchange-specific fixes, and live trading lessons are easier when users are in one place. Community link: [https://t.me/nexustradebot8](https://t.me/nexustradebot8).
 
 ## Languages
 
@@ -43,7 +43,7 @@ The server runner automatically:
 - Builds the bot from source, or uses the bundled binary in a release package.
 - Creates `config.yaml` from `config.example.yaml` if needed and keeps it local.
 - Starts the web console in the background and writes logs to `logs/`.
-- Detects the server public IP automatically and prints a clear access block with the local URL, server URL, PID file, and log path.
+- Prints a clear access block with the local URL, bind address, PID file, and log paths. Remote access stays off unless you explicitly bind a public address.
 
 Useful server commands:
 
@@ -64,7 +64,7 @@ username: admin
 password: admin
 ```
 
-Change the default password immediately after your first login.
+Change the default password immediately after your first login. The bundled server runner binds the web console to `127.0.0.1:8080` by default. For remote access, prefer SSH tunneling or a reverse proxy with firewall rules; only use `NEXUS_TRADE_BOT_ADDR=0.0.0.0:8080` when you intentionally want a public bind.
 
 ## Supported Exchanges
 
@@ -74,8 +74,6 @@ Change the default password immediately after your first login.
 - Bybit ☑️
 - OKX ☑️
 - Hyperliquid ☑️
-
-Bitget rebate link: [up to 70% fee rebate, invite code `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## What It Does
@@ -159,7 +157,7 @@ This does not remove risk, but it gives the bot a chance to stop adding exposure
 
 ### 1. Volume and VIP Tier Building
 
-Use tight intervals and controlled order size on deep-liquidity symbols. The goal is high turnover with predictable execution. Fee rates matter a lot here, so use low-fee pairs or rebate programs where possible.
+Use tight intervals and controlled order size on deep-liquidity symbols. The goal is high turnover with predictable execution. Fee rates matter a lot here, so use low-fee pairs or maker-fee discounts where possible.
 
 ### 2. Long Grid After a Market Pullback
 
@@ -177,6 +175,10 @@ If you already hold a position, the bot can help sell it out gradually as price 
 
 Use neutral mode when you want both long-side and short-side grid behavior. Start with smaller size and watch how the exchange handles position mode before scaling.
 
+### 6. Classic Grid
+
+Classic grid is a futures-only neutral mode. It keeps 50 live buy orders below the current grid price and 50 live sell orders above it, with no upper or lower range. Filled grids are replenished automatically so the book stays close to 100 active orders. Hyperliquid futures currently does not support this mode because it does not expose the required neutral hedge behavior.
+
 
 ## Parameter Guide
 
@@ -184,6 +186,7 @@ Use neutral mode when you want both long-side and short-side grid behavior. Star
 | --- | --- | --- |
 | `symbol` | Trading pair | Start with liquid pairs such as BTC or ETH. |
 | `app.market_type` | `futures` or `spot` | Defaults to `futures`. Spot live trading supports Binance, Bitget, Bybit, OKX, Gate, and Hyperliquid through dedicated adapters. |
+| `mode` | `normal`, `aggressive`, or `classic` | Use `classic` for the fixed 50-buy/50-sell grid. It forces futures + neutral mode and targets 100 live orders total. |
 | `direction` | `long`, `short`, or `neutral` | Long grids need margin for drawdowns. Existing exchange positions are restored as bot inventory at startup. |
 | `price_interval` | Distance between grid levels | Smaller interval means more trades and more fees. |
 | `order_quantity` | Amount used per order | Larger amount increases turnover and drawdown. Confirm whether the UI is showing quote value or base quantity for your exchange and market type. |
@@ -234,6 +237,8 @@ Expose on a server:
 ```bash
 NEXUS_TRADE_BOT_ADDR=0.0.0.0:8080 ./nexus-trade-bot
 ```
+
+Only expose the console intentionally. Keep the port behind a firewall, VPN, SSH tunnel, or reverse proxy with authentication.
 
 One-command server runner from a source checkout:
 

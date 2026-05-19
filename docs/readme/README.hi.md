@@ -7,7 +7,7 @@
 **एक ग्रिड बॉट नियंत्रण केंद्र उन व्यापारियों के लिए बनाया गया है जो हर ऑर्डर पर बेबीसिटिंग किए बिना वॉल्यूम, ऑटोमेशन और जोखिम दृश्यता चाहते हैं। फ़्यूचर्स डिफ़ॉल्ट मोड है; प्रमुख केंद्रीकृत एक्सचेंजों पर स्पॉट ग्रिड समर्थित हैं।**
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green)](../../LICENSE)
 [![One Command](https://img.shields.io/badge/install-one%20command-blue)](#वन-कमांड-इंस्टाल)
 [![Languages](https://img.shields.io/badge/languages-11-orange)](#भाषाएँ)
 
@@ -43,7 +43,7 @@ wget -O nexus-trade-bot.sh https://raw.githubusercontent.com/haohaoi34/nexus-tra
 - स्रोत से बॉट बनाता है, या रिलीज़ पैकेज में बंडल बाइनरी का उपयोग करता है।
 - यदि आवश्यक हो तो `config.example.yaml` से `config.yaml` बनाता है और इसे स्थानीय रखता है।
 - पृष्ठभूमि में वेब कंसोल प्रारंभ करता है और `logs/` पर लॉग लिखता है।
-- सर्वर का सार्वजनिक IP अपने-आप पहचानता है और स्थानीय URL, सर्वर URL, PID फ़ाइल तथा लॉग पथ वाला स्पष्ट एक्सेस ब्लॉक दिखाता है।
+- स्थानीय URL, bind address, PID file और log paths वाला स्पष्ट access block दिखाता है। Remote access तब तक बंद रहता है जब तक आप explicit public bind न करें।
 
 उपयोगी सर्वर आदेश:
 
@@ -75,7 +75,6 @@ password: admin
 - OKX ☑️
 - Hyperliquid ☑️
 
-Bitget rebate link: [70% तक fee rebate, invite code `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## यह क्या करता है
@@ -178,12 +177,17 @@ Bitget rebate link: [70% तक fee rebate, invite code `4n9z`](https://partner.
 जब आप लॉन्ग-साइड और शॉर्ट-साइड दोनों ग्रिड व्यवहार चाहते हैं तो न्यूट्रल मोड का उपयोग करें। छोटे आकार से शुरू करें और देखें कि स्केलिंग से पहले एक्सचेंज स्थिति मोड को कैसे संभालता है।
 
 
+### 6. क्लासिक ग्रिड
+
+क्लासिक ग्रिड केवल futures में neutral mode के लिए है। यह मौजूदा grid price के नीचे 50 live buy orders और ऊपर 50 live sell orders बनाए रखता है, बिना किसी ऊपरी या निचली price range के। कुल लक्ष्य 100 active orders है, और filled grids अपने आप replenish होते हैं। Hyperliquid futures अभी classic mode में समर्थित नहीं है, क्योंकि इसके लिए neutral hedge behavior चाहिए।
+
 ## पैरामीटर गाइड
 
 | सेटिंग | इसका क्या मतलब है | व्यावहारिक युक्ति |
 | --- | --- | --- |
 | `symbol` | ट्रेडिंग जोड़ी | बीटीसी या ईटीएच जैसे तरल जोड़े से शुरुआत करें। |
 | `app.market_type` | `futures` या `spot` | डिफ़ॉल्ट रूप से `futures`. स्पॉट लाइव ट्रेडिंग समर्पित एडेप्टर के माध्यम से बिनेंस, बिटगेट, बायबिट, ओकेएक्स, गेट और हाइपरलिक्विड का समर्थन करता है। |
+| `mode` | `normal`, `aggressive` या `classic` | `classic` futures + neutral को force करता है और 100 live orders का लक्ष्य रखता है: 50 buys और 50 sells. |
 | `direction` | `long`, `short`, या `neutral` | लंबी ग्रिडों को ड्रॉडाउन के लिए मार्जिन की आवश्यकता होती है। जब तक आप जानबूझकर उस व्यवहार को सक्षम नहीं करते तब तक शॉर्ट ग्रिड को गलती से असंबंधित मैन्युअल शॉर्ट पोजीशन नहीं अपनानी चाहिए। |
 | `price_interval` | ग्रिड स्तरों के बीच की दूरी | छोटे अंतराल का अर्थ है अधिक व्यापार और अधिक शुल्क। |
 | `order_quantity` | प्रति ऑर्डर प्रयुक्त राशि | बड़ी राशि से टर्नओवर और ड्राडाउन बढ़ता है। पुष्टि करें कि क्या यूआई आपके एक्सचेंज और बाजार प्रकार के लिए उद्धरण मूल्य या आधार मात्रा दिखा रहा है। |

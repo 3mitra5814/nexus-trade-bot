@@ -231,6 +231,8 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 	volume := deltaQty * tradePrice
 	realized := r.applyPositionFill(entryPrice, tradePrice, deltaQty, side, bookSide)
 	dateKey := dateKeyForUpdate(update.UpdateTime)
+	positionDelta := signedPositionDelta(side, deltaQty)
+	positionAfter := lastRecordedPosition(r.snapshot) + positionDelta
 
 	daily := r.snapshot.Daily[dateKey]
 	daily.Volume += volume
@@ -242,11 +244,9 @@ func (r *Recorder) recordLoaded(update Update) (bool, error) {
 		daily.SellQty += deltaQty
 		r.snapshot.TotalSellQty += deltaQty
 	}
-	positionDelta := signedPositionDelta(side, deltaQty)
 	r.snapshot.Daily[dateKey] = daily
 	r.snapshot.TotalVolume += volume
 	r.snapshot.TotalRealizedPNL += realized
-	positionAfter := lastRecordedPosition(r.snapshot) + positionDelta
 	now := time.Now()
 	r.snapshot.RecentTrades = append(r.snapshot.RecentTrades, TradeRecord{
 		Time:          timeForUpdate(update.UpdateTime, now),

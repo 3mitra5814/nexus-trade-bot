@@ -558,15 +558,20 @@ func (g *GateAdapter) GetPositions(ctx context.Context, symbol string) ([]*Posit
 	entryPrice, _ := strconv.ParseFloat(fp.EntryPrice, 64)
 	markPrice, _ := strconv.ParseFloat(fp.MarkPrice, 64)
 	unrealisedPnl, _ := strconv.ParseFloat(fp.UnrealisedPnl, 64)
+	realisedPnl, _ := strconv.ParseFloat(fp.RealisedPnl, 64)
 
 	position := &Position{
-		Symbol:        g.symbol,
-		Size:          g.signedBaseQuantityFromContracts(fp.Size),
-		EntryPrice:    entryPrice,
-		MarkPrice:     markPrice,
-		UnrealizedPNL: unrealisedPnl,
-		Leverage:      crossLeverage,
-		MarginType:    "crossed", // 全仓模式
+		Symbol:           g.symbol,
+		Size:             g.signedBaseQuantityFromContracts(fp.Size),
+		EntryPrice:       entryPrice,
+		MarkPrice:        markPrice,
+		UnrealizedPNL:    unrealisedPnl,
+		HasUnrealizedPNL: true,
+		RealizedPNL:      realisedPnl,
+		HasRealizedPNL:   fp.RealisedPnl != "",
+		ClosedPNL:        realisedPnl,
+		Leverage:         crossLeverage,
+		MarginType:       "crossed", // 全仓模式
 	}
 
 	positions = append(positions, position)

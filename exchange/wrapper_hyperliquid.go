@@ -204,13 +204,19 @@ func convertHyperliquidOrder(order *hyperliquidex.Order) *Order {
 
 func convertHyperliquidPosition(pos *hyperliquidex.Position) *Position {
 	return &Position{
-		Symbol:         pos.Symbol,
-		Size:           pos.Size,
-		EntryPrice:     pos.EntryPrice,
-		MarkPrice:      pos.MarkPrice,
-		UnrealizedPNL:  pos.UnrealizedPNL,
-		Leverage:       pos.Leverage,
-		MarginType:     pos.MarginType,
-		IsolatedMargin: pos.IsolatedMargin,
+		Symbol:           pos.Symbol,
+		Size:             pos.Size,
+		EntryPrice:       pos.EntryPrice,
+		MarkPrice:        pos.MarkPrice,
+		UnrealizedPNL:    pos.UnrealizedPNL,
+		HasUnrealizedPNL: pos.HasUnrealizedPNL,
+		RealizedPNL:      pos.RealizedPNL,
+		HasRealizedPNL:   pos.HasRealizedPNL,
+		ClosedPNL:        pos.ClosedPNL,
+		FundingFee:       pos.FundingFee,
+		TradingFee:       pos.TradingFee,
+		Leverage:         pos.Leverage,
+		MarginType:       pos.MarginType,
+		IsolatedMargin:   pos.IsolatedMargin,
 	}
 }

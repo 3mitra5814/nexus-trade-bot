@@ -7,7 +7,7 @@
 **Um centro de controle de bot de grade criado para traders que desejam volume, automação e visibilidade de risco sem cuidar de cada pedido. Futuros é o modo padrão; grades spot são suportadas nas principais bolsas centralizadas.**
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green)](../../LICENSE)
 [![One Command](https://img.shields.io/badge/install-one%20command-blue)](#instalação-com-um-comando)
 [![Languages](https://img.shields.io/badge/languages-11-orange)](#idiomas)
 
@@ -43,7 +43,7 @@ O executor do servidor automaticamente:
 - Constrói o bot a partir do código-fonte ou usa o binário incluído em um pacote de lançamento.
 - Cria `config.yaml` a partir de `config.example.yaml` se necessário e o mantém local.
 - Inicia o console da web em segundo plano e grava logs em `logs/`.
-- Detecta automaticamente o IP público do servidor e mostra um bloco de acesso claro com a URL local, a URL do servidor, o arquivo PID e o caminho do log.
+- Mostra um bloco de acesso claro com URL local, endereço de bind, arquivo PID e caminhos de log. O acesso remoto fica desativado até você definir um bind público explicitamente.
 
 Comandos de servidor úteis:
 
@@ -75,7 +75,6 @@ Altere a senha padrão imediatamente após seu primeiro login.
 - OKX ☑️
 - Hyperliquid ☑️
 
-Link de rebate da Bitget: [até 70% de rebate de taxas, código de convite `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## O que faz
@@ -178,12 +177,17 @@ Se você já possui uma posição, o bot pode ajudar a vendê-la gradualmente à
 Use o modo neutro quando desejar o comportamento da grade no lado longo e no lado curto. Comece com um tamanho menor e observe como a bolsa lida com o modo de posição antes de dimensionar.
 
 
+### 6. Grid clássico
+
+O grid clássico funciona apenas em futuros e usa modo neutro. Ele mantém 50 ordens de compra ativas abaixo do preço de grid atual e 50 ordens de venda ativas acima, sem faixa superior ou inferior. O alvo é 100 ordens ativas no total, com reposição automática após execuções. Hyperliquid futures ainda não é compatível porque o modo exige comportamento neutro de hedge.
+
 ## Guia de parâmetros
 
 | Configuração | O que isso significa | Dica Prática |
 | --- | --- | --- |
 | `symbol` | Par de negociação | Comece com pares líquidos como BTC ou ETH. |
 | `app.market_type` | `futures` ou `spot` | O padrão é `futures`. A negociação spot ao vivo oferece suporte a Binance, Bitget, Bybit, OKX, Gate e Hyperliquid por meio de adaptadores dedicados. |
+| `mode` | `normal`, `aggressive` ou `classic` | `classic` força futures + neutral e mira 100 ordens ativas: 50 compras e 50 vendas. |
 | `direction` | `long`, `short` ou `neutral` | Grades longas precisam de margem para rebaixamentos. As grades curtas não devem adotar acidentalmente uma posição curta manual não relacionada, a menos que você ative esse comportamento intencionalmente. |
 | `price_interval` | Distância entre níveis de grelha | Intervalo menor significa mais negociações e mais taxas. |
 | `order_quantity` | Montante utilizado por encomenda | Quantidade maior aumenta o giro e o rebaixamento. Confirme se a IU está mostrando o valor da cotação ou a quantidade base para sua bolsa e tipo de mercado. |

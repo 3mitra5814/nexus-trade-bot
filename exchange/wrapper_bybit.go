@@ -157,14 +157,20 @@ func (w *bybitWrapper) GetAccount(ctx context.Context) (*Account, error) {
 	positions := make([]*Position, len(account.Positions))
 	for i, item := range account.Positions {
 		positions[i] = &Position{
-			Symbol:         item.Symbol,
-			Size:           item.Size,
-			EntryPrice:     item.EntryPrice,
-			MarkPrice:      item.MarkPrice,
-			UnrealizedPNL:  item.UnrealizedPNL,
-			Leverage:       item.Leverage,
-			MarginType:     item.MarginType,
-			IsolatedMargin: item.IsolatedMargin,
+			Symbol:           item.Symbol,
+			Size:             item.Size,
+			EntryPrice:       item.EntryPrice,
+			MarkPrice:        item.MarkPrice,
+			UnrealizedPNL:    item.UnrealizedPNL,
+			HasUnrealizedPNL: item.HasUnrealizedPNL,
+			RealizedPNL:      item.RealizedPNL,
+			HasRealizedPNL:   item.HasRealizedPNL,
+			ClosedPNL:        item.ClosedPNL,
+			FundingFee:       item.FundingFee,
+			TradingFee:       item.TradingFee,
+			Leverage:         item.Leverage,
+			MarginType:       item.MarginType,
+			IsolatedMargin:   item.IsolatedMargin,
 		}
 	}
 
@@ -186,14 +192,20 @@ func (w *bybitWrapper) GetPositions(ctx context.Context, symbol string) ([]*Posi
 	result := make([]*Position, len(positions))
 	for i, item := range positions {
 		result[i] = &Position{
-			Symbol:         item.Symbol,
-			Size:           item.Size,
-			EntryPrice:     item.EntryPrice,
-			MarkPrice:      item.MarkPrice,
-			UnrealizedPNL:  item.UnrealizedPNL,
-			Leverage:       item.Leverage,
-			MarginType:     item.MarginType,
-			IsolatedMargin: item.IsolatedMargin,
+			Symbol:           item.Symbol,
+			Size:             item.Size,
+			EntryPrice:       item.EntryPrice,
+			MarkPrice:        item.MarkPrice,
+			UnrealizedPNL:    item.UnrealizedPNL,
+			HasUnrealizedPNL: item.HasUnrealizedPNL,
+			RealizedPNL:      item.RealizedPNL,
+			HasRealizedPNL:   item.HasRealizedPNL,
+			ClosedPNL:        item.ClosedPNL,
+			FundingFee:       item.FundingFee,
+			TradingFee:       item.TradingFee,
+			Leverage:         item.Leverage,
+			MarginType:       item.MarginType,
+			IsolatedMargin:   item.IsolatedMargin,
 		}
 	}
 

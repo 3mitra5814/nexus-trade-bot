@@ -51,6 +51,7 @@ is_forbidden_path() {
   case "$path" in
     config.yaml|*/config.yaml|config.local.*|*/config.local.*|*.auth.json|.env|*.env|.env.*|*.local.json|*.local.yaml|*.local.yml) return 0 ;;
     web_console_accounts.json|web_console_robots.json|web_console_robots|web_console_robots/*) return 0 ;;
+    web_console_price_baselines.json|web_console_settings.json|*.stats.json) return 0 ;;
     logs|logs/*|log|log/*|dist|dist/*|build|build/*|bin|bin/*|tmp|tmp/*|temp|temp/*|test|test/*) return 0 ;;
     .DS_Store|*/.DS_Store|*.log|*.pid|*.sqlite|*.sqlite3|*.db|*.db-*|*.pem|*.key|*.p12|*.pfx) return 0 ;;
     *.tar|*.tar.gz|*.zip|*.7z|*.rar|*.gz|*.dmg|*.iso) return 0 ;;
@@ -226,6 +227,9 @@ check_sensitive_files() {
     "web_console_accounts.json"
     "web_console_robots.json"
     "web_console_robots/"
+    "web_console_price_baselines.json"
+    "web_console_settings.json"
+    "*.stats.json"
     "dist/"
     "logs/"
   )
@@ -242,6 +246,7 @@ check_sensitive_files() {
   tracked_sensitive="$(git ls-files \
     config.yaml '*.auth.json' '.env' '.env.*' \
     web_console_accounts.json web_console_robots.json 'web_console_robots/*' \
+    web_console_price_baselines.json web_console_settings.json '*.stats.json' \
     'dist/*' 'logs/*' '*.pem' '*.key' '*.p12' '*.pfx' '*.sqlite' '*.sqlite3' '*.db' 2>/dev/null || true)"
   if [[ -n "$tracked_sensitive" ]]; then
     say "以下敏感文件已经被 Git 跟踪，本次会自动从仓库移除跟踪："

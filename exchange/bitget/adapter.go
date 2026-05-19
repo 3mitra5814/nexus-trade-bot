@@ -65,14 +65,20 @@ type Order struct {
 }
 
 type Position struct {
-	Symbol         string
-	Size           float64
-	EntryPrice     float64
-	MarkPrice      float64
-	UnrealizedPNL  float64
-	Leverage       int
-	MarginType     string
-	IsolatedMargin float64
+	Symbol           string
+	Size             float64
+	EntryPrice       float64
+	MarkPrice        float64
+	UnrealizedPNL    float64
+	HasUnrealizedPNL bool
+	RealizedPNL      float64
+	HasRealizedPNL   bool
+	ClosedPNL        float64
+	FundingFee       float64
+	TradingFee       float64
+	Leverage         int
+	MarginType       string
+	IsolatedMargin   float64
 }
 
 type Account struct {
@@ -82,6 +88,16 @@ type Account struct {
 	Positions          []*Position
 	PosMode            string // "hedge_mode" or "one_way_mode"
 	AccountLeverage    int    // 账户级别的杠杆倍数
+}
+
+type PNLSummary struct {
+	TotalRealizedPNL    float64
+	TodayRealizedPNL    float64
+	ClosedPNL           float64
+	FundingFee          float64
+	TradingFee          float64
+	HasTotalRealizedPNL bool
+	HasTodayRealizedPNL bool
 }
 
 type OrderUpdate struct {
@@ -876,7 +892,10 @@ func (b *BitgetAdapter) GetPositions(ctx context.Context, symbol string) ([]*Pos
 		Total             string `json:"total"`
 		Leverage          string `json:"leverage"`
 		AchievedProfits   string `json:"achievedProfits"`
+		TotalFee          string `json:"totalFee"`
+		DeductedFee       string `json:"deductedFee"`
 		AverageOpenPrice  string `json:"averageOpenPrice"`
+		OpenPriceAvg      string `json:"openPriceAvg"`
 		MarginMode        string `json:"marginMode"`
 		PositionSide      string `json:"positionSide"`
 		UnrealizedPL      string `json:"unrealizedPL"`
@@ -897,9 +916,14 @@ func (b *BitgetAdapter) GetPositions(ctx context.Context, symbol string) ([]*Pos
 			continue // 跳过空持仓
 		}
 
-		entryPrice, _ := strconv.ParseFloat(item.AverageOpenPrice, 64)
+		entryPrice, _ := strconv.ParseFloat(firstNonEmpty(item.AverageOpenPrice, item.OpenPriceAvg), 64)
 		markPrice, _ := strconv.ParseFloat(item.MarkPrice, 64)
 		unrealizedPNL, _ := strconv.ParseFloat(item.UnrealizedPL, 64)
+		closedPNL, _ := strconv.ParseFloat(item.AchievedProfits, 64)
+		fundingFee, _ := strconv.ParseFloat(item.TotalFee, 64)
+		deductedFee, _ := strconv.ParseFloat(item.DeductedFee, 64)
+		tradingFee := -deductedFee
+		realizedPNL := closedPNL + fundingFee + tradingFee
 		leverage, _ := strconv.Atoi(item.Leverage)
 		margin, _ := strconv.ParseFloat(item.Margin, 64)
 
@@ -910,18 +934,162 @@ func (b *BitgetAdapter) GetPositions(ctx context.Context, symbol string) ([]*Pos
 		}
 
 		positions = append(positions, &Position{
-			Symbol:         item.Symbol,
-			Size:           size,
-			EntryPrice:     entryPrice,
-			MarkPrice:      markPrice,
-			UnrealizedPNL:  unrealizedPNL,
-			Leverage:       leverage,
-			MarginType:     item.MarginMode,
-			IsolatedMargin: margin,
+			Symbol:           item.Symbol,
+			Size:             size,
+			EntryPrice:       entryPrice,
+			MarkPrice:        markPrice,
+			UnrealizedPNL:    unrealizedPNL,
+			HasUnrealizedPNL: true,
+			RealizedPNL:      realizedPNL,
+			HasRealizedPNL:   item.AchievedProfits != "" || item.TotalFee != "" || item.DeductedFee != "",
+			ClosedPNL:        closedPNL,
+			FundingFee:       fundingFee,
+			TradingFee:       tradingFee,
+			Leverage:         leverage,
+			MarginType:       item.MarginMode,
+			IsolatedMargin:   margin,
 		})
 	}
 
 	return positions, nil
+}
+
+// GetPNLSummary 汇总 Bitget 合约盈亏。
+// 当前持仓的已实现盈亏来自 single-position；已完全平掉的历史仓位来自 history-position。
+func (b *BitgetAdapter) GetPNLSummary(ctx context.Context, symbol string, startTime, endTime, todayStart time.Time) (*PNLSummary, error) {
+	if endTime.IsZero() {
+		endTime = time.Now()
+	}
+	if startTime.IsZero() || startTime.After(endTime) {
+		startTime = endTime.AddDate(0, 0, -89)
+	}
+	summary := &PNLSummary{}
+	positions, err := b.GetPositions(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	for _, pos := range positions {
+		if pos == nil || !pos.HasRealizedPNL {
+			continue
+		}
+		summary.TotalRealizedPNL += pos.RealizedPNL
+		summary.ClosedPNL += pos.ClosedPNL
+		summary.FundingFee += pos.FundingFee
+		summary.TradingFee += pos.TradingFee
+		summary.HasTotalRealizedPNL = true
+	}
+	if err := b.addHistoryPositionPNL(ctx, summary, startTime, endTime, todayStart); err != nil {
+		return nil, err
+	}
+	return summary, nil
+}
+
+func (b *BitgetAdapter) addHistoryPositionPNL(ctx context.Context, summary *PNLSummary, startTime, endTime, todayStart time.Time) error {
+	if summary == nil {
+		return nil
+	}
+	type historyPosition struct {
+		PositionID   string `json:"positionId"`
+		ID           string `json:"id"`
+		Symbol       string `json:"symbol"`
+		NetProfit    string `json:"netProfit"`
+		Pnl          string `json:"pnl"`
+		TotalFunding string `json:"totalFunding"`
+		OpenFee      string `json:"openFee"`
+		CloseFee     string `json:"closeFee"`
+		CTime        string `json:"cTime"`
+		UTime        string `json:"uTime"`
+	}
+	todayMS := todayStart.UnixMilli()
+	seen := make(map[string]struct{})
+	var idLessThan string
+	for page := 0; page < 20; page++ {
+		path := fmt.Sprintf("/api/v2/mix/position/history-position?symbol=%s&productType=%s&startTime=%d&endTime=%d&limit=100",
+			b.symbol, b.productType, startTime.UnixMilli(), endTime.UnixMilli())
+		if idLessThan != "" {
+			path += "&idLessThan=" + idLessThan
+		}
+		resp, err := b.client.DoRequest(ctx, "GET", path, nil)
+		if err != nil {
+			return err
+		}
+		var wrapped struct {
+			List  []historyPosition `json:"list"`
+			EndID string            `json:"endId"`
+		}
+		if err := json.Unmarshal(resp.Data, &wrapped); err != nil || wrapped.List == nil {
+			var direct []historyPosition
+			if err2 := json.Unmarshal(resp.Data, &direct); err2 != nil {
+				if err != nil {
+					return fmt.Errorf("解析 Bitget 历史持仓盈亏失败: %w", err)
+				}
+				return fmt.Errorf("解析 Bitget 历史持仓盈亏失败: %w", err2)
+			}
+			wrapped.List = direct
+		}
+		if len(wrapped.List) == 0 {
+			break
+		}
+		nextIDLessThan := strings.TrimSpace(wrapped.EndID)
+		fallbackIDLessThan := ""
+		for _, item := range wrapped.List {
+			rowID := firstNonEmpty(item.PositionID, item.ID)
+			if rowID != "" {
+				if _, ok := seen[rowID]; ok {
+					continue
+				}
+				seen[rowID] = struct{}{}
+				fallbackIDLessThan = rowID
+			}
+			closedPNL := parseBitgetFloat(item.Pnl)
+			fundingFee := parseBitgetFloat(item.TotalFunding)
+			tradingFee := parseBitgetFloat(item.OpenFee) + parseBitgetFloat(item.CloseFee)
+			total := parseBitgetFloat(item.NetProfit)
+			if item.NetProfit == "" {
+				total = closedPNL + fundingFee + tradingFee
+			}
+			summary.TotalRealizedPNL += total
+			summary.ClosedPNL += closedPNL
+			summary.FundingFee += fundingFee
+			summary.TradingFee += tradingFee
+			summary.HasTotalRealizedPNL = true
+			eventTime := parseBitgetInt64(item.UTime)
+			if eventTime == 0 {
+				eventTime = parseBitgetInt64(item.CTime)
+			}
+			if todayMS > 0 && eventTime >= todayMS {
+				summary.TodayRealizedPNL += total
+				summary.HasTodayRealizedPNL = true
+			}
+		}
+		if nextIDLessThan == "" {
+			nextIDLessThan = fallbackIDLessThan
+		}
+		if len(wrapped.List) < 100 || nextIDLessThan == "" || nextIDLessThan == idLessThan {
+			break
+		}
+		idLessThan = nextIDLessThan
+	}
+	return nil
+}
+
+func parseBitgetFloat(value string) float64 {
+	parsed, _ := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	return parsed
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseBitgetInt64(value string) int64 {
+	parsed, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return parsed
 }
 
 // GetBalance 获取余额

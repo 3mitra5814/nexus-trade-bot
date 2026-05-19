@@ -1,6 +1,9 @@
 package bybit
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestPositionIdxForBybitOrder(t *testing.T) {
 	tests := []struct {
@@ -22,5 +25,21 @@ func TestPositionIdxForBybitOrder(t *testing.T) {
 				t.Fatalf("positionIdxForBybitOrder() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBybitCancelOrderGoneErrorClassification(t *testing.T) {
+	tests := []error{
+		errors.New("Bybit API 错误: code=110001, msg=order not exists or too late to cancel"),
+		errors.New("order does not exist"),
+		errors.New("already filled"),
+	}
+	for _, err := range tests {
+		if !isBybitCancelOrderGoneError(err) {
+			t.Fatalf("expected cancel gone error: %v", err)
+		}
+	}
+	if isBybitCancelOrderGoneError(errors.New("Bybit API 错误: code=10006, msg=Too many visits")) {
+		t.Fatalf("rate limit error must not be treated as cancel success")
 	}
 }

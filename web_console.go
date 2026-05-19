@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -44,6 +45,8 @@ type consoleServer struct {
 	sessions      map[string]bool
 	loginFailures map[string]loginFailure
 	balanceCache  map[string]accountBalanceCache
+	pnlCache      map[string]pnlCacheEntry
+	metricCache   map[string]robotMetricCache
 	auth          authState
 	accounts      map[string]*accountProfile
 	robots        map[string]*robotDefinition
@@ -52,8 +55,12 @@ type consoleServer struct {
 	baseRawYAML   []byte
 	settings      consoleSettings
 	priceBaseMu   sync.Mutex
+	pnlCacheMu    sync.Mutex
 	mu            sync.RWMutex
+	procInspector processInspector
 }
+
+type processInspector func(pid int) bool
 
 type consoleSettings struct {
 	Timezone string `json:"timezone"`
@@ -148,26 +155,29 @@ type accountPayload struct {
 }
 
 type robotMetric struct {
-	Balance          float64 `json:"balance"`
-	AvailableBalance float64 `json:"available_balance"`
-	MarginBalance    float64 `json:"margin_balance"`
-	CurrentPrice     float64 `json:"current_price"`
-	PriceChangePct   float64 `json:"price_change_pct"`
-	LongPosition     float64 `json:"long_position"`
-	ShortPosition    float64 `json:"short_position"`
-	NetPosition      float64 `json:"net_position"`
-	UnrealizedPNL    float64 `json:"unrealized_pnl"`
-	TodayRealizedPNL float64 `json:"today_realized_pnl"`
-	TotalRealizedPNL float64 `json:"total_realized_pnl"`
-	TodayVolume      float64 `json:"today_volume"`
-	TotalVolume      float64 `json:"total_volume"`
-	TodayFees        float64 `json:"today_fees"`
-	TotalFees        float64 `json:"total_fees"`
-	PositionCount    int     `json:"position_count"`
-	OpenOrderCount   int     `json:"open_order_count"`
-	QuoteAsset       string  `json:"quote_asset"`
-	PriceError       string  `json:"price_error,omitempty"`
-	Error            string  `json:"error,omitempty"`
+	Balance                     float64 `json:"balance"`
+	AvailableBalance            float64 `json:"available_balance"`
+	MarginBalance               float64 `json:"margin_balance"`
+	CurrentPrice                float64 `json:"current_price"`
+	PriceChangePct              float64 `json:"price_change_pct"`
+	LongPosition                float64 `json:"long_position"`
+	ShortPosition               float64 `json:"short_position"`
+	NetPosition                 float64 `json:"net_position"`
+	UnrealizedPNL               float64 `json:"unrealized_pnl"`
+	TodayRealizedPNL            float64 `json:"today_realized_pnl"`
+	TotalRealizedPNL            float64 `json:"total_realized_pnl"`
+	HasExchangeUnrealizedPNL    bool    `json:"-"`
+	HasExchangeTodayRealizedPNL bool    `json:"-"`
+	HasExchangeTotalRealizedPNL bool    `json:"-"`
+	TodayVolume                 float64 `json:"today_volume"`
+	TotalVolume                 float64 `json:"total_volume"`
+	TodayFees                   float64 `json:"today_fees"`
+	TotalFees                   float64 `json:"total_fees"`
+	PositionCount               int     `json:"position_count"`
+	OpenOrderCount              int     `json:"open_order_count"`
+	QuoteAsset                  string  `json:"quote_asset"`
+	PriceError                  string  `json:"price_error,omitempty"`
+	Error                       string  `json:"error,omitempty"`
 }
 
 type accountBalanceView struct {
@@ -186,6 +196,18 @@ type accountBalanceCache struct {
 	Value            accountBalanceView
 	AccountUpdatedAt time.Time
 	ExpiresAt        time.Time
+}
+
+type pnlCacheEntry struct {
+	Value     exchange.PNLSummary
+	ExpiresAt time.Time
+}
+
+type robotMetricCache struct {
+	Value          robotMetric
+	RobotUpdatedAt time.Time
+	ConfigPath     string
+	ExpiresAt      time.Time
 }
 
 type robotView struct {
@@ -252,6 +274,7 @@ const (
 	maxLoginFailures               = 5
 	robotStartProbeDelay           = 800 * time.Millisecond
 	maxRobotAutoRestarts           = 5
+	robotMetricCacheTTL            = 5 * time.Second
 	passwordPBKDF2Prefix           = "pbkdf2-sha512"
 	passwordPBKDF2Iterations       = 200000
 	passwordPBKDF2KeyLength        = 32
@@ -325,11 +348,14 @@ func newConsoleServer(configPath string) (*consoleServer, error) {
 		sessions:      make(map[string]bool),
 		loginFailures: make(map[string]loginFailure),
 		balanceCache:  make(map[string]accountBalanceCache),
+		pnlCache:      make(map[string]pnlCacheEntry),
+		metricCache:   make(map[string]robotMetricCache),
 		accounts:      make(map[string]*accountProfile),
 		robots:        make(map[string]*robotDefinition),
 		processes:     make(map[string]*robotProcess),
 		baseConfig:    baseCfg,
 		baseRawYAML:   baseRawYAML,
+		procInspector: processAlive,
 	}
 	if err := os.MkdirAll(server.robotsDir, 0700); err != nil {
 		return nil, err
@@ -1210,7 +1236,11 @@ func (s *consoleServer) deleteRobot(id string) error {
 		return err
 	}
 	if err := s.cancelRobotOpenOrders(id); err != nil {
-		return err
+		if isIgnorableCancelErrorForDelete(err) {
+			logger.Warn("⚠️ [删除机器人] 清空交易对挂单失败（将继续删除）: robot=%s err=%v", id, err)
+		} else {
+			return err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1224,8 +1254,33 @@ func (s *consoleServer) deleteRobot(id string) error {
 	return s.saveRobotsLocked()
 }
 
+func isIgnorableCancelErrorForDelete(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "-2015"),
+		strings.Contains(lower, "invalid api-key"),
+		strings.Contains(lower, "invalid api key"),
+		strings.Contains(lower, "invalid key"),
+		strings.Contains(lower, "api key"),
+		strings.Contains(lower, "apikey"),
+		strings.Contains(lower, "unauthorized"),
+		strings.Contains(lower, "forbidden"),
+		strings.Contains(lower, "permission"),
+		strings.Contains(lower, "not permitted"),
+		strings.Contains(lower, "not allowed"),
+		strings.Contains(lower, "status=401"):
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *consoleServer) startRobot(id string) error {
 	s.mu.Lock()
+	delete(s.metricCache, id)
 	robot, ok := s.robots[id]
 	if !ok {
 		s.mu.Unlock()
@@ -1351,7 +1406,7 @@ func (s *consoleServer) probeRobotStart(id string, cmd *exec.Cmd) {
 func (s *consoleServer) pauseRobot(id string) error {
 	s.mu.Lock()
 	if proc, ok := s.processes[id]; ok && proc != nil && proc.Status != "running" && proc.DesiredStatus == "running" {
-		pidAlive := proc.PID > 0 && processAlive(proc.PID)
+		pidAlive := proc.PID > 0 && s.isProcessAlive(proc.PID)
 		if pid, ok := s.runningPIDFromFile(id); ok {
 			proc.PID = pid
 			pidAlive = true
@@ -1413,6 +1468,7 @@ func (s *consoleServer) waitRobot(id string, cmd *exec.Cmd) {
 	var restartAfter time.Duration
 	shouldRestart := false
 	s.mu.Lock()
+	delete(s.metricCache, id)
 	proc, ok := s.processes[id]
 	if !ok {
 		s.mu.Unlock()
@@ -1497,6 +1553,7 @@ func (s *consoleServer) stopRobot(id string) error {
 
 func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 	s.mu.Lock()
+	delete(s.metricCache, id)
 	proc, ok := s.processes[id]
 	var extraPIDs []int
 	if !ok || proc == nil {
@@ -1552,7 +1609,7 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 				proc.PID = pid
 				proc.ExitReason = "正在停止按配置路径发现的遗留 worker 进程"
 				_ = s.writeRobotPID(id, pid)
-			} else if proc.PID > 0 && processAlive(proc.PID) {
+			} else if proc.PID > 0 && s.isProcessAlive(proc.PID) {
 				proc.Status = "running"
 			} else {
 				proc.Status = finalStatus
@@ -1562,7 +1619,7 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 				s.mu.Unlock()
 				return nil
 			}
-		} else if proc.PID > 0 && processAlive(proc.PID) {
+		} else if proc.PID > 0 && s.isProcessAlive(proc.PID) {
 			proc.Status = "running"
 		} else {
 			proc.Status = finalStatus
@@ -1603,7 +1660,7 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 		s.mu.RLock()
 		status := proc.Status
 		s.mu.RUnlock()
-		if status != "running" || !processAlive(pid) {
+		if status != "running" || !s.isProcessAlive(pid) {
 			s.markRobotStopped(id, pid, finalStatus, "已停止")
 			return nil
 		}
@@ -1612,7 +1669,7 @@ func (s *consoleServer) stopRobotWithStatus(id, finalStatus string) error {
 	_ = signalProcessGroup(pid, syscall.SIGKILL)
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if !processAlive(pid) {
+		if !s.isProcessAlive(pid) {
 			s.markRobotStopped(id, pid, finalStatus, "已强制停止")
 			return nil
 		}
@@ -1647,11 +1704,33 @@ func (s *consoleServer) runningPIDFromFile(id string) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	if processAlive(pid) {
+	if s.isProcessAlive(pid) && s.pidMatchesRobotWorkerLocked(id, pid) {
 		return pid, true
 	}
 	_ = os.Remove(s.robotPIDPath(id))
 	return 0, false
+}
+
+func (s *consoleServer) isProcessAlive(pid int) bool {
+	if s != nil && s.procInspector != nil {
+		return s.procInspector(pid)
+	}
+	return processAlive(pid)
+}
+
+func (s *consoleServer) pidMatchesRobotWorkerLocked(id string, pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	robot := s.robots[id]
+	configPath := ""
+	if robot != nil {
+		configPath = robot.ConfigPath
+	}
+	if strings.TrimSpace(configPath) == "" {
+		return true
+	}
+	return pidCommandUsesWorkerConfig(pid, configPath)
 }
 
 func (s *consoleServer) removeRobotPIDIfCurrent(id string, pid int) {
@@ -1697,7 +1776,7 @@ func (s *consoleServer) monitorAdoptedRobot(id string, pid int) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if processAlive(pid) {
+		if s.isProcessAlive(pid) {
 			continue
 		}
 		s.markRobotStopped(id, pid, "stopped", "遗留 worker 进程已退出")
@@ -1786,6 +1865,18 @@ func findWorkerPIDsForConfig(configPath string) []int {
 	}
 	sort.Ints(pids)
 	return pids
+}
+
+func pidCommandUsesWorkerConfig(pid int, configPath string) bool {
+	if pid <= 0 || strings.TrimSpace(configPath) == "" {
+		return false
+	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	return workerCommandUsesConfig(fields, configPath)
 }
 
 func workerCommandUsesConfig(args []string, targetConfigPath string) bool {
@@ -1929,7 +2020,9 @@ func (s *consoleServer) normalizeRobotConfig(cfg *config.Config) (*config.Config
 	if cfg.App.MarketType == "spot" {
 		cfg.Trading.Direction = "long"
 	}
-	applyHardcodedRobotDefaults(cfg)
+	if err := applyHardcodedRobotDefaults(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -2051,16 +2144,27 @@ func formatTradingSymbolForName(symbol string) string {
 	return symbol
 }
 
-func applyHardcodedRobotDefaults(cfg *config.Config) {
+func applyHardcodedRobotDefaults(cfg *config.Config) error {
 	cfg.App.MarketType = normalizeMarketTypeParam(cfg.App.MarketType)
 	if cfg.App.MarketType == "spot" {
 		cfg.Trading.Direction = "long"
 	}
-	if strings.TrimSpace(cfg.Trading.Mode) == "" {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Trading.Mode))
+	if mode == "" {
 		cfg.Trading.Mode = "normal"
+		mode = "normal"
+	} else {
+		cfg.Trading.Mode = mode
+	}
+	if mode == "classic" {
+		cfg.App.MarketType = "futures"
+		cfg.Trading.Direction = "neutral"
 	}
 	if len(cfg.RiskControl.MonitorSymbols) == 0 {
 		cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"}
+	}
+	if mode == "classic" && strings.EqualFold(strings.TrimSpace(cfg.App.CurrentExchange), "hyperliquid") {
+		return fmt.Errorf("经典网格需要 neutral 双向挂单，Hyperliquid 合约暂不支持该模式")
 	}
 	cfg.RiskControl.Interval = hardcodedRiskInterval
 	cfg.RiskControl.VolumeMultiplier = hardcodedRiskVolumeMultiplier
@@ -2084,11 +2188,19 @@ func applyHardcodedRobotDefaults(cfg *config.Config) {
 
 	cfg.Trading.BuyWindowSize = hardcodedBuyWindowSize
 	cfg.Trading.SellWindowSize = hardcodedSellWindowSize
+	if mode == "classic" {
+		cfg.Trading.BuyWindowSize = config.ClassicGridWindowSize
+		cfg.Trading.SellWindowSize = config.ClassicGridWindowSize
+	}
 	cfg.Trading.ReconcileInterval = hardcodedReconcileInterval
 	cfg.Trading.OrderCleanupThreshold = hardcodedOrderCleanupThreshold
+	if mode == "classic" {
+		cfg.Trading.OrderCleanupThreshold = config.ClassicGridWindowSize * 2
+	}
 	cfg.Trading.CleanupBatchSize = hardcodedCleanupBatchSize
 	cfg.Trading.MarginLockDurationSec = hardcodedMarginLockSeconds
 	cfg.Trading.PositionSafetyCheck = hardcodedPositionSafetyCheck
+	return nil
 }
 
 func (s *consoleServer) loadAccounts() error {
@@ -2264,9 +2376,11 @@ func (s *consoleServer) createAccount(payload accountPayload) (*accountProfile, 
 	if strings.TrimSpace(payload.Name) == "" {
 		return nil, fmt.Errorf("账户名称不能为空")
 	}
-	if strings.TrimSpace(payload.Exchange) == "" {
+	exchangeName := config.NormalizeExchangeName(payload.Exchange)
+	if exchangeName == "" {
 		return nil, fmt.Errorf("交易所不能为空")
 	}
+	payload.Exchange = exchangeName
 	payload.Config = normalizeAccountExchangeConfig(payload.Config)
 	if strings.TrimSpace(payload.Config.APIKey) == "" || strings.TrimSpace(payload.Config.SecretKey) == "" {
 		return nil, fmt.Errorf("API Key 和 Secret Key 不能为空")
@@ -2294,9 +2408,11 @@ func (s *consoleServer) updateAccount(id string, payload accountPayload) (*accou
 	if strings.TrimSpace(payload.Name) == "" {
 		return nil, fmt.Errorf("账户名称不能为空")
 	}
-	if strings.TrimSpace(payload.Exchange) == "" {
+	exchangeName := config.NormalizeExchangeName(payload.Exchange)
+	if exchangeName == "" {
 		return nil, fmt.Errorf("交易所不能为空")
 	}
+	payload.Exchange = exchangeName
 	s.mu.RLock()
 	existing, exists := s.accounts[id]
 	var existingConfig config.ExchangeConfig
@@ -2350,6 +2466,9 @@ func (s *consoleServer) updateAccount(id string, payload accountPayload) (*accou
 	if err := s.saveRobotsLocked(); err != nil {
 		return nil, err
 	}
+	delete(s.balanceCache, id)
+	s.clearPNLCacheForAccount(id)
+	s.clearMetricCacheForAccountLocked(id)
 	return account, nil
 }
 
@@ -2367,11 +2486,15 @@ func applyAccountConfigToConfig(cfg *config.Config, account *accountProfile) err
 	if account == nil {
 		return fmt.Errorf("账户不存在")
 	}
-	cfg.App.CurrentExchange = account.Exchange
+	exchangeName := config.NormalizeExchangeName(account.Exchange)
+	if exchangeName == "" {
+		return fmt.Errorf("不支持的交易所: %s", account.Exchange)
+	}
+	cfg.App.CurrentExchange = exchangeName
 	if cfg.Exchanges == nil {
 		cfg.Exchanges = make(map[string]config.ExchangeConfig)
 	}
-	cfg.Exchanges[account.Exchange] = normalizeAccountExchangeConfig(account.Config)
+	cfg.Exchanges[exchangeName] = normalizeAccountExchangeConfig(account.Config)
 	return nil
 }
 
@@ -2430,10 +2553,14 @@ func requiresPassphrase(exchangeName string) bool {
 }
 
 func validateAccountPayload(payload accountPayload) error {
-	cfg := accountConfig(payload.Exchange, payload.Config, "BTCUSDT", "futures")
+	exchangeName := config.NormalizeExchangeName(payload.Exchange)
+	if exchangeName == "" {
+		return fmt.Errorf("不支持的交易所: %s", payload.Exchange)
+	}
+	cfg := accountConfig(exchangeName, payload.Config, "BTCUSDT", "futures")
 	ex, err := exchange.NewExchange(cfg)
 	if err != nil {
-		spotCfg := accountConfig(payload.Exchange, payload.Config, "BTCUSDT", "spot")
+		spotCfg := accountConfig(exchangeName, payload.Config, "BTCUSDT", "spot")
 		spotEx, spotErr := exchange.NewExchange(spotCfg)
 		if spotErr != nil {
 			return fmt.Errorf("账户校验失败: %s", friendlyErrorMessage(err))
@@ -2445,7 +2572,7 @@ func validateAccountPayload(payload accountPayload) error {
 	defer cancel()
 	if _, err := ex.GetAccount(ctx); err != nil {
 		if cfg.App.MarketType != "spot" {
-			spotCfg := accountConfig(payload.Exchange, payload.Config, "BTCUSDT", "spot")
+			spotCfg := accountConfig(exchangeName, payload.Config, "BTCUSDT", "spot")
 			spotEx, spotErr := exchange.NewExchange(spotCfg)
 			if spotErr == nil {
 				spotCtx, spotCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2772,6 +2899,7 @@ func fallbackSymbols() []string {
 func accountConfig(exchangeName string, exchangeConfig config.ExchangeConfig, symbol string, marketType string) *config.Config {
 	cfg := &config.Config{}
 	exchangeConfig = normalizeAccountExchangeConfig(exchangeConfig)
+	exchangeName = config.NormalizeExchangeName(exchangeName)
 	cfg.App.CurrentExchange = exchangeName
 	cfg.App.MarketType = normalizeMarketTypeParam(marketType)
 	cfg.Exchanges = map[string]config.ExchangeConfig{
@@ -2789,7 +2917,7 @@ func accountConfig(exchangeName string, exchangeConfig config.ExchangeConfig, sy
 	cfg.Trading.CleanupBatchSize = hardcodedCleanupBatchSize
 	cfg.Trading.MarginLockDurationSec = hardcodedMarginLockSeconds
 	cfg.Trading.PositionSafetyCheck = hardcodedPositionSafetyCheck
-	applyHardcodedRobotDefaults(cfg)
+	_ = applyHardcodedRobotDefaults(cfg)
 	return cfg
 }
 
@@ -2819,6 +2947,8 @@ func (s *consoleServer) deleteAccount(id string) error {
 	}
 	delete(s.accounts, id)
 	delete(s.balanceCache, id)
+	s.clearPNLCacheForAccount(id)
+	s.clearMetricCacheForAccountLocked(id)
 	return s.saveAccountsLocked()
 }
 
@@ -2958,14 +3088,17 @@ func (s *consoleServer) collectArchivedRobotMetrics(activeConfigPaths map[string
 }
 
 func (s *consoleServer) buildRobotView(robot *robotDefinition) robotView {
-	s.mu.RLock()
+	s.mu.Lock()
 	view := s.buildRobotViewLocked(robot)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	view.Metric = s.fetchRobotMetric(robot)
 	return view
 }
 
 func (s *consoleServer) buildRobotViewLocked(robot *robotDefinition) robotView {
+	if robot != nil {
+		s.refreshRobotProcessStateLocked(robot.ID)
+	}
 	view := robotView{
 		ID:        robot.ID,
 		Name:      robot.Name,
@@ -2989,11 +3122,90 @@ func (s *consoleServer) buildRobotViewLocked(robot *robotDefinition) robotView {
 	return view
 }
 
+func (s *consoleServer) refreshRobotProcessStateLocked(id string) {
+	if s.processes == nil {
+		return
+	}
+	proc, ok := s.processes[id]
+	if !ok || proc == nil {
+		if pid, alive := s.runningPIDFromFile(id); alive {
+			s.processes[id] = &robotProcess{
+				Status:        "running",
+				PID:           pid,
+				StartedAt:     time.Now(),
+				DesiredStatus: "running",
+				LogPath:       filepath.Join(s.robotsDir, id+".log"),
+				ExitReason:    "已接管现有 worker 进程",
+			}
+			return
+		}
+		return
+	}
+	if proc.Status == "running" && proc.PID > 0 && !s.isProcessAlive(proc.PID) {
+		oldPID := proc.PID
+		status := "stopped"
+		reason := "worker 进程已退出"
+		if proc.DesiredStatus == "paused" {
+			status = "paused"
+			reason = "已暂停"
+		}
+		proc.Status = status
+		proc.DesiredStatus = status
+		proc.StoppedAt = time.Now()
+		proc.ExitReason = reason
+		proc.PID = 0
+		if proc.logFile != nil {
+			_ = proc.logFile.Close()
+			proc.logFile = nil
+		}
+		s.removeRobotPIDIfCurrent(id, oldPID)
+	}
+}
+
 func (s *consoleServer) fetchRobotMetric(robot *robotDefinition) robotMetric {
 	statsMetric := robotStatsMetric(robot.ConfigPath, 0)
+	if !s.robotCurrentlyRunning(robot.ID) {
+		if cached, ok := s.cachedRobotMetric(robot); ok {
+			return mergeStatsMetric(cached, statsMetric)
+		}
+		return statsMetric
+	}
+	if cached, ok := s.cachedRobotMetric(robot); ok {
+		return mergeStatsMetric(cached, statsMetric)
+	}
+	return s.fetchAndCacheRobotMetric(robot, statsMetric)
+}
+
+func (s *consoleServer) robotCurrentlyRunning(id string) bool {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshRobotProcessStateLocked(id)
+	proc, ok := s.processes[id]
+	return ok && proc != nil && proc.Status == "running"
+}
+
+func (s *consoleServer) cachedRobotMetric(robot *robotDefinition) (robotMetric, bool) {
+	if robot == nil {
+		return robotMetric{}, false
+	}
+	now := time.Now()
+	s.mu.RLock()
+	cached, ok := s.metricCache[robot.ID]
+	s.mu.RUnlock()
+	if !ok || cached.ConfigPath != robot.ConfigPath || !cached.RobotUpdatedAt.Equal(robot.UpdatedAt) || !now.Before(cached.ExpiresAt) {
+		return robotMetric{}, false
+	}
+	return cached.Value, true
+}
+
+func (s *consoleServer) fetchAndCacheRobotMetric(robot *robotDefinition, statsMetric robotMetric) robotMetric {
 	ex, err := exchange.NewExchange(robot.Config)
 	if err != nil {
 		statsMetric.Error = friendlyErrorMessage(err)
+		s.storeRobotMetricCache(robot, statsMetric)
 		return statsMetric
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -3021,27 +3233,163 @@ func (s *consoleServer) fetchRobotMetric(robot *robotDefinition) robotMetric {
 	if err != nil && statsMetric.Error == "" {
 		statsMetric.Error = friendlyErrorMessage(err)
 	} else if err == nil {
-		var exchangePNL float64
-		for _, pos := range positions {
-			exchangePNL += pos.UnrealizedPNL
-			if pos.Size > 0 {
-				statsMetric.LongPosition += pos.Size
-			} else if pos.Size < 0 {
-				statsMetric.ShortPosition += -pos.Size
-			}
-		}
-		statsMetric.NetPosition = statsMetric.LongPosition - statsMetric.ShortPosition
-		if exchangePNL != 0 {
-			statsMetric.UnrealizedPNL = exchangePNL
-		}
-		statsMetric.PositionCount = len(positions)
+		statsMetric = applyExchangePositionsMetric(statsMetric, positions, currentPrice)
+	}
+	if pnlSummary, ok := s.exchangePNLSummary(ctx, robot, ex); ok {
+		statsMetric = applyExchangePNLSummary(statsMetric, pnlSummary)
 	}
 	if currentPrice > 0 {
 		statsMetric.CurrentPrice = currentPrice
 	}
 	statsMetric.QuoteAsset = ex.GetQuoteAsset()
 	statsMetric.PriceError = friendlyErrorString(priceErr)
+	s.storeRobotMetricCache(robot, statsMetric)
 	return statsMetric
+}
+
+func (s *consoleServer) storeRobotMetricCache(robot *robotDefinition, metric robotMetric) {
+	if robot == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.metricCache != nil {
+		s.metricCache[robot.ID] = robotMetricCache{
+			Value:          metric,
+			RobotUpdatedAt: robot.UpdatedAt,
+			ConfigPath:     robot.ConfigPath,
+			ExpiresAt:      time.Now().Add(robotMetricCacheTTL),
+		}
+	}
+	s.mu.Unlock()
+}
+
+func applyExchangePositionsMetric(metric robotMetric, positions []*exchange.Position, currentPrice float64) robotMetric {
+	var exchangePNL float64
+	var latestPricePNL float64
+	hasExchangePNL := false
+	hasLatestPricePNL := false
+	positionCount := 0
+	metric.LongPosition = 0
+	metric.ShortPosition = 0
+
+	for _, pos := range positions {
+		if pos == nil || math.Abs(pos.Size) <= 1e-12 {
+			continue
+		}
+		positionCount++
+		if pos.HasUnrealizedPNL {
+			exchangePNL += pos.UnrealizedPNL
+			hasExchangePNL = true
+		}
+		if pos.Size > 0 {
+			metric.LongPosition += pos.Size
+		} else {
+			metric.ShortPosition += -pos.Size
+		}
+		if currentPrice > 0 && pos.EntryPrice > 0 {
+			qty := math.Abs(pos.Size)
+			if pos.Size > 0 {
+				latestPricePNL += (currentPrice - pos.EntryPrice) * qty
+			} else {
+				latestPricePNL += (pos.EntryPrice - currentPrice) * qty
+			}
+			hasLatestPricePNL = true
+		}
+	}
+
+	metric.NetPosition = metric.LongPosition - metric.ShortPosition
+	metric.PositionCount = positionCount
+	if hasExchangePNL {
+		metric.UnrealizedPNL = exchangePNL
+		metric.HasExchangeUnrealizedPNL = true
+	} else if hasLatestPricePNL {
+		metric.UnrealizedPNL = latestPricePNL
+	}
+	return metric
+}
+
+func applyExchangePNLSummary(metric robotMetric, summary exchange.PNLSummary) robotMetric {
+	if summary.HasTotalRealizedPNL {
+		metric.TotalRealizedPNL = summary.TotalRealizedPNL
+		metric.HasExchangeTotalRealizedPNL = true
+	}
+	if summary.HasTodayRealizedPNL {
+		metric.TodayRealizedPNL = summary.TodayRealizedPNL
+		metric.HasExchangeTodayRealizedPNL = true
+	}
+	return metric
+}
+
+func (s *consoleServer) exchangePNLSummary(ctx context.Context, robot *robotDefinition, ex exchange.IExchange) (exchange.PNLSummary, bool) {
+	provider, ok := ex.(exchange.PNLProvider)
+	if !ok || robot == nil || robot.Config == nil {
+		return exchange.PNLSummary{}, false
+	}
+	now := time.Now()
+	loc := tradestats.TradingDayLocation()
+	localNow := now.In(loc)
+	todayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
+	startTime := now.AddDate(0, 0, -89)
+	symbol := strings.ToUpper(strings.TrimSpace(robot.Config.Trading.Symbol))
+	cacheKey := exchangePNLCacheKey(robot, symbol, tradestats.TradingDayKey(now))
+
+	s.pnlCacheMu.Lock()
+	if cached, ok := s.pnlCache[cacheKey]; ok && now.Before(cached.ExpiresAt) {
+		s.pnlCacheMu.Unlock()
+		return cached.Value, true
+	}
+	s.pnlCacheMu.Unlock()
+
+	summary, err := provider.GetPNLSummary(ctx, symbol, startTime, now, todayStart)
+	if err != nil || summary == nil {
+		if err != nil {
+			logger.Debug("ℹ️ 交易所盈亏汇总读取失败，将使用本地统计: %v", err)
+		}
+		return exchange.PNLSummary{}, false
+	}
+	s.pnlCacheMu.Lock()
+	s.pnlCache[cacheKey] = pnlCacheEntry{Value: *summary, ExpiresAt: now.Add(30 * time.Second)}
+	s.pnlCacheMu.Unlock()
+	return *summary, true
+}
+
+func exchangePNLCacheKey(robot *robotDefinition, symbol, tradingDay string) string {
+	if robot == nil || robot.Config == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		strings.TrimSpace(robot.AccountID),
+		strings.ToLower(strings.TrimSpace(robot.Config.App.CurrentExchange)),
+		normalizeMarketTypeParam(robot.Config.App.MarketType),
+		strings.ToUpper(strings.TrimSpace(symbol)),
+		strings.TrimSpace(tradingDay),
+	}, "|")
+}
+
+func (s *consoleServer) clearPNLCacheForAccount(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	s.pnlCacheMu.Lock()
+	defer s.pnlCacheMu.Unlock()
+	s.clearPNLCacheForAccountLocked(accountID)
+}
+
+func (s *consoleServer) clearPNLCacheForAccountLocked(accountID string) {
+	for key := range s.pnlCache {
+		if strings.HasPrefix(key, accountID+"|") {
+			delete(s.pnlCache, key)
+		}
+	}
+}
+
+func (s *consoleServer) clearMetricCacheForAccountLocked(accountID string) {
+	for id, robot := range s.robots {
+		if robot != nil && robot.AccountID == accountID {
+			delete(s.metricCache, id)
+		}
+	}
 }
 
 func (s *consoleServer) priceChangePct(robot *robotDefinition, currentPrice float64) float64 {
@@ -3132,9 +3480,18 @@ func mergeStatsMetric(base, next robotMetric) robotMetric {
 	if next.CurrentPrice > 0 {
 		base.CurrentPrice = next.CurrentPrice
 	}
-	base.UnrealizedPNL = next.UnrealizedPNL
-	base.TodayRealizedPNL = next.TodayRealizedPNL
-	base.TotalRealizedPNL = next.TotalRealizedPNL
+	if next.HasExchangeUnrealizedPNL || !base.HasExchangeUnrealizedPNL {
+		base.UnrealizedPNL = next.UnrealizedPNL
+		base.HasExchangeUnrealizedPNL = next.HasExchangeUnrealizedPNL
+	}
+	if next.HasExchangeTodayRealizedPNL || !base.HasExchangeTodayRealizedPNL {
+		base.TodayRealizedPNL = next.TodayRealizedPNL
+		base.HasExchangeTodayRealizedPNL = next.HasExchangeTodayRealizedPNL
+	}
+	if next.HasExchangeTotalRealizedPNL || !base.HasExchangeTotalRealizedPNL {
+		base.TotalRealizedPNL = next.TotalRealizedPNL
+		base.HasExchangeTotalRealizedPNL = next.HasExchangeTotalRealizedPNL
+	}
 	base.TodayVolume = next.TodayVolume
 	base.TotalVolume = next.TotalVolume
 	base.TodayFees = next.TodayFees

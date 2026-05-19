@@ -27,6 +27,8 @@ import (
 // Version 版本号
 var Version = "v3.4.4"
 
+const maxTradePriceAge = 10 * time.Second
+
 type adjustRequest struct {
 	reason               string
 	allowWindowRebalance bool
@@ -287,6 +289,7 @@ func runTrader(configPath string) {
 		requiredPositions,
 		priceDecimals,
 		cfg.Trading.Direction,
+		cfg.Trading.Mode,
 	); err != nil {
 		logger.Fatalf("❌ %v", err)
 	}
@@ -384,6 +387,7 @@ func runTrader(configPath string) {
 	adjustScheduler := newAdjustRequestScheduler()
 	var acceptingAdjust atomic.Bool
 	acceptingAdjust.Store(true)
+	classicMode := strings.EqualFold(strings.TrimSpace(cfg.Trading.Mode), "classic")
 	scheduleAdjust := func(reason string, allowWindowRebalance bool) {
 		if !acceptingAdjust.Load() {
 			return
@@ -431,6 +435,10 @@ func runTrader(configPath string) {
 						return
 					}
 					if riskMonitor.IsTriggered() {
+						return
+					}
+					if !priceMonitor.IsPriceFresh(maxTradePriceAge) {
+						logger.Warn("⚠️ [调价跳过] WebSocket 价格超过 %s 未更新，暂停本轮补单", maxTradePriceAge)
 						return
 					}
 					latestPrice := priceMonitor.GetLastPrice()
@@ -515,7 +523,7 @@ func runTrader(configPath string) {
 		logger.Debug("🔍 [main.go] 收到订单更新回调: ID=%d, ClientOID=%s, Price=%.2f, Status=%s",
 			posUpdate.OrderID, posUpdate.ClientOrderID, posUpdate.Price, posUpdate.Status)
 		if superPositionManager.OnOrderUpdate(posUpdate) {
-			scheduleAdjust("order_update", false)
+			scheduleAdjust("order_update", classicMode)
 		}
 		statsUpdate := tradestats.Update{
 			Symbol:        posUpdate.Symbol,
@@ -790,11 +798,12 @@ func (a *positionExchangeAdapter) GetPositions(ctx context.Context, symbol strin
 	result := make([]*position.PositionInfo, len(positions))
 	for i, pos := range positions {
 		result[i] = &position.PositionInfo{
-			Symbol:        pos.Symbol,
-			Size:          pos.Size,
-			EntryPrice:    pos.EntryPrice,
-			MarkPrice:     pos.MarkPrice,
-			UnrealizedPNL: pos.UnrealizedPNL,
+			Symbol:           pos.Symbol,
+			Size:             pos.Size,
+			EntryPrice:       pos.EntryPrice,
+			MarkPrice:        pos.MarkPrice,
+			UnrealizedPNL:    pos.UnrealizedPNL,
+			HasUnrealizedPNL: pos.HasUnrealizedPNL,
 		}
 	}
 

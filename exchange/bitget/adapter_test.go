@@ -1,9 +1,14 @@
 package bitget
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMapBitgetOrderStatusAcceptsRESTAndWSVariants(t *testing.T) {
@@ -122,5 +127,86 @@ func TestBitgetInternalOrderSideConvertsCloseOrdersToActionSide(t *testing.T) {
 				t.Fatalf("got %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAddHistoryPositionPNLPaginatesAndDedupes(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.String())
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("idLessThan") == "" {
+			rows := make([]string, 0, 100)
+			rows = append(rows, `{"positionId":"200","netProfit":"1.5","pnl":"2","totalFunding":"-0.1","openFee":"-0.2","closeFee":"-0.2","uTime":"2000"}`)
+			for i := 199; i >= 101; i-- {
+				rows = append(rows, fmt.Sprintf(`{"positionId":"%d","netProfit":"0","uTime":"2000"}`, i))
+			}
+			fmt.Fprintf(w, `{"code":"00000","data":{"list":[%s]}}`, strings.Join(rows, ","))
+			return
+		}
+		fmt.Fprint(w, `{"code":"00000","data":{"list":[{"positionId":"100","netProfit":"2.5","pnl":"3","totalFunding":"-0.1","openFee":"-0.2","closeFee":"-0.2","uTime":"3000"}]}}`)
+	}))
+	defer server.Close()
+
+	adapter := &BitgetAdapter{
+		client:      NewClient("api", "secret", "pass"),
+		symbol:      "ETHUSDT",
+		productType: "usdt-futures",
+	}
+	adapter.client.baseURL = server.URL
+	summary := &PNLSummary{}
+
+	err := adapter.addHistoryPositionPNL(context.Background(), summary, time.UnixMilli(1000), time.UnixMilli(4000), time.UnixMilli(2500))
+	if err != nil {
+		t.Fatalf("addHistoryPositionPNL() error = %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected two paginated requests, got %d: %v", len(paths), paths)
+	}
+	if !strings.Contains(paths[1], "idLessThan=101") {
+		t.Fatalf("expected second request to use the last first-page idLessThan=101, got %s", paths[1])
+	}
+	if summary.TotalRealizedPNL != 4 || summary.TodayRealizedPNL != 2.5 {
+		t.Fatalf("unexpected pnl summary: %#v", summary)
+	}
+}
+
+func TestAddHistoryPositionPNLUsesOfficialEndIDCursor(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.String())
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("idLessThan") == "" {
+			rows := make([]string, 0, 100)
+			for i := 200; i >= 101; i-- {
+				rows = append(rows, fmt.Sprintf(`{"positionId":"%d","netProfit":"0","uTime":"2000"}`, i))
+			}
+			fmt.Fprintf(w, `{"code":"00000","data":{"list":[%s],"endId":"cursor-100"}}`, strings.Join(rows, ","))
+			return
+		}
+		fmt.Fprint(w, `{"code":"00000","data":{"list":[{"positionId":"100","netProfit":"1.25","uTime":"3000"}]}}`)
+	}))
+	defer server.Close()
+
+	adapter := &BitgetAdapter{
+		client:      NewClient("api", "secret", "pass"),
+		symbol:      "ETHUSDT",
+		productType: "usdt-futures",
+	}
+	adapter.client.baseURL = server.URL
+	summary := &PNLSummary{}
+
+	err := adapter.addHistoryPositionPNL(context.Background(), summary, time.UnixMilli(1000), time.UnixMilli(4000), time.UnixMilli(2500))
+	if err != nil {
+		t.Fatalf("addHistoryPositionPNL() error = %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected two paginated requests, got %d: %v", len(paths), paths)
+	}
+	if !strings.Contains(paths[1], "idLessThan=cursor-100") {
+		t.Fatalf("expected second request to use official endId cursor, got %s", paths[1])
+	}
+	if summary.TotalRealizedPNL != 1.25 || summary.TodayRealizedPNL != 1.25 {
+		t.Fatalf("unexpected pnl summary: %#v", summary)
 	}
 }

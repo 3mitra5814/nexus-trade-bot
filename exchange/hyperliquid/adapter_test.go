@@ -2,6 +2,7 @@ package hyperliquidex
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -21,5 +22,15 @@ func TestValidatePositionModeAllowsDirectionalFutures(t *testing.T) {
 		if err := adapter.ValidatePositionMode(context.Background(), direction); err != nil {
 			t.Fatalf("direction %s should be allowed, got %v", direction, err)
 		}
+	}
+}
+
+func TestHyperliquidCancelOrderGoneErrorClassification(t *testing.T) {
+	err := errors.New("Order was never placed, already canceled, or filled. asset=173")
+	if !isHyperliquidCancelOrderGoneError(err) {
+		t.Fatalf("expected Hyperliquid stale cancel error to be ignored: %v", err)
+	}
+	if isHyperliquidCancelOrderGoneError(errors.New("insufficient margin")) {
+		t.Fatal("margin error must not be treated as cancel success")
 	}
 }

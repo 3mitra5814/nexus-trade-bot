@@ -66,3 +66,26 @@ func TestReconcilerPrefersInjectedMarkPriceForUnrealizedPNL(t *testing.T) {
 		t.Fatalf("expected injected mark price 99, got %v", pm.unrealizedMarks)
 	}
 }
+
+func TestReconcilerPrefersExchangeUnrealizedPNLWhenAvailable(t *testing.T) {
+	cfg := &config.Config{}
+	pm := &fakeReconcilePM{}
+	ex := fakeReconcileExchange{positions: []struct {
+		UnrealizedPNL    float64
+		HasUnrealizedPNL bool
+		MarkPrice        float64
+	}{
+		{UnrealizedPNL: 1.25, HasUnrealizedPNL: true, MarkPrice: 101},
+		{UnrealizedPNL: -0.75, HasUnrealizedPNL: true, MarkPrice: 102},
+	}}
+	reconciler := NewReconciler(cfg, ex, pm)
+	reconciler.SetMarkPriceProvider(func() float64 { return 99 })
+
+	got := reconciler.reconciledUnrealizedPNL(ex.positions)
+	if got != 0.5 {
+		t.Fatalf("expected exchange unrealized PNL 0.5, got %v", got)
+	}
+	if len(pm.unrealizedMarks) != 0 {
+		t.Fatalf("expected local estimator to be skipped, got marks %v", pm.unrealizedMarks)
+	}
+}

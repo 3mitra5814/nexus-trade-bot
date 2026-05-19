@@ -83,14 +83,20 @@ type Order struct {
 }
 
 type Position struct {
-	Symbol         string
-	Size           float64
-	EntryPrice     float64
-	MarkPrice      float64
-	UnrealizedPNL  float64
-	Leverage       int
-	MarginType     string
-	IsolatedMargin float64
+	Symbol           string
+	Size             float64
+	EntryPrice       float64
+	MarkPrice        float64
+	UnrealizedPNL    float64
+	HasUnrealizedPNL bool
+	RealizedPNL      float64
+	HasRealizedPNL   bool
+	ClosedPNL        float64
+	FundingFee       float64
+	TradingFee       float64
+	Leverage         int
+	MarginType       string
+	IsolatedMargin   float64
 }
 
 type Account struct {
@@ -350,9 +356,17 @@ func (h *HyperliquidAdapter) BatchPlaceOrders(ctx context.Context, orders []*Ord
 func (h *HyperliquidAdapter) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
 	resp, err := h.exchange.Cancel(ctx, h.marketCoin(symbol), orderID)
 	if err != nil {
+		if isHyperliquidCancelOrderGoneError(err) {
+			logger.Info("ℹ️ [Hyperliquid] 订单 %d 已不存在或已完成，跳过取消", orderID)
+			return nil
+		}
 		return err
 	}
 	if resp != nil && !resp.Ok {
+		if isHyperliquidCancelOrderGoneMessage(resp.Err) {
+			logger.Info("ℹ️ [Hyperliquid] 订单 %d 已不存在或已完成，跳过取消", orderID)
+			return nil
+		}
 		return fmt.Errorf("Hyperliquid 撤单失败: %s", resp.Err)
 	}
 	return nil
@@ -366,9 +380,17 @@ func (h *HyperliquidAdapter) BatchCancelOrders(ctx context.Context, symbol strin
 	}
 	resp, err := h.exchange.BulkCancel(ctx, requests)
 	if err != nil {
+		if isHyperliquidCancelOrderGoneError(err) {
+			logger.Info("ℹ️ [Hyperliquid] 批量撤单目标已不存在或已完成，跳过取消: %v", orderIDs)
+			return nil
+		}
 		return err
 	}
 	if resp != nil && !resp.Ok {
+		if isHyperliquidCancelOrderGoneMessage(resp.Err) {
+			logger.Info("ℹ️ [Hyperliquid] 批量撤单目标已不存在或已完成，跳过取消: %v", orderIDs)
+			return nil
+		}
 		return fmt.Errorf("Hyperliquid 批量撤单失败: %s", resp.Err)
 	}
 	return nil
@@ -514,13 +536,14 @@ func (h *HyperliquidAdapter) convertPositions(assetPositions []hl.AssetPosition,
 			entryPrice = parseFloat(*pos.EntryPx)
 		}
 		positions = append(positions, &Position{
-			Symbol:         h.toDisplaySymbol(pos.Coin),
-			Size:           size,
-			EntryPrice:     entryPrice,
-			UnrealizedPNL:  parseFloat(pos.UnrealizedPnl),
-			Leverage:       pos.Leverage.Value,
-			MarginType:     pos.Leverage.Type,
-			IsolatedMargin: parseFloat(pos.MarginUsed),
+			Symbol:           h.toDisplaySymbol(pos.Coin),
+			Size:             size,
+			EntryPrice:       entryPrice,
+			UnrealizedPNL:    parseFloat(pos.UnrealizedPnl),
+			HasUnrealizedPNL: true,
+			Leverage:         pos.Leverage.Value,
+			MarginType:       pos.Leverage.Type,
+			IsolatedMargin:   parseFloat(pos.MarginUsed),
 		})
 	}
 	return positions
@@ -816,6 +839,23 @@ func mapOrderStatusFromHyperliquid(status hl.OrderStatusValue) OrderStatus {
 		}
 		return OrderStatusNew
 	}
+}
+
+func isHyperliquidCancelOrderGoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isHyperliquidCancelOrderGoneMessage(err.Error())
+}
+
+func isHyperliquidCancelOrderGoneMessage(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	return strings.Contains(lower, "never placed") ||
+		strings.Contains(lower, "already canceled") ||
+		strings.Contains(lower, "already cancelled") ||
+		strings.Contains(lower, "or filled") ||
+		strings.Contains(lower, "does not exist") ||
+		strings.Contains(lower, "not found")
 }
 
 func parseFloat(value string) float64 {

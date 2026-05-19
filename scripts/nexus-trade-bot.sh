@@ -15,7 +15,8 @@ set -Eeuo pipefail
 # Optional env:
 #   NEXUS_TRADE_BOT_DIR=/opt/nexus-trade-bot
 #   NEXUS_TRADE_BOT_REPO=https://github.com/haohaoi34/nexus-trade-bot.git
-#   NEXUS_TRADE_BOT_ADDR=0.0.0.0:8080
+#   NEXUS_TRADE_BOT_BRANCH=main
+#   NEXUS_TRADE_BOT_ADDR=127.0.0.1:8080
 #   NEXUS_TRADE_BOT_CONFIG=/opt/nexus-trade-bot/config.yaml
 #   NEXUS_TRADE_BOT_GO_VERSION=1.26.3
 #   NEXUS_TRADE_BOT_PUBLIC_IP=1.2.3.4
@@ -24,8 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 REPO_URL="${NEXUS_TRADE_BOT_REPO:-https://github.com/haohaoi34/nexus-trade-bot.git}"
+REPO_BRANCH="${NEXUS_TRADE_BOT_BRANCH:-main}"
 GO_VERSION="${NEXUS_TRADE_BOT_GO_VERSION:-1.26.3}"
-ADDR="${NEXUS_TRADE_BOT_ADDR:-0.0.0.0:8080}"
+ADDR="${NEXUS_TRADE_BOT_ADDR:-127.0.0.1:8080}"
 
 if [[ -f "${SCRIPT_ROOT}/go.mod" || -x "${SCRIPT_ROOT}/nexus-trade-bot" || -x "${SCRIPT_ROOT}/nexus-trade-bot.exe" ]]; then
   APP_DIR="${NEXUS_TRADE_BOT_DIR:-${SCRIPT_ROOT}}"
@@ -257,8 +259,8 @@ sync_source() {
   command -v git >/dev/null 2>&1 || fail "git is required to update ${REPO_URL}"
   if [[ -d "${APP_DIR}/.git" ]]; then
     info "Updating source in ${APP_DIR}"
-    git -C "$APP_DIR" fetch --prune origin
-    git -C "$APP_DIR" reset --hard origin/main
+    git -C "$APP_DIR" fetch --prune origin "$REPO_BRANCH"
+    git -C "$APP_DIR" reset --hard "origin/${REPO_BRANCH}"
     git -C "$APP_DIR" clean -fd \
       -e config.yaml \
       -e config.yaml.auth.json \
@@ -366,6 +368,26 @@ local_url() {
   printf "http://127.0.0.1:%s" "$(port_from_addr)"
 }
 
+bind_host() {
+  local value="$ADDR" host
+  if [[ "$value" == \[*\]* ]]; then
+    host="${value#\[}"
+    printf "%s" "${host%%\]*}"
+    return
+  fi
+  if [[ "$value" == *:* ]]; then
+    printf "%s" "${value%:*}"
+    return
+  fi
+  printf "127.0.0.1"
+}
+
+binds_loopback_only() {
+  local host
+  host="$(bind_host)"
+  [[ -z "$host" || "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "::1" ]]
+}
+
 is_ip_address() {
   local value="$1"
   [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$value" =~ ^[0-9A-Fa-f:]+$ ]]
@@ -444,6 +466,10 @@ server_host_for_url() {
 
 server_url() {
   local host
+  if binds_loopback_only; then
+    local_url
+    return
+  fi
   host="$(server_host)"
   printf "http://%s:%s" "$(server_host_for_url "$host")" "$(port_from_addr)"
 }
@@ -461,15 +487,23 @@ print_access_block() {
   say "======================================================================"
   [[ -n "$pid" ]] && say " PID:        ${pid}"
   say " Local URL:  $(local_url)"
-  say " Server URL: ${access_url}"
   say " Bind Addr:  ${ADDR}"
+  if binds_loopback_only; then
+    say " Remote URL: disabled; set NEXUS_TRADE_BOT_ADDR=0.0.0.0:${port} only behind a firewall or reverse proxy."
+  else
+    say " Server URL: ${access_url}"
+  fi
   say " Log:        ${WEB_LOG}"
   say " Error Log:  ${WEB_ERR_LOG}"
   say " Daily Log:  ${LOG_DIR}/nexus-trade-bot-$(date +%F).log"
   say " Stop:       ${APP_DIR}/scripts/nexus-trade-bot.sh stop"
   say "----------------------------------------------------------------------"
   say " Open this in your browser: ${access_url}"
-  say " If it cannot open, allow TCP port ${port} in your server firewall."
+  if binds_loopback_only; then
+    say " Remote access is off by default. Use SSH tunneling, a reverse proxy, or an explicit public bind."
+  else
+    say " If it cannot open, allow TCP port ${port} in your server firewall and keep access restricted."
+  fi
   say "======================================================================"
   say
 }
@@ -501,7 +535,7 @@ start_web() {
     kill_port_listeners "$port"
   fi
   if port_is_busy "$port"; then
-    fail "TCP port ${port} is still in use by a non-nexus process. Set NEXUS_TRADE_BOT_ADDR=0.0.0.0:8081 or free the port."
+    fail "TCP port ${port} is still in use by a non-nexus process. Set NEXUS_TRADE_BOT_ADDR=127.0.0.1:8081 or free the port."
   fi
 
   : > "$WEB_LOG"

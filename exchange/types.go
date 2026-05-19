@@ -1,6 +1,9 @@
 package exchange
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Side 交易方向
 type Side string
@@ -72,14 +75,36 @@ type Order struct {
 
 // Position 持仓信息（通用）
 type Position struct {
-	Symbol         string
-	Size           float64 // 正数表示多仓，负数表示空仓
-	EntryPrice     float64
-	MarkPrice      float64
-	UnrealizedPNL  float64
-	Leverage       int
-	MarginType     string
-	IsolatedMargin float64
+	Symbol           string
+	Size             float64 // 正数表示多仓，负数表示空仓
+	EntryPrice       float64
+	MarkPrice        float64
+	UnrealizedPNL    float64
+	HasUnrealizedPNL bool
+	RealizedPNL      float64
+	HasRealizedPNL   bool
+	ClosedPNL        float64
+	FundingFee       float64
+	TradingFee       float64
+	Leverage         int
+	MarginType       string
+	IsolatedMargin   float64
+}
+
+// PNLSummary 是交易所账单/持仓接口返回的盈亏汇总。
+// TotalRealizedPNL 按交易所口径净额统计，通常包含平仓盈亏、资金费和交易手续费。
+type PNLSummary struct {
+	TotalRealizedPNL    float64
+	TodayRealizedPNL    float64
+	ClosedPNL           float64
+	FundingFee          float64
+	TradingFee          float64
+	HasTotalRealizedPNL bool
+	HasTodayRealizedPNL bool
+}
+
+type PNLProvider interface {
+	GetPNLSummary(ctx context.Context, symbol string, startTime, endTime, todayStart time.Time) (*PNLSummary, error)
 }
 
 // Account 账户信息（通用）

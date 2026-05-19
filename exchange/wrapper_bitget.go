@@ -3,6 +3,7 @@ package exchange
 import (
 	"context"
 	"nexus-trade-bot/exchange/bitget"
+	"time"
 )
 
 // bitgetWrapper 包装 Bitget 适配器以实现 IExchange 接口
@@ -173,14 +174,20 @@ func (w *bitgetWrapper) GetAccount(ctx context.Context) (*Account, error) {
 	positions := make([]*Position, len(bitgetAccount.Positions))
 	for i, pos := range bitgetAccount.Positions {
 		positions[i] = &Position{
-			Symbol:         pos.Symbol,
-			Size:           pos.Size,
-			EntryPrice:     pos.EntryPrice,
-			MarkPrice:      pos.MarkPrice,
-			UnrealizedPNL:  pos.UnrealizedPNL,
-			Leverage:       pos.Leverage,
-			MarginType:     pos.MarginType,
-			IsolatedMargin: pos.IsolatedMargin,
+			Symbol:           pos.Symbol,
+			Size:             pos.Size,
+			EntryPrice:       pos.EntryPrice,
+			MarkPrice:        pos.MarkPrice,
+			UnrealizedPNL:    pos.UnrealizedPNL,
+			HasUnrealizedPNL: pos.HasUnrealizedPNL,
+			RealizedPNL:      pos.RealizedPNL,
+			HasRealizedPNL:   pos.HasRealizedPNL,
+			ClosedPNL:        pos.ClosedPNL,
+			FundingFee:       pos.FundingFee,
+			TradingFee:       pos.TradingFee,
+			Leverage:         pos.Leverage,
+			MarginType:       pos.MarginType,
+			IsolatedMargin:   pos.IsolatedMargin,
 		}
 	}
 
@@ -202,18 +209,40 @@ func (w *bitgetWrapper) GetPositions(ctx context.Context, symbol string) ([]*Pos
 	positions := make([]*Position, len(bitgetPositions))
 	for i, pos := range bitgetPositions {
 		positions[i] = &Position{
-			Symbol:         pos.Symbol,
-			Size:           pos.Size,
-			EntryPrice:     pos.EntryPrice,
-			MarkPrice:      pos.MarkPrice,
-			UnrealizedPNL:  pos.UnrealizedPNL,
-			Leverage:       pos.Leverage,
-			MarginType:     pos.MarginType,
-			IsolatedMargin: pos.IsolatedMargin,
+			Symbol:           pos.Symbol,
+			Size:             pos.Size,
+			EntryPrice:       pos.EntryPrice,
+			MarkPrice:        pos.MarkPrice,
+			UnrealizedPNL:    pos.UnrealizedPNL,
+			HasUnrealizedPNL: pos.HasUnrealizedPNL,
+			RealizedPNL:      pos.RealizedPNL,
+			HasRealizedPNL:   pos.HasRealizedPNL,
+			ClosedPNL:        pos.ClosedPNL,
+			FundingFee:       pos.FundingFee,
+			TradingFee:       pos.TradingFee,
+			Leverage:         pos.Leverage,
+			MarginType:       pos.MarginType,
+			IsolatedMargin:   pos.IsolatedMargin,
 		}
 	}
 
 	return positions, nil
+}
+
+func (w *bitgetWrapper) GetPNLSummary(ctx context.Context, symbol string, startTime, endTime, todayStart time.Time) (*PNLSummary, error) {
+	summary, err := w.adapter.GetPNLSummary(ctx, symbol, startTime, endTime, todayStart)
+	if err != nil || summary == nil {
+		return nil, err
+	}
+	return &PNLSummary{
+		TotalRealizedPNL:    summary.TotalRealizedPNL,
+		TodayRealizedPNL:    summary.TodayRealizedPNL,
+		ClosedPNL:           summary.ClosedPNL,
+		FundingFee:          summary.FundingFee,
+		TradingFee:          summary.TradingFee,
+		HasTotalRealizedPNL: summary.HasTotalRealizedPNL,
+		HasTodayRealizedPNL: summary.HasTodayRealizedPNL,
+	}, nil
 }
 
 func (w *bitgetWrapper) ValidatePositionMode(ctx context.Context, direction string) error {

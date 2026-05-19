@@ -100,5 +100,34 @@ func TestCheckAccountSafetyDelegatesPositionModeValidation(t *testing.T) {
 	}
 }
 
+func TestCheckAccountSafetyMatchesNormalizedPositionSymbol(t *testing.T) {
+	ex := &safetyFakeExchange{
+		account: &exchange.Account{AvailableBalance: 30, AccountLeverage: 1},
+		positions: []*exchange.Position{
+			{Symbol: "ETH-USDT", Size: 1, Leverage: 1},
+		},
+	}
+
+	err := CheckAccountSafety(ex, "ETHUSDT", 100, 10, 2, 0.0002, 1, 2, "long")
+	if err == nil || !strings.Contains(err.Error(), "余额不足") {
+		t.Fatalf("expected normalized existing position to count toward safety budget, got %v", err)
+	}
+}
+
+func TestCheckAccountSafetyClassicNeutralUsesFixedBudget(t *testing.T) {
+	ex := &safetyFakeExchange{
+		account: &exchange.Account{AvailableBalance: 100, AccountLeverage: 1},
+	}
+
+	if err := CheckAccountSafety(ex, "ETHUSDT", 100, 10, 2, 0, 10, 2, "neutral", "classic"); err != nil {
+		t.Fatalf("classic neutral budget should not be doubled: %v", err)
+	}
+
+	err := CheckAccountSafety(ex, "ETHUSDT", 100, 10, 2, 0, 10, 2, "neutral")
+	if err == nil || !strings.Contains(err.Error(), "余额不足") {
+		t.Fatalf("normal neutral budget should still be doubled and fail, got %v", err)
+	}
+}
+
 var _ exchange.IExchange = (*safetyFakeExchange)(nil)
 var _ positionModeChecker = (*safetyFakeExchange)(nil)

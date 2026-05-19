@@ -82,6 +82,64 @@ func TestNormalizeAccountExchangeConfigDefaultsFeeRate(t *testing.T) {
 	}
 }
 
+func TestApplyAccountConfigNormalizesExchangeName(t *testing.T) {
+	cfg := &config.Config{}
+	account := &accountProfile{
+		ID:       "acc-1",
+		Name:     "main",
+		Exchange: " Gate.io ",
+		Config: config.ExchangeConfig{
+			APIKey:    "api",
+			SecretKey: "secret",
+			FeeRate:   0.0002,
+		},
+	}
+
+	if err := applyAccountConfigToConfig(cfg, account); err != nil {
+		t.Fatalf("applyAccountConfigToConfig() error = %v", err)
+	}
+	if cfg.App.CurrentExchange != "gate" {
+		t.Fatalf("expected exchange gate, got %q", cfg.App.CurrentExchange)
+	}
+	if _, ok := cfg.Exchanges["gate"]; !ok {
+		t.Fatalf("expected normalized gate exchange config, got %#v", cfg.Exchanges)
+	}
+}
+
+func TestApplyHardcodedRobotDefaultsUsesClassicGridWindow(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trading.Mode = "classic"
+	cfg.App.MarketType = "spot"
+	cfg.Trading.Direction = "long"
+	cfg.Trading.BuyWindowSize = 1
+	cfg.Trading.SellWindowSize = 1
+
+	if err := applyHardcodedRobotDefaults(cfg); err != nil {
+		t.Fatalf("applyHardcodedRobotDefaults() error = %v", err)
+	}
+
+	if cfg.Trading.Mode != "classic" {
+		t.Fatalf("expected mode classic, got %q", cfg.Trading.Mode)
+	}
+	if cfg.App.MarketType != "futures" || cfg.Trading.Direction != "neutral" {
+		t.Fatalf("expected classic grid to force futures/neutral, got market=%q direction=%q", cfg.App.MarketType, cfg.Trading.Direction)
+	}
+	if cfg.Trading.BuyWindowSize != config.ClassicGridWindowSize || cfg.Trading.SellWindowSize != config.ClassicGridWindowSize {
+		t.Fatalf("expected classic grid to force 50/50 windows, got buy=%d sell=%d", cfg.Trading.BuyWindowSize, cfg.Trading.SellWindowSize)
+	}
+}
+
+func TestApplyHardcodedRobotDefaultsRejectsHyperliquidClassic(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.CurrentExchange = "hyperliquid"
+	cfg.Trading.Mode = "classic"
+
+	err := applyHardcodedRobotDefaults(cfg)
+	if err == nil || !strings.Contains(err.Error(), "Hyperliquid") {
+		t.Fatalf("expected Hyperliquid classic grid validation error, got %v", err)
+	}
+}
+
 func TestMergeStatsMetricKeepsLocalPNLAndPrice(t *testing.T) {
 	base := robotMetric{
 		CurrentPrice:     1.23,
@@ -113,11 +171,196 @@ func TestMergeStatsMetricKeepsLocalPNLAndPrice(t *testing.T) {
 	}
 }
 
+func TestMergeStatsMetricPreservesExchangePNL(t *testing.T) {
+	base := robotMetric{
+		UnrealizedPNL:               11,
+		TodayRealizedPNL:            12,
+		TotalRealizedPNL:            13,
+		HasExchangeUnrealizedPNL:    true,
+		HasExchangeTodayRealizedPNL: true,
+		HasExchangeTotalRealizedPNL: true,
+		TodayVolume:                 1,
+		TotalVolume:                 2,
+	}
+	next := robotMetric{
+		CurrentPrice:     99,
+		UnrealizedPNL:    -1,
+		TodayRealizedPNL: -2,
+		TotalRealizedPNL: -3,
+		TodayVolume:      4,
+		TotalVolume:      5,
+	}
+
+	merged := mergeStatsMetric(base, next)
+
+	if merged.UnrealizedPNL != 11 || merged.TodayRealizedPNL != 12 || merged.TotalRealizedPNL != 13 {
+		t.Fatalf("expected exchange pnl values to survive local stats merge, got %#v", merged)
+	}
+	if merged.CurrentPrice != 99 || merged.TodayVolume != 4 || merged.TotalVolume != 5 {
+		t.Fatalf("expected local price/volume to refresh, got %#v", merged)
+	}
+}
+
+func TestCachedRobotMetricMergesFreshLocalStats(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "bot.yaml")
+	recorder := tradestats.NewRecorder(tradestats.PathForConfig(configPath), 2, 1, 0)
+	if err := recorder.RecordTotals(1, 2, 10, 3, -4); err != nil {
+		t.Fatalf("record totals: %v", err)
+	}
+	robot := &robotDefinition{
+		ID:         "bot-1",
+		AccountID:  "acc-1",
+		ConfigPath: configPath,
+		UpdatedAt:  time.Now(),
+	}
+	server := &consoleServer{
+		metricCache: map[string]robotMetricCache{
+			"bot-1": {
+				Value:          robotMetric{Balance: 99, TotalRealizedPNL: 1, TotalVolume: 1},
+				RobotUpdatedAt: robot.UpdatedAt,
+				ConfigPath:     configPath,
+				ExpiresAt:      time.Now().Add(time.Minute),
+			},
+		},
+	}
+
+	got := server.fetchRobotMetric(robot)
+
+	if got.Balance != 99 {
+		t.Fatalf("expected cached remote balance to remain, got %#v", got)
+	}
+	if got.TotalRealizedPNL != 3 || got.UnrealizedPNL != -4 || got.TotalVolume != 30 {
+		t.Fatalf("expected fresh local stats to override cached stats, got %#v", got)
+	}
+}
+
+func TestStoppedRobotMetricUsesLocalStatsWithoutRemoteFetch(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "bot.yaml")
+	recorder := tradestats.NewRecorder(tradestats.PathForConfig(configPath), 2, 1, 0)
+	if err := recorder.RecordTotals(1, 2, 10, 3, -4); err != nil {
+		t.Fatalf("record totals: %v", err)
+	}
+	robot := &robotDefinition{ID: "bot-1", ConfigPath: configPath, UpdatedAt: time.Now()}
+	server := &consoleServer{
+		robotsDir:     dir,
+		processes:     map[string]*robotProcess{"bot-1": {Status: "stopped", DesiredStatus: "stopped"}},
+		metricCache:   make(map[string]robotMetricCache),
+		procInspector: func(int) bool { return false },
+	}
+
+	got := server.fetchRobotMetric(robot)
+
+	if got.TotalRealizedPNL != 3 || got.UnrealizedPNL != -4 || got.TotalVolume != 30 {
+		t.Fatalf("expected stopped robot metric to come from local stats only, got %#v", got)
+	}
+	if got.Error != "" {
+		t.Fatalf("stopped robot metric should not surface remote exchange errors, got %q", got.Error)
+	}
+}
+
+func TestApplyExchangePositionsMetricPrefersExchangeUnrealizedPNL(t *testing.T) {
+	base := robotMetric{UnrealizedPNL: 9, TotalRealizedPNL: 3}
+	positions := []*exchange.Position{
+		{Symbol: "ETHUSDT", Size: -2, EntryPrice: 100, MarkPrice: 101, UnrealizedPNL: -2.5, HasUnrealizedPNL: true},
+		{Symbol: "ETHUSDT", Size: 1, EntryPrice: 90, MarkPrice: 101, UnrealizedPNL: 11, HasUnrealizedPNL: true},
+	}
+
+	got := applyExchangePositionsMetric(base, positions, 105)
+
+	if got.ShortPosition != 2 || got.LongPosition != 1 || got.NetPosition != -1 || got.PositionCount != 2 {
+		t.Fatalf("unexpected position metrics: %#v", got)
+	}
+	if got.UnrealizedPNL != 8.5 {
+		t.Fatalf("expected exchange unrealized pnl 8.5, got %.8f", got.UnrealizedPNL)
+	}
+	if got.TotalRealizedPNL != 3 {
+		t.Fatalf("expected local realized pnl to remain without exchange realized data, got %.8f", got.TotalRealizedPNL)
+	}
+}
+
+func TestApplyExchangePositionsMetricDoesNotTreatPositionRealizedAsSummary(t *testing.T) {
+	base := robotMetric{TodayRealizedPNL: 7, TotalRealizedPNL: 13}
+	positions := []*exchange.Position{
+		{Symbol: "ETHUSDT", Size: -2, EntryPrice: 100, RealizedPNL: -1.5, HasRealizedPNL: true},
+	}
+
+	got := applyExchangePositionsMetric(base, positions, 99)
+
+	if got.TotalRealizedPNL != 13 || got.TodayRealizedPNL != 7 {
+		t.Fatalf("position-level realized pnl should not override robot summary pnl: %#v", got)
+	}
+	if got.HasExchangeTotalRealizedPNL {
+		t.Fatalf("position-level realized pnl must not be marked as exchange summary pnl: %#v", got)
+	}
+}
+
+func TestApplyExchangePositionsMetricFallsBackToLatestPriceFormula(t *testing.T) {
+	base := robotMetric{UnrealizedPNL: 9}
+	positions := []*exchange.Position{
+		{Symbol: "SOLUSDC", Size: -3, EntryPrice: 86.5},
+	}
+
+	got := applyExchangePositionsMetric(base, positions, 86)
+
+	if got.UnrealizedPNL != 1.5 {
+		t.Fatalf("expected latest-price fallback pnl 1.5, got %.8f", got.UnrealizedPNL)
+	}
+}
+
+func TestApplyExchangePNLSummaryOverridesRealizedPNLWhenAvailable(t *testing.T) {
+	base := robotMetric{TodayRealizedPNL: 1, TotalRealizedPNL: 2}
+	got := applyExchangePNLSummary(base, exchange.PNLSummary{
+		TodayRealizedPNL:    3,
+		TotalRealizedPNL:    4,
+		HasTodayRealizedPNL: true,
+		HasTotalRealizedPNL: true,
+	})
+
+	if got.TodayRealizedPNL != 3 || got.TotalRealizedPNL != 4 {
+		t.Fatalf("expected exchange realized pnl to override local stats, got %#v", got)
+	}
+}
+
+func TestExchangePNLCacheKeyIncludesMarketType(t *testing.T) {
+	futures := &robotDefinition{AccountID: "acc-1", Config: testRobotConfig("ETHUSDT", "futures")}
+	spot := &robotDefinition{AccountID: "acc-1", Config: testRobotConfig("ETHUSDT", "spot")}
+
+	futuresKey := exchangePNLCacheKey(futures, "ETHUSDT", "2026-05-19")
+	spotKey := exchangePNLCacheKey(spot, "ETHUSDT", "2026-05-19")
+
+	if futuresKey == spotKey {
+		t.Fatalf("expected futures and spot pnl cache keys to differ, both were %q", futuresKey)
+	}
+	if !strings.Contains(futuresKey, "|futures|") || !strings.Contains(spotKey, "|spot|") {
+		t.Fatalf("expected cache keys to include market type, got futures=%q spot=%q", futuresKey, spotKey)
+	}
+}
+
 func TestFriendlyErrorMessageForRestrictedLocation(t *testing.T) {
 	got := friendlyErrorMessage(testError("status=451 body=Service unavailable from a restricted location"))
 	want := "服务器所在地区被交易所限制访问。请更换服务器地区、配置代理，或改用当前地区可访问的交易所。"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestIsIgnorableCancelErrorForDelete(t *testing.T) {
+	cases := []string{
+		"清空交易对挂单失败: 查询挂单失败: <APIError> code=-2015, msg=Invalid API-key, IP, or permissions for action",
+		"unauthorized",
+		"forbidden",
+		"permission denied",
+		"status=401",
+	}
+	for _, msg := range cases {
+		if !isIgnorableCancelErrorForDelete(testError(msg)) {
+			t.Fatalf("expected delete to ignore cancel error: %q", msg)
+		}
+	}
+	if isIgnorableCancelErrorForDelete(testError("network timeout")) {
+		t.Fatalf("did not expect random network error to be ignored")
 	}
 }
 
@@ -192,7 +435,7 @@ func TestStopRobotCancelsPendingAutoRestart(t *testing.T) {
 	}
 }
 
-func TestStopRobotKillsPidfileWorker(t *testing.T) {
+func TestStopRobotIgnoresStalePidfileForNonWorkerProcess(t *testing.T) {
 	if _, err := exec.LookPath("sleep"); err != nil {
 		t.Skip("sleep command not available")
 	}
@@ -210,27 +453,49 @@ func TestStopRobotKillsPidfileWorker(t *testing.T) {
 	}()
 
 	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "bot.yaml")
 	server := &consoleServer{
 		robotsDir: dir,
 		processes: make(map[string]*robotProcess),
+		robots: map[string]*robotDefinition{
+			"bot-1": {ID: "bot-1", ConfigPath: cfgPath, Config: &config.Config{}},
+		},
 	}
 	if err := os.WriteFile(server.robotPIDPath("bot-1"), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0600); err != nil {
 		t.Fatalf("write pidfile: %v", err)
 	}
 
-	if err := server.stopRobotWithStatus("bot-1", "paused"); err != nil {
-		t.Fatalf("stopRobotWithStatus() error = %v", err)
+	if err := server.stopRobotWithStatus("bot-1", "paused"); err == nil {
+		t.Fatalf("expected stale non-worker pidfile to be ignored")
 	}
-	proc := server.processes["bot-1"]
-	if proc == nil || proc.Status != "paused" || proc.DesiredStatus != "paused" {
-		t.Fatalf("expected adopted pidfile worker to be paused, got %#v", proc)
+	if !processAlive(cmd.Process.Pid) {
+		t.Fatalf("non-worker process should not be killed")
 	}
-	if err := cmd.Wait(); err == nil {
-		t.Fatalf("expected pidfile worker to be killed, got clean exit")
-	}
+	_ = signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+	_, _ = cmd.Process.Wait()
 	waited = true
 	if _, ok := server.readRobotPID("bot-1"); ok {
-		t.Fatalf("expected pidfile to be removed")
+		t.Fatalf("expected stale pidfile to be removed")
+	}
+}
+
+func TestPidCommandUsesWorkerConfig(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep command not available")
+	}
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	defer func() {
+		if processAlive(cmd.Process.Pid) {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	if pidCommandUsesWorkerConfig(cmd.Process.Pid, filepath.Join(t.TempDir(), "bot.yaml")) {
+		t.Fatalf("sleep process must not match nexus worker config")
 	}
 }
 
@@ -584,6 +849,23 @@ func TestCurrentTimezoneLockedCanBeUsedWhileWriteLocked(t *testing.T) {
 
 	if got != "Asia/Shanghai" {
 		t.Fatalf("expected locked timezone lookup to use settings value, got %q", got)
+	}
+}
+
+func TestBuildRobotViewRefreshesDeadRunningProcess(t *testing.T) {
+	server := &consoleServer{
+		robotsDir: t.TempDir(),
+		accounts:  make(map[string]*accountProfile),
+		processes: map[string]*robotProcess{
+			"bot-1": {Status: "running", DesiredStatus: "running", PID: 99999999},
+		},
+	}
+	robot := &robotDefinition{ID: "bot-1", Config: &config.Config{}}
+
+	view := server.buildRobotView(robot)
+
+	if view.Status != "stopped" {
+		t.Fatalf("expected dead running process to refresh as stopped, got %#v", view)
 	}
 }
 

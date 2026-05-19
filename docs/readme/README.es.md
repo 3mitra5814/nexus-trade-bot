@@ -7,7 +7,7 @@
 **Un centro de control de robots en red creado para comerciantes que desean volumen, automatización y visibilidad de riesgos sin tener que cuidar cada pedido. Los futuros son el modo predeterminado; Las redes spot son compatibles con los principales intercambios centralizados.**
 
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-MIT-green)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green)](../../LICENSE)
 [![One Command](https://img.shields.io/badge/install-one%20command-blue)](#instalación-con-un-solo-comando)
 [![Languages](https://img.shields.io/badge/languages-11-orange)](#idiomas)
 
@@ -43,7 +43,7 @@ El servidor ejecuta automáticamente:
 - Compila el bot desde el código fuente o utiliza el binario incluido en un paquete de lanzamiento.
 - Crea `config.yaml` a partir de `config.example.yaml` si es necesario y lo mantiene local.
 - Inicia la consola web en segundo plano y escribe registros en `logs/`.
-- Detecta automáticamente la IP pública del servidor y muestra un bloque de acceso claro con la URL local, la URL del servidor, el archivo PID y la ruta del log.
+- Muestra un bloque de acceso claro con la URL local, la dirección de escucha, el archivo PID y las rutas de log. El acceso remoto queda desactivado salvo que vincules una dirección pública explícitamente.
 
 Comandos útiles del servidor:
 
@@ -75,7 +75,6 @@ Cambie la contraseña predeterminada inmediatamente después de su primer inicio
 - OKX ☑️
 - Hyperliquid ☑️
 
-Enlace de reembolso de Bitget: [hasta 70% de reembolso de comisiones, código de invitación `4n9z`](https://partner.hdmune.cn/bg/3DLRKF).
 
 
 ## Qué hace
@@ -159,7 +158,7 @@ Esto no elimina el riesgo, pero le da al robot la oportunidad de dejar de agrega
 
 ### 1. Creación de volumen y niveles VIP
 
-Utilice intervalos ajustados y tamaños de orden controlados en símbolos de gran liquidez. El objetivo es una alta rotación con una ejecución predecible. Las tarifas son muy importantes aquí, así que utilice pares de tarifas bajas o programas de reembolso siempre que sea posible.
+Utilice intervalos ajustados y tamaños de orden controlados en símbolos de gran liquidez. El objetivo es una alta rotación con una ejecución predecible. Las tarifas son muy importantes aquí, así que utilice pares de tarifas bajas o programas de descuentos de comisiones maker cuando sea posible.
 
 ### 2. Cuadrícula larga después de un retroceso del mercado
 
@@ -178,12 +177,17 @@ Si ya mantiene una posición, el robot puede ayudarle a venderla gradualmente a 
 Utilice el modo neutral cuando desee un comportamiento de cuadrícula tanto en el lado largo como en el lado corto. Comience con un tamaño más pequeño y observe cómo el intercambio maneja el modo de posición antes de escalar.
 
 
+### 6. Grid clásico
+
+El grid clásico solo funciona en futuros y usa modo neutral. Mantiene 50 órdenes de compra activas por debajo del precio de grid actual y 50 órdenes de venta activas por encima, sin rango superior ni inferior. El objetivo total es 100 órdenes activas, y las órdenes ejecutadas se reponen automáticamente. Hyperliquid futures no admite este modo por ahora porque requiere comportamiento neutral de cobertura.
+
 ## Guía de parámetros
 
 | Configuración | Lo que significa | Consejo práctico |
 | --- | --- | --- |
 | `symbol` | Par comercial | Comience con pares líquidos como BTC o ETH. |
 | `app.market_type` | `futures` o `spot` | El valor predeterminado es `futures`. El comercio al contado en vivo admite Binance, Bitget, Bybit, OKX, Gate e Hyperliquid a través de adaptadores dedicados. |
+| `mode` | `normal`, `aggressive` o `classic` | `classic` fuerza futuros + neutral y apunta a 100 órdenes activas: 50 compras y 50 ventas. |
 | `direction` | `long`, `short` o `neutral` | Las cuadrículas largas necesitan margen para las reducciones. Las cuadrículas cortas no deben adoptar accidentalmente una posición corta manual no relacionada a menos que habilites ese comportamiento intencionalmente. |
 | `price_interval` | Distancia entre niveles de cuadrícula | Un intervalo más pequeño significa más operaciones y más tarifas. |
 | `order_quantity` | Cantidad utilizada por pedido | Una cantidad mayor aumenta la rotación y la reducción. Confirme si la interfaz de usuario muestra el valor de cotización o la cantidad base para su intercambio y tipo de mercado. |

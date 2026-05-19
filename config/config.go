@@ -8,7 +8,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultFeeRate = 0.0002 // 0.02%
+const (
+	DefaultFeeRate        = 0.0002 // 0.02%
+	ClassicGridWindowSize = 50
+)
 
 // Config 做市商系统配置
 type Config struct {
@@ -27,7 +30,7 @@ type Config struct {
 		Symbol                string  `yaml:"symbol" json:"symbol"`
 		PriceInterval         float64 `yaml:"price_interval" json:"price_interval"`
 		OrderQuantity         float64 `yaml:"order_quantity" json:"order_quantity"`   // 每单购买金额（USDT/USDC）
-		MinOrderValue         float64 `yaml:"min_order_value" json:"min_order_value"` // 最小订单价值（USDT），默认6U，小于此值不挂单
+		MinOrderValue         float64 `yaml:"min_order_value" json:"min_order_value"` // 最小订单价值（USDT），默认20U，小于此值不挂单
 		BuyWindowSize         int     `yaml:"buy_window_size" json:"buy_window_size"`
 		SellWindowSize        int     `yaml:"sell_window_size" json:"sell_window_size"` // 卖单窗口大小
 		ReconcileInterval     int     `yaml:"reconcile_interval" json:"reconcile_interval"`
@@ -97,6 +100,11 @@ func TargetOrderCapacity(c *Config) int {
 		sellWindowSize = buyWindowSize
 	}
 	baseCapacity := buyWindowSize + sellWindowSize
+	if strings.EqualFold(strings.TrimSpace(c.Trading.Mode), "classic") {
+		// 经典网格是固定 50 买 / 50 卖的一百单盘口，不按
+		// neutral 的开/平仓双层预算翻倍。
+		return ClassicGridWindowSize * 2
+	}
 	if strings.EqualFold(strings.TrimSpace(c.App.MarketType), "spot") {
 		return baseCapacity
 	}
@@ -150,11 +158,62 @@ func normalizeMarketType(marketType string) string {
 	}
 }
 
+// NormalizeExchangeName maps common user-facing exchange spellings to the
+// internal configuration key used across adapters and persisted robot files.
+func NormalizeExchangeName(exchangeName string) string {
+	name := strings.ToLower(strings.TrimSpace(exchangeName))
+	name = strings.ReplaceAll(name, " ", "")
+	name = strings.ReplaceAll(name, "-", "")
+	name = strings.ReplaceAll(name, "_", "")
+	name = strings.ReplaceAll(name, ".", "")
+	switch name {
+	case "binance":
+		return "binance"
+	case "bitget":
+		return "bitget"
+	case "bybit":
+		return "bybit"
+	case "gate", "gateio":
+		return "gate"
+	case "okx", "okex":
+		return "okx"
+	case "hyperliquid", "hyperliquidex":
+		return "hyperliquid"
+	default:
+		return ""
+	}
+}
+
+func (c *Config) normalizeExchangeConfigs() error {
+	if c.Exchanges == nil {
+		return nil
+	}
+	normalized := make(map[string]ExchangeConfig, len(c.Exchanges))
+	for name, exchangeCfg := range c.Exchanges {
+		key := NormalizeExchangeName(name)
+		if key == "" {
+			normalized[strings.TrimSpace(name)] = exchangeCfg
+			continue
+		}
+		if _, exists := normalized[key]; exists {
+			return fmt.Errorf("交易所 %s 配置重复，请只保留一个配置项", key)
+		}
+		normalized[key] = exchangeCfg
+	}
+	c.Exchanges = normalized
+	return nil
+}
+
 // Validate 验证配置
 func (c *Config) Validate() error {
 	// 验证交易所配置
 	if c.App.CurrentExchange == "" {
 		return fmt.Errorf("必须指定当前使用的交易所 (app.current_exchange)")
+	}
+	rawExchangeName := c.App.CurrentExchange
+	c.App.CurrentExchange = NormalizeExchangeName(rawExchangeName)
+	if c.App.CurrentExchange == "" {
+		return fmt.Errorf("不支持的交易所: %s", rawExchangeName)
 	}
 	c.App.MarketType = normalizeMarketType(c.App.MarketType)
 	if c.App.MarketType == "" {
@@ -164,6 +223,9 @@ func (c *Config) Validate() error {
 	// 验证多交易所配置
 	if len(c.Exchanges) == 0 {
 		return fmt.Errorf("未配置任何交易所，请在 exchanges 中添加配置")
+	}
+	if err := c.normalizeExchangeConfigs(); err != nil {
+		return err
 	}
 
 	exchangeCfg, exists := c.Exchanges[c.App.CurrentExchange]
@@ -191,9 +253,18 @@ func (c *Config) Validate() error {
 	}
 	c.Trading.Mode = strings.ToLower(strings.TrimSpace(c.Trading.Mode))
 	switch c.Trading.Mode {
-	case "normal", "aggressive":
+	case "normal", "aggressive", "classic":
 	default:
-		return fmt.Errorf("trading.mode 仅支持 normal、aggressive")
+		return fmt.Errorf("trading.mode 仅支持 normal、aggressive、classic")
+	}
+	if c.Trading.Mode == "classic" {
+		c.App.MarketType = "futures"
+		c.Trading.Direction = "neutral"
+		c.Trading.BuyWindowSize = ClassicGridWindowSize
+		c.Trading.SellWindowSize = ClassicGridWindowSize
+		if strings.EqualFold(strings.TrimSpace(c.App.CurrentExchange), "hyperliquid") {
+			return fmt.Errorf("classic 经典网格需要 neutral 双向持仓，Hyperliquid 合约暂不支持该模式")
+		}
 	}
 	if c.Trading.Symbol == "" {
 		return fmt.Errorf("交易对不能为空")
@@ -231,7 +302,7 @@ func (c *Config) Validate() error {
 	}
 	// 注意：price_decimals 和 quantity_decimals 已从配置中移除，现在从交易所自动获取
 	if c.Trading.MinOrderValue <= 0 {
-		c.Trading.MinOrderValue = 20.0 // 默认6U (币安通常最小5U)
+		c.Trading.MinOrderValue = 20.0
 	}
 
 	// 设置默认时间间隔

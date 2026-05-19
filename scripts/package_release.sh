@@ -137,6 +137,7 @@ CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -o "$BIN_PATH" .
 
 echo "==> 准备发布包内容"
 cp README.md "$STAGE_DIR/README.md"
+cp LICENSE "$STAGE_DIR/LICENSE"
 cp config.example.yaml "$STAGE_DIR/config.example.yaml"
 cp config.example.yaml "$STAGE_DIR/config.yaml"
 

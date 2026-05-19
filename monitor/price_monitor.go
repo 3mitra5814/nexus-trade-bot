@@ -209,6 +209,23 @@ func (pm *PriceMonitor) GetLastPrice() float64 {
 	return 0
 }
 
+// GetLastPriceTime 返回最近一次收到 WebSocket 价格的时间。
+func (pm *PriceMonitor) GetLastPriceTime() time.Time {
+	if val := pm.lastPriceTime.Load(); val != nil {
+		return val.(time.Time)
+	}
+	return time.Time{}
+}
+
+// IsPriceFresh 判断价格缓存是否仍可用于下单调度。
+func (pm *PriceMonitor) IsPriceFresh(maxAge time.Duration) bool {
+	lastUpdate := pm.GetLastPriceTime()
+	if lastUpdate.IsZero() {
+		return false
+	}
+	return time.Since(lastUpdate) <= maxAge
+}
+
 // GetLastPriceString 获取最新价格的原始字符串（用于检测小数位数）
 func (pm *PriceMonitor) GetLastPriceString() string {
 	if val := pm.lastPriceStr.Load(); val != nil {

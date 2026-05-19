@@ -226,3 +226,110 @@ func TestCleanupOrdersCancelsOnlyExcessShortEntriesAboveProtectedCapacity(t *tes
 		}
 	}
 }
+
+func TestClassicCleanupUsesFixedTargetCapacityAndKeepsExitOrders(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Mode = "classic"
+	cfg.Trading.Direction = "short"
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 10
+	cfg.Trading.OrderCleanupThreshold = 200
+	cfg.Trading.CleanupBatchSize = 20
+
+	slots := make([]cleanerSlot, 0, 105)
+	for i := 0; i < 50; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:          86 - float64(i)*0.02,
+			BookSide:       "SHORT",
+			OrderID:        int64(i + 1),
+			OrderSide:      "BUY",
+			OrderStatus:    "PLACED",
+			PositionStatus: "FILLED",
+			PositionQty:    0.34,
+		})
+	}
+	for i := 0; i < 55; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:       86.40 + float64(i)*0.02,
+			BookSide:    "SHORT",
+			OrderID:     int64(1000 + i),
+			OrderSide:   "SELL",
+			OrderStatus: "PLACED",
+		})
+	}
+	pm := &fakeCleanerPM{slots: slots}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	want := []int64{1054, 1053, 1052, 1051, 1050}
+	if len(executor.canceled) != len(want) {
+		t.Fatalf("expected classic cleaner to cancel %d far short entries above fixed 100 cap, got %v", len(want), executor.canceled)
+	}
+	for i := range want {
+		if executor.canceled[i] != want[i] {
+			t.Fatalf("expected canceled order IDs %v, got %v", want, executor.canceled)
+		}
+	}
+	for _, id := range executor.canceled {
+		if id >= 1 && id <= 50 {
+			t.Fatalf("classic cleaner must not cancel reduce-only/protective BUY exits, canceled %v", executor.canceled)
+		}
+	}
+}
+
+func TestClassicCleanupReducesTotalAboveTargetEvenWhenSidesWithinWindow(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.App.MarketType = "futures"
+	cfg.Trading.Mode = "classic"
+	cfg.Trading.Direction = "neutral"
+	cfg.Trading.BuyWindowSize = 50
+	cfg.Trading.SellWindowSize = 50
+	cfg.Trading.OrderCleanupThreshold = 200
+	cfg.Trading.CleanupBatchSize = 20
+
+	slots := make([]cleanerSlot, 0, 105)
+	for i := 0; i < 40; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:          86 - float64(i)*0.02,
+			BookSide:       "SHORT",
+			OrderID:        int64(i + 1),
+			OrderSide:      "BUY",
+			OrderStatus:    "PLACED",
+			PositionStatus: "FILLED",
+			PositionQty:    0.34,
+		})
+	}
+	for i := 0; i < 35; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:       86.40 + float64(i)*0.02,
+			BookSide:    "SHORT",
+			OrderID:     int64(1000 + i),
+			OrderSide:   "SELL",
+			OrderStatus: "PLACED",
+		})
+	}
+	for i := 0; i < 30; i++ {
+		slots = append(slots, cleanerSlot{
+			Price:       85.90 - float64(i)*0.02,
+			BookSide:    "LONG",
+			OrderID:     int64(2000 + i),
+			OrderSide:   "BUY",
+			OrderStatus: "PLACED",
+		})
+	}
+	pm := &fakeCleanerPM{slots: slots}
+	executor := &fakeCancelExecutor{}
+
+	NewOrderCleaner(cfg, executor, pm).CleanupOrders()
+
+	if len(executor.canceled) != 5 {
+		t.Fatalf("expected classic cleaner to bring 105 orders back to fixed 100 cap, got %v", executor.canceled)
+	}
+	for _, id := range executor.canceled {
+		if id >= 1 && id <= 40 {
+			t.Fatalf("classic cleaner must not cancel protective BUY exits, canceled %v", executor.canceled)
+		}
+	}
+}

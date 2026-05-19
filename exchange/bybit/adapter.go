@@ -256,6 +256,10 @@ func (b *BybitAdapter) CancelOrder(ctx context.Context, symbol string, orderID i
 		"orderId":  remoteOrderID,
 	}
 	_, err := b.client.DoSignedRequest(ctx, "POST", "/v5/order/cancel", nil, body)
+	if err != nil && isBybitCancelOrderGoneError(err) {
+		logger.Info("ℹ️ [Bybit] 订单 %d 已不存在或已完成，跳过取消", orderID)
+		return nil
+	}
 	return err
 }
 
@@ -407,15 +411,16 @@ func (b *BybitAdapter) GetPositions(ctx context.Context, symbol string) ([]*Posi
 
 	var result struct {
 		List []struct {
-			Symbol        string `json:"symbol"`
-			Side          string `json:"side"`
-			Size          string `json:"size"`
-			AvgPrice      string `json:"avgPrice"`
-			MarkPrice     string `json:"markPrice"`
-			Leverage      string `json:"leverage"`
-			TradeMode     int    `json:"tradeMode"`
-			PositionIM    string `json:"positionIM"`
-			UnrealisedPnl string `json:"unrealisedPnl"`
+			Symbol         string `json:"symbol"`
+			Side           string `json:"side"`
+			Size           string `json:"size"`
+			AvgPrice       string `json:"avgPrice"`
+			MarkPrice      string `json:"markPrice"`
+			Leverage       string `json:"leverage"`
+			TradeMode      int    `json:"tradeMode"`
+			PositionIM     string `json:"positionIM"`
+			UnrealisedPnl  string `json:"unrealisedPnl"`
+			CurRealisedPnl string `json:"curRealisedPnl"`
 		} `json:"list"`
 	}
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
@@ -438,14 +443,18 @@ func (b *BybitAdapter) GetPositions(ctx context.Context, symbol string) ([]*Posi
 		}
 
 		positions = append(positions, &Position{
-			Symbol:         item.Symbol,
-			Size:           size,
-			EntryPrice:     parseFloat(item.AvgPrice),
-			MarkPrice:      parseFloat(item.MarkPrice),
-			UnrealizedPNL:  parseFloat(item.UnrealisedPnl),
-			Leverage:       parseInt(item.Leverage),
-			MarginType:     marginType,
-			IsolatedMargin: parseFloat(item.PositionIM),
+			Symbol:           item.Symbol,
+			Size:             size,
+			EntryPrice:       parseFloat(item.AvgPrice),
+			MarkPrice:        parseFloat(item.MarkPrice),
+			UnrealizedPNL:    parseFloat(item.UnrealisedPnl),
+			HasUnrealizedPNL: true,
+			RealizedPNL:      parseFloat(item.CurRealisedPnl),
+			HasRealizedPNL:   item.CurRealisedPnl != "",
+			ClosedPNL:        parseFloat(item.CurRealisedPnl),
+			Leverage:         parseInt(item.Leverage),
+			MarginType:       marginType,
+			IsolatedMargin:   parseFloat(item.PositionIM),
 		})
 	}
 
@@ -774,6 +783,21 @@ func timeInForceToBybit(timeInForce TimeInForce, postOnly bool) string {
 	default:
 		return "GTC"
 	}
+}
+
+func isBybitCancelOrderGoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "order not exists") ||
+		strings.Contains(msg, "order does not exist") ||
+		strings.Contains(msg, "not exist") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "too late to cancel") ||
+		strings.Contains(msg, "already cancelled") ||
+		strings.Contains(msg, "already canceled") ||
+		strings.Contains(msg, "already filled")
 }
 
 func mapStatusFromBybit(status string) OrderStatus {

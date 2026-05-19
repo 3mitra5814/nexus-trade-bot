@@ -2,12 +2,12 @@
 # Go 构建产物 / 二进制文件
 ################################
 # go build 输出（当前目录）
-./opensqt_free
-./opensqt
 /nexus-trade-bot
 /nexus-trade-bot.pid
 nexus-trade-bot.local.pid
 nexus-trade-bot.local.pid.port
+.nexus-trade-bot.build
+*.lock
 # 一般二进制可执行文件（无扩展名）
 *.exe
 *.exe~
@@ -43,6 +43,9 @@ config.local.*
 web_console_accounts.json
 web_console_robots.json
 web_console_robots/
+web_console_price_baselines.json
+web_console_settings.json
+*.stats.json
 *.pem
 *.key
 *.p12
@@ -69,6 +72,3 @@ vendor/
 # 系统文件
 .DS_Store
 Thumbs.db
-
-
-opensqt
